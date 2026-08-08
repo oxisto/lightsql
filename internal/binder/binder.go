@@ -532,8 +532,7 @@ func bindRowCount(e ast.Expr, clause string) (plan.Expr, error) {
 // at attaches a source position to an error raised by a package that has no
 // access to one, such as catalog lookup or type resolution.
 func at(err error, pos token.Pos) error {
-	var e *pgerr.Error
-	if errors.As(err, &e) {
+	if e, ok := errors.AsType[*pgerr.Error](err); ok {
 		return e.At(pos)
 	}
 	return err

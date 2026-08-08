@@ -1,7 +1,8 @@
 package lightsql
 
 import (
-	"os"
+	"encoding/json"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -18,18 +19,37 @@ var allowedPrefixes = []string{"golang.org/x/"}
 // without noticing. Test-only dependencies belong in the separate compat/
 // module, which is not covered by this check.
 func TestNoRuntimeDependencies(t *testing.T) {
-	data, err := os.ReadFile("go.mod")
+	// `go mod edit -json` is the toolchain's own view of the file. Parsing
+	// go.mod by hand would mean reimplementing a format that has more forms
+	// than it first appears to, and getting it subtly wrong would weaken the
+	// check rather than fail it.
+	out, err := exec.Command("go", "mod", "edit", "-json").Output()
 	if err != nil {
-		t.Fatalf("reading go.mod: %v", err)
+		t.Fatalf("go mod edit -json: %v", err)
 	}
 
-	for _, mod := range requiredModules(string(data)) {
-		if !allowed(mod) {
-			t.Errorf("go.mod requires %q.\n"+
-				"The root module may only depend on the standard library and %s.\n"+
-				"Put test-only dependencies in the compat/ module instead.",
-				mod, strings.Join(allowedPrefixes, ", "))
+	var mod struct {
+		Require []struct {
+			Path     string
+			Indirect bool
 		}
+	}
+	if err := json.Unmarshal(out, &mod); err != nil {
+		t.Fatalf("parsing go.mod: %v", err)
+	}
+
+	for _, req := range mod.Require {
+		if allowed(req.Path) {
+			continue
+		}
+		kind := "a direct dependency"
+		if req.Indirect {
+			kind = "an indirect dependency"
+		}
+		t.Errorf("go.mod requires %q as %s.\n"+
+			"The root module may only depend on the standard library and %s.\n"+
+			"Put test-only dependencies in the compat/ module instead.",
+			req.Path, kind, strings.Join(allowedPrefixes, ", "))
 	}
 }
 
@@ -40,31 +60,4 @@ func allowed(mod string) bool {
 		}
 	}
 	return false
-}
-
-// requiredModules extracts module paths from both the block and single-line
-// forms of a require directive.
-func requiredModules(gomod string) []string {
-	var mods []string
-	inBlock := false
-
-	for line := range strings.Lines(gomod) {
-		line = strings.TrimSpace(line)
-		if i := strings.Index(line, "//"); i >= 0 {
-			line = strings.TrimSpace(line[:i])
-		}
-		switch {
-		case line == "require (":
-			inBlock = true
-		case inBlock && line == ")":
-			inBlock = false
-		case inBlock && line != "":
-			mods = append(mods, strings.Fields(line)[0])
-		case strings.HasPrefix(line, "require "):
-			if f := strings.Fields(line); len(f) >= 2 {
-				mods = append(mods, f[1])
-			}
-		}
-	}
-	return mods
 }

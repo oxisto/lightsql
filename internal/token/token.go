@@ -2,7 +2,10 @@
 // by lightsql, along with the source positions attached to them.
 package token
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // Kind classifies a token. It is a distinct type rather than a bare int so that
 // a token kind can never be silently confused with an ordinal, a column index or
@@ -129,35 +132,47 @@ const (
 	keywordEnd
 )
 
-var kindNames = map[Kind]string{
-	Invalid:     "INVALID",
-	EOF:         "EOF",
-	Ident:       "IDENT",
-	QuotedIdent: "QUOTED_IDENT",
-	String:      "STRING",
-	Number:      "NUMBER",
-	Param:       "PARAM",
+// kindNames is built by a function rather than an init, so the dependency on
+// keywords is expressed directly and package initialisation order handles it.
+var kindNames = buildKindNames()
 
-	LParen:      "(",
-	RParen:      ")",
-	Comma:       ",",
-	Semicolon:   ";",
-	Dot:         ".",
-	Colon:       ":",
-	DoubleColon: "::",
-	Plus:        "+",
-	Minus:       "-",
-	Star:        "*",
-	Slash:       "/",
-	Percent:     "%",
-	Caret:       "^",
-	Eq:          "=",
-	NotEq:       "<>",
-	Less:        "<",
-	LessEq:      "<=",
-	Greater:     ">",
-	GreaterEq:   ">=",
-	Concat:      "||",
+func buildKindNames() map[Kind]string {
+	names := map[Kind]string{
+		Invalid:     "INVALID",
+		EOF:         "EOF",
+		Ident:       "IDENT",
+		QuotedIdent: "QUOTED_IDENT",
+		String:      "STRING",
+		Number:      "NUMBER",
+		Param:       "PARAM",
+
+		LParen:      "(",
+		RParen:      ")",
+		Comma:       ",",
+		Semicolon:   ";",
+		Dot:         ".",
+		Colon:       ":",
+		DoubleColon: "::",
+		Plus:        "+",
+		Minus:       "-",
+		Star:        "*",
+		Slash:       "/",
+		Percent:     "%",
+		Caret:       "^",
+		Eq:          "=",
+		NotEq:       "<>",
+		Less:        "<",
+		LessEq:      "<=",
+		Greater:     ">",
+		GreaterEq:   ">=",
+		Concat:      "||",
+	}
+	// A keyword's name is just its upper-cased source text, so derive it rather
+	// than maintaining a second table that can drift out of sync.
+	for text, kind := range keywords {
+		names[kind] = strings.ToUpper(text)
+	}
+	return names
 }
 
 // keywords maps the lower-cased keyword text to its kind. A single map lookup
@@ -181,24 +196,6 @@ var keywords = map[string]Kind{
 	"union": Union, "unique": Unique, "update": Update, "using": Using,
 	"values": Values,
 	"when":   When, "where": Where,
-}
-
-func init() {
-	// Keyword names are just the upper-cased source text, so derive them rather
-	// than maintaining a second table that can drift out of sync.
-	for text, kind := range keywords {
-		kindNames[kind] = upper(text)
-	}
-}
-
-func upper(s string) string {
-	b := []byte(s)
-	for i, c := range b {
-		if 'a' <= c && c <= 'z' {
-			b[i] = c - 'a' + 'A'
-		}
-	}
-	return string(b)
 }
 
 // Lookup returns the keyword kind for an identifier, or Ident if it is not a

@@ -4,6 +4,7 @@
 package types
 
 import (
+	"cmp"
 	"hash/maphash"
 	"math"
 	"strconv"
@@ -203,18 +204,18 @@ func Compare(a, b Value) int {
 		if a.k.IsNumeric() && b.k.IsNumeric() {
 			return cmpFloat(a.AsFloat(), b.AsFloat())
 		}
-		return cmpUint(uint64(a.k), uint64(b.k))
+		return cmp.Compare(a.k, b.k)
 	}
 	switch a.k {
 	case KindBool:
-		return cmpUint(a.n, b.n)
+		return cmp.Compare(a.n, b.n)
 	case KindFloat:
 		return cmpFloat(a.AsFloat(), b.AsFloat())
 	case KindText, KindBytea:
-		return cmpString(a.s, b.s)
+		return cmp.Compare(a.s, b.s)
 	default:
 		// KindInt and the date/time kinds are all signed integer counts.
-		return cmpInt(a.AsInt(), b.AsInt())
+		return cmp.Compare(a.AsInt(), b.AsInt())
 	}
 }
 
@@ -314,40 +315,8 @@ func writeUint64(h *maphash.Hash, n uint64) {
 	h.Write(b[:])
 }
 
-func cmpInt(a, b int64) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
-	}
-}
-
-func cmpUint(a, b uint64) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
-	}
-}
-
-func cmpString(a, b string) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
-	}
-}
-
 // cmpFloat orders floats totally, which requires deciding where NaN goes.
+// The other kinds use cmp.Compare directly; only floats need custom handling.
 // PostgreSQL sorts NaN greater than every other float, including infinity.
 func cmpFloat(a, b float64) int {
 	aNaN, bNaN := math.IsNaN(a), math.IsNaN(b)

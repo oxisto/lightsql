@@ -1,6 +1,9 @@
 package catalog
 
 import (
+	"maps"
+	"slices"
+
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/types"
 )
@@ -99,9 +102,5 @@ func ResolveType(name string, mods []int) (Type, error) {
 
 // TypeNames returns every accepted type spelling, for diagnostics and tests.
 func TypeNames() []string {
-	names := make([]string, 0, len(typeAliases))
-	for n := range typeAliases {
-		names = append(names, n)
-	}
-	return names
+	return slices.Sorted(maps.Keys(typeAliases))
 }

@@ -9,7 +9,8 @@
 package catalog
 
 import (
-	"strings"
+	"cmp"
+	"slices"
 	"sync"
 
 	"github.com/oxisto/lightsql/internal/pgerr"
@@ -106,13 +107,13 @@ func (t *Table) Rows() [][]types.Value {
 //     stops a concurrent scan from seeing a half-applied UPDATE.
 //
 // The callback must not call back into the table.
-func (t *Table) Mutate(fn func(i int, row []types.Value) (replacement []types.Value, err error)) error {
+func (t *Table) Mutate(fn func(row []types.Value) (replacement []types.Value, err error)) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	next := make([][]types.Value, 0, len(t.rows))
-	for i, row := range t.rows {
-		replacement, err := fn(i, row)
+	for _, row := range t.rows {
+		replacement, err := fn(row)
 		if err != nil {
 			return err
 		}
@@ -234,10 +235,8 @@ func (c *Catalog) Tables() []*Table {
 	}
 	// A stable order keeps introspection output deterministic across runs,
 	// which map iteration would not.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && strings.Compare(out[j-1].QualifiedName(), out[j].QualifiedName()) > 0; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
+	slices.SortFunc(out, func(a, b *Table) int {
+		return cmp.Compare(a.QualifiedName(), b.QualifiedName())
+	})
 	return out
 }

@@ -118,13 +118,16 @@ func (p *parser) accept(k token.Kind) bool {
 }
 
 // expect consumes the current token, which must have the given kind.
-func (p *parser) expect(k token.Kind) (token.Token, error) {
+//
+// It returns only an error: the token itself is fully described by the kind the
+// caller just demanded, so returning it invited call sites to write a blank
+// identifier for a value that could never be interesting.
+func (p *parser) expect(k token.Kind) error {
 	if !p.at(k) {
-		return token.Token{}, p.unexpected(k.String())
+		return p.unexpected(k.String())
 	}
-	tok := p.cur()
 	p.next()
-	return tok, nil
+	return nil
 }
 
 // expectWord consumes an unreserved word, i.e. an identifier used as syntax.
@@ -204,14 +207,14 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 
 func (p *parser) parseSelect() (*ast.SelectStmt, error) {
 	sel := &ast.SelectStmt{SelectPos: p.cur().Pos}
-	if _, err := p.expect(token.Select); err != nil {
+	if err := p.expect(token.Select); err != nil {
 		return nil, err
 	}
 
 	if p.accept(token.Distinct) {
 		sel.Distinct = true
 		if p.accept(token.On) {
-			if _, err := p.expect(token.LParen); err != nil {
+			if err := p.expect(token.LParen); err != nil {
 				return nil, err
 			}
 			for {
@@ -224,7 +227,7 @@ func (p *parser) parseSelect() (*ast.SelectStmt, error) {
 					break
 				}
 			}
-			if _, err := p.expect(token.RParen); err != nil {
+			if err := p.expect(token.RParen); err != nil {
 				return nil, err
 			}
 		}
@@ -256,7 +259,7 @@ func (p *parser) parseSelect() (*ast.SelectStmt, error) {
 	}
 
 	if p.accept(token.Group) {
-		if _, err := p.expect(token.By); err != nil {
+		if err := p.expect(token.By); err != nil {
 			return nil, err
 		}
 		for {
@@ -278,7 +281,7 @@ func (p *parser) parseSelect() (*ast.SelectStmt, error) {
 	}
 
 	if p.accept(token.Order) {
-		if _, err := p.expect(token.By); err != nil {
+		if err := p.expect(token.By); err != nil {
 			return nil, err
 		}
 		if sel.OrderBy, err = p.parseOrderBy(); err != nil {
@@ -420,7 +423,7 @@ func (p *parser) parseFromItem() (ast.TableExpr, error) {
 			p.accept(token.Outer)
 		}
 
-		if _, err := p.expect(token.Join); err != nil {
+		if err := p.expect(token.Join); err != nil {
 			return nil, err
 		}
 		right, err := p.parseTableFactor()
@@ -455,7 +458,7 @@ func (p *parser) parseTableFactor() (ast.TableExpr, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, err := p.expect(token.RParen); err != nil {
+		if err := p.expect(token.RParen); err != nil {
 			return nil, err
 		}
 		ref := &ast.SubqueryRef{Lparen: lparen, Select: sel}
@@ -502,7 +505,7 @@ func (p *parser) parseTableName() (*ast.TableName, error) {
 func (p *parser) parseInsert() (*ast.InsertStmt, error) {
 	stmt := &ast.InsertStmt{InsertPos: p.cur().Pos}
 	p.next()
-	if _, err := p.expect(token.Into); err != nil {
+	if err := p.expect(token.Into); err != nil {
 		return nil, err
 	}
 
@@ -525,7 +528,7 @@ func (p *parser) parseInsert() (*ast.InsertStmt, error) {
 				break
 			}
 		}
-		if _, err := p.expect(token.RParen); err != nil {
+		if err := p.expect(token.RParen); err != nil {
 			return nil, err
 		}
 	}
@@ -533,7 +536,7 @@ func (p *parser) parseInsert() (*ast.InsertStmt, error) {
 	switch {
 	case p.accept(token.Values):
 		for {
-			if _, err := p.expect(token.LParen); err != nil {
+			if err := p.expect(token.LParen); err != nil {
 				return nil, err
 			}
 			var row []ast.Expr
@@ -547,7 +550,7 @@ func (p *parser) parseInsert() (*ast.InsertStmt, error) {
 					break
 				}
 			}
-			if _, err := p.expect(token.RParen); err != nil {
+			if err := p.expect(token.RParen); err != nil {
 				return nil, err
 			}
 			stmt.Rows = append(stmt.Rows, row)
@@ -605,7 +608,7 @@ func (p *parser) parseUpdate() (*ast.UpdateStmt, error) {
 		}
 	}
 
-	if _, err := p.expect(token.Set); err != nil {
+	if err := p.expect(token.Set); err != nil {
 		return nil, err
 	}
 	for {
@@ -613,7 +616,7 @@ func (p *parser) parseUpdate() (*ast.UpdateStmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, err := p.expect(token.Eq); err != nil {
+		if err := p.expect(token.Eq); err != nil {
 			return nil, err
 		}
 		val, err := p.parseExpr(bpNone)
@@ -640,7 +643,7 @@ func (p *parser) parseUpdate() (*ast.UpdateStmt, error) {
 func (p *parser) parseDelete() (*ast.DeleteStmt, error) {
 	stmt := &ast.DeleteStmt{DeletePos: p.cur().Pos}
 	p.next()
-	if _, err := p.expect(token.From); err != nil {
+	if err := p.expect(token.From); err != nil {
 		return nil, err
 	}
 
@@ -674,16 +677,16 @@ func (p *parser) parseDelete() (*ast.DeleteStmt, error) {
 func (p *parser) parseCreate() (ast.Stmt, error) {
 	createPos := p.cur().Pos
 	p.next()
-	if _, err := p.expect(token.Table); err != nil {
+	if err := p.expect(token.Table); err != nil {
 		return nil, err
 	}
 
 	stmt := &ast.CreateTableStmt{CreatePos: createPos}
 	if p.accept(token.If) {
-		if _, err := p.expect(token.Not); err != nil {
+		if err := p.expect(token.Not); err != nil {
 			return nil, err
 		}
-		if _, err := p.expect(token.Exists); err != nil {
+		if err := p.expect(token.Exists); err != nil {
 			return nil, err
 		}
 		stmt.IfNotExists = true
@@ -695,7 +698,7 @@ func (p *parser) parseCreate() (ast.Stmt, error) {
 	}
 	stmt.Table = name
 
-	if _, err := p.expect(token.LParen); err != nil {
+	if err := p.expect(token.LParen); err != nil {
 		return nil, err
 	}
 	for {
@@ -706,7 +709,7 @@ func (p *parser) parseCreate() (ast.Stmt, error) {
 			break
 		}
 	}
-	if _, err := p.expect(token.RParen); err != nil {
+	if err := p.expect(token.RParen); err != nil {
 		return nil, err
 	}
 	if len(stmt.Columns) == 0 {
@@ -757,7 +760,7 @@ func (p *parser) parseTableConstraint(pos token.Pos, name ast.Name) (*ast.TableC
 
 	switch {
 	case p.accept(token.Primary):
-		if _, err := p.expect(token.Key); err != nil {
+		if err := p.expect(token.Key); err != nil {
 			return nil, err
 		}
 		c.Kind = ast.ConstraintPrimaryKey
@@ -773,7 +776,7 @@ func (p *parser) parseTableConstraint(pos token.Pos, name ast.Name) (*ast.TableC
 		return c, nil
 	default: // FOREIGN KEY
 		p.next()
-		if _, err := p.expect(token.Key); err != nil {
+		if err := p.expect(token.Key); err != nil {
 			return nil, err
 		}
 		c.Kind = ast.ConstraintReferences
@@ -786,7 +789,7 @@ func (p *parser) parseTableConstraint(pos token.Pos, name ast.Name) (*ast.TableC
 	c.Columns = cols
 
 	if c.Kind == ast.ConstraintReferences {
-		if _, err := p.expect(token.References); err != nil {
+		if err := p.expect(token.References); err != nil {
 			return nil, err
 		}
 		ref, err := p.parseForeignKeyRef()
@@ -823,14 +826,14 @@ func (p *parser) parseColumnDef() (*ast.ColumnDef, error) {
 		c := &ast.ColumnConstraint{ConstraintPos: pos, Name: cname}
 		switch {
 		case p.accept(token.Not):
-			if _, err := p.expect(token.Null); err != nil {
+			if err := p.expect(token.Null); err != nil {
 				return nil, err
 			}
 			c.Kind = ast.ConstraintNotNull
 		case p.accept(token.Null):
 			c.Kind = ast.ConstraintNull
 		case p.accept(token.Primary):
-			if _, err := p.expect(token.Key); err != nil {
+			if err := p.expect(token.Key); err != nil {
 				return nil, err
 			}
 			c.Kind = ast.ConstraintPrimaryKey
@@ -920,7 +923,7 @@ func (p *parser) parseRefAction() (ast.RefAction, error) {
 }
 
 func (p *parser) parseNameList() ([]ast.Name, error) {
-	if _, err := p.expect(token.LParen); err != nil {
+	if err := p.expect(token.LParen); err != nil {
 		return nil, err
 	}
 	var names []ast.Name
@@ -934,21 +937,21 @@ func (p *parser) parseNameList() ([]ast.Name, error) {
 			break
 		}
 	}
-	if _, err := p.expect(token.RParen); err != nil {
+	if err := p.expect(token.RParen); err != nil {
 		return nil, err
 	}
 	return names, nil
 }
 
 func (p *parser) parseParenExpr() (ast.Expr, error) {
-	if _, err := p.expect(token.LParen); err != nil {
+	if err := p.expect(token.LParen); err != nil {
 		return nil, err
 	}
 	e, err := p.parseExpr(bpNone)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(token.RParen); err != nil {
+	if err := p.expect(token.RParen); err != nil {
 		return nil, err
 	}
 	return e, nil

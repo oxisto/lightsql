@@ -283,7 +283,7 @@ func floatArith(op ast.BinaryOp, a, b float64) (types.Value, error) {
 
 // evalPair evaluates both operands, which every non-short-circuiting operator
 // needs.
-func evalPair(l, r Eval, args []types.Value, row Row) (types.Value, types.Value, error) {
+func evalPair(l, r Eval, args []types.Value, row Row) (left, right types.Value, err error) {
 	lv, err := l(args, row)
 	if err != nil {
 		return types.Value{}, types.Value{}, err

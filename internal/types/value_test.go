@@ -1,6 +1,7 @@
 package types
 
 import (
+	"cmp"
 	"hash/maphash"
 	"math"
 	"testing"
@@ -144,7 +145,7 @@ func TestCompareIsATotalOrder(t *testing.T) {
 	for i := range ordered {
 		for j := range ordered {
 			got := Compare(ordered[i], ordered[j])
-			want := cmpInt(int64(i), int64(j))
+			want := cmp.Compare(i, j)
 			if got != want {
 				t.Errorf("Compare(%v, %v) = %d, want %d", ordered[i], ordered[j], got, want)
 			}

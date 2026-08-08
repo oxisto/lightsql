@@ -309,7 +309,7 @@ func ExecUpdate(ctx context.Context, up *plan.Update, args []types.Value) (Resul
 	}
 
 	var res Result
-	err = up.Table.Mutate(func(_ int, row []types.Value) ([]types.Value, error) {
+	err = up.Table.Mutate(func(row []types.Value) ([]types.Value, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -364,7 +364,7 @@ func ExecDelete(ctx context.Context, del *plan.Delete, args []types.Value) (Resu
 	}
 
 	var res Result
-	err = del.Table.Mutate(func(_ int, row []types.Value) ([]types.Value, error) {
+	err = del.Table.Mutate(func(row []types.Value) ([]types.Value, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
