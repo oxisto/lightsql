@@ -1,0 +1,76 @@
+#!/bin/sh
+# Reject commit subjects that do not follow the convention in CONTRIBUTING.md:
+#
+#     package: lower-case imperative summary
+#
+# The rule is enforced here rather than documented and hoped for. A convention
+# that lives only in a file nobody re-reads is a convention that erodes, and the
+# cost of catching a bad subject after the fact is a rewrite of published history.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+# Character ranges such as [A-Z] are collation-dependent: under a UTF-8 locale
+# they also match lower-case letters, which would make every check below either
+# fire or never fire. Pin the C locale so the ranges mean what they say.
+LC_ALL=C
+export LC_ALL
+
+subject=$(sed -n '1p' "$1")
+
+# Skip anything git generates or that is not a real subject yet.
+case "$subject" in
+	'#'*|'') exit 0 ;;
+	Merge\ *|Revert\ *|fixup!\ *|squash!\ *|amend!\ *) exit 0 ;;
+	# Dependabot and friends; there is no value in rewriting these.
+	'build(deps'*) exit 0 ;;
+esac
+
+fail() {
+	echo "commit-msg: $1" >&2
+	echo >&2
+	echo "  subject: $subject" >&2
+	echo >&2
+	echo "Expected:  package: lower-case imperative summary" >&2
+	echo "Examples:  exec: fix non-terminating scan on SELECT without FROM" >&2
+	echo "           scanner, parser: carry positions through quoted identifiers" >&2
+	echo "           all: gofmt after the Go 1.27 comment change" >&2
+	echo "           docs: describe the WAL layout" >&2
+	echo >&2
+	echo "See CONTRIBUTING.md#commit-messages." >&2
+	exit 1
+}
+
+# Conventional Commit prefixes are called out by name, because that is the
+# mistake most likely to be made by habit from another project.
+case "$subject" in
+	feat:*|feat\(*|fix:*|fix\(*|chore:*|chore\(*|refactor:*|refactor\(*|test:*|test\(*|perf:*|perf\(*|style:*|style\(*)
+		fail "Conventional Commit prefixes are not used in this repository" ;;
+esac
+
+case "$subject" in
+	*:\ *) ;;
+	*) fail "missing the 'package: ' prefix" ;;
+esac
+
+area=${subject%%:*}
+rest=${subject#*: }
+
+# One or more lowercase package names, comma-separated: "parser" or "scanner, parser".
+if ! printf '%s' "$area" | grep -Eq '^[a-z][a-z0-9]*(, [a-z][a-z0-9]*)*$'; then
+	fail "'$area' is not a package list; use lowercase names separated by ', '"
+fi
+
+case "$rest" in
+	[A-Z]*) fail "the summary should start lower case" ;;
+	'') fail "the summary is empty" ;;
+esac
+
+case "$rest" in
+	*.) fail "the summary should not end with a period" ;;
+esac
+
+if [ ${#subject} -gt 72 ]; then
+	fail "the subject is ${#subject} characters; keep it to 72"
+fi
+
+exit 0

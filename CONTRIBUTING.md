@@ -8,11 +8,17 @@ tested, and what a change is expected to include.
 ```sh
 git clone https://github.com/oxisto/lightsql
 cd lightsql
+git config core.hooksPath .githooks   # enables the commit-msg check
 go test ./...
 ```
 
 There is nothing to install. The root module depends on the standard library and
 `golang.org/x/*` only, and a test enforces that.
+
+The `core.hooksPath` line is a one-time step per clone. Git does not track `.git/hooks`,
+so a repository cannot ship hooks that enable themselves; pointing at the tracked
+`.githooks/` directory is the closest thing. It only checks the commit subject format
+described below.
 
 ## Layout
 
@@ -131,12 +137,16 @@ Rules:
 - **Issues**: close with `Fixes #123` on its own line at the end of the body.
 
 Dependabot's `build(deps): bump ...` subjects are left as they are; there is no value
-in rewriting them.
+in rewriting them. Merge, revert and `fixup!` subjects are exempt too.
 
 Do not use `feat:` / `fix:` Conventional Commit prefixes here. They encode the kind of
 change rather than its location, and lightsql has no semantic-release tooling that
 would make the trade worthwhile — the compatibility matrix already serves as the
 user-facing changelog.
+
+All of the above is enforced by `.githooks/commit-msg`, so a wrong subject fails at
+commit time rather than being noticed after it has been pushed, when fixing it means
+rewriting published history.
 
 ## Pull requests
 
