@@ -3,6 +3,7 @@ package exec
 import (
 	"context"
 	"math"
+	"slices"
 
 	"github.com/oxisto/lightsql/internal/catalog"
 	"github.com/oxisto/lightsql/internal/pgerr"
@@ -57,6 +58,21 @@ func Build(n plan.Node, args []types.Value) (Operator, error) {
 			}
 		}
 		return &projectOp{input: input, evals: evals, args: args, out: make(Row, len(evals))}, nil
+
+	case *plan.Sort:
+		input, err := Build(n.Input, args)
+		if err != nil {
+			return nil, err
+		}
+		keys := make([]sortKey, len(n.Keys))
+		for i, k := range n.Keys {
+			eval, err := Compile(k.Expr)
+			if err != nil {
+				return nil, err
+			}
+			keys[i] = sortKey{eval: eval, desc: k.Desc, nullsFirst: k.NullsFirst}
+		}
+		return &sortOp{input: input, keys: keys, args: args}, nil
 
 	case *plan.Limit:
 		input, err := Build(n.Input, args)
@@ -221,6 +237,132 @@ func (o *projectOp) Next(ctx context.Context) (Row, bool, error) {
 }
 
 func (o *projectOp) Close() error { return o.input.Close() }
+
+// sortKey is one compiled ORDER BY term.
+type sortKey struct {
+	eval       Eval
+	desc       bool
+	nullsFirst bool
+}
+
+// sortOp orders its input.
+//
+// Sorting cannot stream: the last row read may belong first, so the whole input
+// is drained before anything is emitted. That makes this the one operator whose
+// memory is proportional to the result, which is acceptable at the scale
+// lightsql targets and is why the ordering rules live here rather than being
+// pushed into the scan.
+type sortOp struct {
+	input  Operator
+	keys   []sortKey
+	args   []types.Value
+	rows   []Row
+	i      int
+	sorted bool
+}
+
+func (o *sortOp) Next(ctx context.Context) (Row, bool, error) {
+	if !o.sorted {
+		if err := o.drainAndSort(ctx); err != nil {
+			return nil, false, err
+		}
+	}
+	if o.i >= len(o.rows) {
+		return nil, false, nil
+	}
+	row := o.rows[o.i]
+	o.i++
+	return row, true, nil
+}
+
+func (o *sortOp) drainAndSort(ctx context.Context) error {
+	// Sort keys are computed once per row here rather than inside the
+	// comparison, which would recompute them O(n log n) times.
+	type entry struct {
+		row  Row
+		keys []types.Value
+	}
+	var entries []entry
+
+	for {
+		row, ok, err := o.input.Next(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+
+		keys := make([]types.Value, len(o.keys))
+		for i, k := range o.keys {
+			if keys[i], err = k.eval(o.args, row); err != nil {
+				return err
+			}
+		}
+		// The operator contract says a row is only valid until the next Next,
+		// so any operator that accumulates rows must copy them. Sorting is the
+		// first place that matters.
+		owned := make(Row, len(row))
+		copy(owned, row)
+		entries = append(entries, entry{row: owned, keys: keys})
+	}
+
+	// The comparison cannot fail, because every key was already evaluated above.
+	// That is the reason for precomputing them beyond the wasted work: a sort
+	// comparator has nowhere to report an error to.
+	//
+	// A stable sort makes the result deterministic for rows that tie on every
+	// key. SQL does not require that, but a test asserting on output should not
+	// depend on which of two equal rows came back first.
+	slices.SortStableFunc(entries, func(a, b entry) int {
+		for i, k := range o.keys {
+			if c := compareSortKey(a.keys[i], b.keys[i], k.desc, k.nullsFirst); c != 0 {
+				return c
+			}
+		}
+		return 0
+	})
+
+	o.rows = make([]Row, len(entries))
+	for i, e := range entries {
+		o.rows[i] = e.row
+	}
+	o.sorted = true
+	return nil
+}
+
+// compareSortKey orders two key values under one ORDER BY term.
+//
+// NULL placement is deliberately independent of direction: DESC reverses the
+// ordering of the values, but where NULLs land is decided by nullsFirst, which
+// the binder already resolved from the term's direction and any explicit NULLS
+// FIRST/LAST. Folding the two together is how DESC NULLS LAST ends up putting
+// NULLs first.
+func compareSortKey(a, b types.Value, desc, nullsFirst bool) int {
+	aNull, bNull := a.IsNull(), b.IsNull()
+	switch {
+	case aNull && bNull:
+		return 0
+	case aNull:
+		if nullsFirst {
+			return -1
+		}
+		return 1
+	case bNull:
+		if nullsFirst {
+			return 1
+		}
+		return -1
+	}
+
+	c := types.Compare(a, b)
+	if desc {
+		return -c
+	}
+	return c
+}
+
+func (o *sortOp) Close() error { return o.input.Close() }
 
 // limitOp applies OFFSET and LIMIT.
 type limitOp struct {
