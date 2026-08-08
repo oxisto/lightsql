@@ -101,9 +101,57 @@ One subtlety when adding a keyword: decide whether it must be **reserved**. An
 unreserved word appearing where an alias is legal gets swallowed as an alias — this is
 why `CROSS` and `USING` are reserved keywords rather than identifiers matched by value.
 
+## Commit messages
+
+lightsql follows the Go project's convention: the subject starts with the affected
+package, then a colon, then a lower-case imperative summary.
+
+```
+scanner: resolve dollar-quote tags verbatim
+parser: add UNION, INTERSECT and EXCEPT
+binder: reject aggregates outside GROUP BY
+exec: fix non-terminating scan on SELECT without FROM
+types: hash numeric kinds by class so equal values agree
+```
+
+The prefix names *where*, which in a strict pipeline is the first thing anyone wants
+to know: a bug is always "the binder rejects X" or "the scanner mislexes Y". Use the
+package's base name without the `internal/` prefix — `scanner`, not `internal/scanner`.
+
+Rules:
+
+- **Subject**: at most 72 characters, imperative mood, no trailing period, and the
+  part after the colon starts lower case.
+- **Several packages**: list them, most significant first —
+  `scanner, parser: carry positions through quoted identifiers`.
+- **Tree-wide**: use `all:`, e.g. `all: gofmt after the Go 1.27 comment change`.
+- **Repository docs and tooling**: `docs:`, `ci:`, `build:`.
+- **Body**: explain *why*, wrapped at 72 columns. The diff already says what. If the
+  change is not obvious, say what the alternative was and why it was rejected.
+- **Issues**: close with `Fixes #123` on its own line at the end of the body.
+
+Dependabot's `build(deps): bump ...` subjects are left as they are; there is no value
+in rewriting them.
+
+Do not use `feat:` / `fix:` Conventional Commit prefixes here. They encode the kind of
+change rather than its location, and lightsql has no semantic-release tooling that
+would make the trade worthwhile — the compatibility matrix already serves as the
+user-facing changelog.
+
 ## Pull requests
+
+Title a PR exactly like a commit subject: `parser: add window function syntax`. For a
+PR spanning several packages, use the most significant one, or `all:`.
+
+The description should cover, briefly:
+
+- **Why** the change is needed. Link the issue if there is one.
+- **What approach** was taken, and what was rejected, if a reader would wonder.
+- **How it was verified** beyond the test suite, if anything.
+
+Before opening:
 
 - `gofmt -l .` prints nothing, `go vet ./...` is clean, `go test ./...` passes.
 - One logical change per PR.
-- Explain *why* in the description. The code says what.
-- New behaviour comes with tests; new SQL comes with a `features` entry.
+- New behaviour comes with tests; new SQL comes with a `features` entry and a
+  regenerated README.

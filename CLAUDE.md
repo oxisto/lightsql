@@ -93,6 +93,26 @@ order. The short version:
 
 Step 6 is not optional: the matrix is generated and tested, so a stale entry fails CI.
 
+## Commit and PR style
+
+Go project convention: `package: lower-case imperative summary`, at most 72 characters,
+no trailing period.
+
+```
+exec: fix non-terminating scan on SELECT without FROM
+scanner, parser: carry positions through quoted identifiers
+all: gofmt after the Go 1.27 comment change
+docs: settle on Go-style commit messages
+```
+
+Use the package base name, not the `internal/` path. Several packages are listed
+most-significant-first; tree-wide changes use `all:`; repository docs and tooling use
+`docs:`, `ci:` or `build:`. Do **not** use `feat:` / `fix:` prefixes — the convention
+here names *where* a change lands, which is the useful axis in a staged pipeline.
+
+The body explains why, wrapped at 72 columns. PR titles follow the same format.
+Dependabot's `build(deps):` subjects are left alone.
+
 ## Conventions
 
 - Comments explain *why*, especially where the code deliberately differs from an obvious
