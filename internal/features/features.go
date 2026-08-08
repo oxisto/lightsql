@@ -1,0 +1,363 @@
+// Package features is the single source of truth for lightsql's SQL
+// compatibility matrix.
+//
+// The table in README.md is generated from this registry, and a test regenerates
+// and diffs it, so the documented compatibility cannot drift from the code. Each
+// entry also carries a probe: a representative statement that must parse when the
+// front end claims support and must be rejected when it does not. That turns the
+// matrix from a promise into an assertion — a feature cannot be marked supported
+// without at least one statement proving it.
+//
+// Adding a SQL feature therefore includes updating this file; see the
+// sql-feature skill in .claude/skills.
+package features
+
+import (
+	"fmt"
+	"strings"
+)
+
+// Status describes how far a feature has been implemented.
+type Status uint8
+
+const (
+	// No means the feature is deliberately out of scope.
+	No Status = iota
+	// Planned means it is intended but not implemented.
+	Planned
+	// Partial means the common forms work but some do not; Note says which.
+	Partial
+	// Yes means fully implemented.
+	Yes
+)
+
+// mark is the cell rendered in the README for each status.
+var mark = map[Status]string{
+	Yes:     "✅",
+	Partial: "🟡",
+	Planned: "⬜",
+	No:      "❌",
+}
+
+func (s Status) String() string {
+	switch s {
+	case Yes:
+		return "yes"
+	case Partial:
+		return "partial"
+	case Planned:
+		return "planned"
+	default:
+		return "no"
+	}
+}
+
+// Feature is one row of the compatibility matrix.
+//
+// Parse and Exec are tracked separately because the front end legitimately runs
+// ahead of the executor during development, and collapsing them into one column
+// would either overstate or understate what works.
+type Feature struct {
+	// Name is the SQL construct, written as it appears in the standard.
+	Name string
+	// Parse is the status of the scanner, parser and AST.
+	Parse Status
+	// Exec is the status of the binder, planner and executor.
+	Exec Status
+	// Note explains a Partial status or records a caveat. Keep it to a clause.
+	Note string
+	// SQL is a representative statement used as a probe. It must be a complete,
+	// self-contained statement. Leave empty only when no single statement can
+	// demonstrate the feature.
+	SQL string
+	// Setup holds statements run before SQL in a fresh instance, so that a probe
+	// can refer to a table. Without it, an execution probe could only ever
+	// demonstrate features that need no schema.
+	Setup []string
+}
+
+// Overall reduces the two axes to the status a user actually experiences: a
+// feature the parser accepts but the executor cannot run is not usable.
+func (f Feature) Overall() Status {
+	return min(f.Parse, f.Exec)
+}
+
+// Group is a named section of the matrix.
+type Group struct {
+	Name     string
+	Features []Feature
+}
+
+// probeTable is the fixture most query probes run against. Sharing one schema
+// keeps each probe's SQL about the feature rather than the scaffolding.
+var probeTable = []string{
+	`CREATE TABLE t (a INT, b INT, c INT, s TEXT, flag BOOLEAN)`,
+}
+
+// probeJoin adds a second table, for probes that need two.
+var probeJoin = []string{
+	`CREATE TABLE t (a INT, b INT, id INT, s TEXT)`,
+	`CREATE TABLE u (a INT, b INT, id INT)`,
+}
+
+// Groups is the registry. Order here is the order in the README.
+var Groups = []Group{
+	{
+		Name: "Data definition",
+		Features: []Feature{
+			{Name: "CREATE TABLE", Parse: Yes, Exec: Yes,
+				SQL: "CREATE TABLE t (id INT, name TEXT)"},
+			{Name: "CREATE TABLE IF NOT EXISTS", Parse: Yes, Exec: Yes,
+				SQL: "CREATE TABLE IF NOT EXISTS t (id INT)"},
+			{Name: "Column constraints", Parse: Yes, Exec: Partial,
+				Note: "NOT NULL and PRIMARY KEY are enforced; UNIQUE, DEFAULT, CHECK and REFERENCES parse but are not applied",
+				SQL:  "CREATE TABLE t (id INT PRIMARY KEY, n INT NOT NULL)"},
+			{Name: "Table constraints", Parse: Yes, Exec: Partial,
+				Note: "PRIMARY KEY only",
+				SQL:  "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))"},
+			{Name: "Referential actions", Parse: Yes, Exec: Planned,
+				Note: "ON DELETE / ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT",
+				SQL:  "CREATE TABLE t (a INT REFERENCES u (id) ON DELETE CASCADE)"},
+			{Name: "DROP TABLE", Parse: Planned, Exec: Planned, SQL: "DROP TABLE t"},
+			{Name: "ALTER TABLE", Parse: Planned, Exec: Planned, SQL: "ALTER TABLE t ADD COLUMN c INT"},
+			{Name: "CREATE INDEX", Parse: Planned, Exec: Planned, SQL: "CREATE INDEX i ON t (a)"},
+			{Name: "CREATE VIEW", Parse: Planned, Exec: Planned, SQL: "CREATE VIEW v AS SELECT 1"},
+			{Name: "CREATE SCHEMA", Parse: Planned, Exec: Planned, SQL: "CREATE SCHEMA s"},
+			{Name: "Sequences and SERIAL", Parse: Yes, Exec: Yes,
+				Note:  "an omitted SERIAL column is filled from a per-column sequence",
+				Setup: []string{"CREATE TABLE s (id BIGSERIAL PRIMARY KEY, v INT)"},
+				SQL:   "INSERT INTO s (v) VALUES (1)"},
+		},
+	},
+	{
+		Name: "Data manipulation",
+		Features: []Feature{
+			{Name: "INSERT ... VALUES", Parse: Yes, Exec: Yes,
+				Note:  "including multi-row VALUES",
+				Setup: probeTable,
+				SQL:   "INSERT INTO t (a, s) VALUES (1, 'x'), (2, 'y')"},
+			{Name: "INSERT ... SELECT", Parse: Yes, Exec: Planned,
+				Setup: probeJoin,
+				SQL:   "INSERT INTO t (a) SELECT b FROM u"},
+			{Name: "RETURNING", Parse: Yes, Exec: Planned,
+				Note:  "on INSERT; UPDATE and DELETE pending",
+				Setup: probeTable,
+				SQL:   "INSERT INTO t (a) VALUES (1) RETURNING a"},
+			{Name: "UPDATE", Parse: Planned, Exec: Planned, SQL: "UPDATE t SET a = 1 WHERE b = 2"},
+			{Name: "DELETE", Parse: Planned, Exec: Planned, SQL: "DELETE FROM t WHERE a = 1"},
+			{Name: "ON CONFLICT", Parse: Planned, Exec: Planned,
+				SQL: "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING"},
+			{Name: "TRUNCATE", Parse: Planned, Exec: Planned, SQL: "TRUNCATE t"},
+		},
+	},
+	{
+		Name: "Queries",
+		Features: []Feature{
+			{Name: "SELECT list, aliases", Parse: Yes, Exec: Yes,
+				Note:  "AS is optional",
+				Setup: probeTable,
+				SQL:   "SELECT a AS x, b y, * FROM t"},
+			{Name: "SELECT without FROM", Parse: Yes, Exec: Yes,
+				SQL: "SELECT 1 + 1"},
+			{Name: "WHERE", Parse: Yes, Exec: Yes,
+				Setup: probeTable,
+				SQL:   "SELECT a FROM t WHERE a > 1"},
+			{Name: "LIMIT / OFFSET", Parse: Yes, Exec: Yes,
+				Note:  "either order, LIMIT ALL accepted",
+				Setup: probeTable,
+				SQL:   "SELECT a FROM t LIMIT 10 OFFSET 5"},
+			{Name: "Table aliases", Parse: Yes, Exec: Yes,
+				Note:  "an alias replaces the table name, as in PostgreSQL",
+				Setup: probeTable,
+				SQL:   "SELECT x.a FROM t x WHERE x.b > 1"},
+			{Name: "Inner and outer joins", Parse: Yes, Exec: Planned,
+				Note:  "INNER, LEFT, RIGHT, FULL, CROSS, with ON or USING",
+				Setup: probeJoin,
+				SQL:   "SELECT t.a FROM t LEFT OUTER JOIN u ON t.id = u.id"},
+			{Name: "GROUP BY / HAVING", Parse: Yes, Exec: Planned,
+				Setup: probeTable,
+				SQL:   "SELECT a FROM t GROUP BY a HAVING count(*) > 1"},
+			{Name: "Aggregate functions", Parse: Yes, Exec: Planned,
+				Note:  "parsed generically; the function library is pending",
+				Setup: probeTable,
+				SQL:   "SELECT count(*), sum(a), avg(b), min(c), max(a) FROM t"},
+			{Name: "ORDER BY", Parse: Yes, Exec: Planned,
+				Note:  "ASC/DESC and NULLS FIRST/LAST",
+				Setup: probeTable,
+				SQL:   "SELECT a FROM t ORDER BY a DESC NULLS FIRST, b"},
+			{Name: "DISTINCT / DISTINCT ON", Parse: Yes, Exec: Planned,
+				Setup: probeTable,
+				SQL:   "SELECT DISTINCT ON (a) a, b FROM t"},
+			{Name: "Subqueries", Parse: Yes, Exec: Planned,
+				Note:  "scalar, IN, EXISTS, and derived tables",
+				Setup: probeJoin,
+				SQL:   "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)"},
+			{Name: "UNION / INTERSECT / EXCEPT", Parse: Planned, Exec: Planned,
+				SQL: "SELECT a FROM t UNION SELECT b FROM u"},
+			{Name: "Common table expressions", Parse: Planned, Exec: Planned,
+				Note: "WITH, including RECURSIVE",
+				SQL:  "WITH x AS (SELECT 1) SELECT * FROM x"},
+			{Name: "Window functions", Parse: No, Exec: No,
+				Note: "out of scope for v1",
+				SQL:  "SELECT row_number() OVER (ORDER BY a) FROM t"},
+		},
+	},
+	{
+		Name: "Expressions",
+		Features: []Feature{
+			{Name: "Operator precedence", Parse: Yes, Exec: Yes,
+				Note:  "full PostgreSQL precedence table, including left-associative ^",
+				Setup: probeTable,
+				SQL:   "SELECT a * b + c, -2 ^ 2 FROM t"},
+			{Name: "Comparison and logic", Parse: Yes, Exec: Yes,
+				Note:  "three-valued logic throughout",
+				Setup: probeTable,
+				SQL:   "SELECT a FROM t WHERE a = 1 AND NOT b <> 2 OR c >= 3"},
+			{Name: "IS NULL / IS DISTINCT FROM", Parse: Yes, Exec: Yes,
+				Setup: probeTable,
+				SQL:   "SELECT a FROM t WHERE a IS NULL AND b IS NOT DISTINCT FROM c"},
+			{Name: "String concatenation", Parse: Yes, Exec: Yes,
+				Note:  "NULL propagates, as in PostgreSQL",
+				Setup: probeTable,
+				SQL:   "SELECT s || 'x' FROM t"},
+			{Name: "Parameter placeholders", Parse: Yes, Exec: Yes,
+				Note:  "$1 and ?, not mixed in one statement; the type is inferred from context",
+				Setup: probeTable,
+				SQL:   "SELECT a FROM t WHERE b = $1 AND c = $2"},
+			{Name: "BETWEEN / IN / LIKE", Parse: Yes, Exec: Planned,
+				Note:  "including the negated forms",
+				Setup: probeTable,
+				SQL:   "SELECT a FROM t WHERE a BETWEEN 1 AND 2"},
+			{Name: "CASE", Parse: Yes, Exec: Planned,
+				Note:  "simple and searched forms",
+				Setup: probeTable,
+				SQL:   "SELECT CASE WHEN a > 1 THEN 1 ELSE 2 END FROM t"},
+			{Name: "CAST", Parse: Yes, Exec: Planned,
+				Note:  "both CAST(x AS t) and x::t",
+				Setup: probeTable,
+				SQL:   "SELECT CAST(a AS TEXT) FROM t"},
+			{Name: "Scalar functions", Parse: Yes, Exec: Planned,
+				Note:  "parsed generically; the function library is pending",
+				Setup: probeTable,
+				SQL:   "SELECT coalesce(a, b, 0) FROM t"},
+			{Name: "Arrays", Parse: No, Exec: No, Note: "out of scope for v1"},
+			{Name: "JSON / JSONB", Parse: No, Exec: No, Note: "out of scope for v1"},
+		},
+	},
+	{
+		Name: "Types",
+		Features: []Feature{
+			{Name: "Integer types", Parse: Yes, Exec: Yes,
+				Note: "SMALLINT, INT, BIGINT stored as int64",
+				SQL:  "CREATE TABLE t (a SMALLINT, b INT, c BIGINT)"},
+			{Name: "Floating point", Parse: Yes, Exec: Yes,
+				Note: "REAL and DOUBLE PRECISION stored as float64",
+				SQL:  "CREATE TABLE t (a REAL, b DOUBLE PRECISION)"},
+			{Name: "Character types", Parse: Yes, Exec: Yes,
+				Note: "TEXT, VARCHAR(n), CHARACTER VARYING(n), CHAR; length is recorded but not enforced",
+				SQL:  "CREATE TABLE t (a TEXT, b VARCHAR(255), c CHARACTER VARYING(10))"},
+			{Name: "BOOLEAN", Parse: Yes, Exec: Yes, SQL: "CREATE TABLE t (a BOOLEAN)"},
+			{Name: "Date and time", Parse: Yes, Exec: Partial,
+				Note: "columns and time.Time arguments work; date and time literals are pending",
+				SQL:  "CREATE TABLE t (a DATE, b TIMESTAMP WITH TIME ZONE)"},
+			{Name: "BYTEA", Parse: Yes, Exec: Yes, SQL: "CREATE TABLE t (a BYTEA)"},
+			{Name: "NUMERIC / DECIMAL", Parse: Yes, Exec: Partial,
+				Note: "stored as double precision; exact decimal arithmetic is pending",
+				SQL:  "CREATE TABLE t (a NUMERIC(10, 2))"},
+			{Name: "UUID", Parse: Yes, Exec: Partial,
+				Note: "accepted and stored as text; no validation",
+				SQL:  "CREATE TABLE t (a UUID)"},
+		},
+	},
+	{
+		Name: "Transactions and sessions",
+		Features: []Feature{
+			{Name: "BEGIN / COMMIT / ROLLBACK", Parse: Planned, Exec: Planned,
+				Note: "via database/sql Tx"},
+			{Name: "Isolation levels", Parse: Planned, Exec: Planned,
+				Note: "READ COMMITTED, REPEATABLE READ, SERIALIZABLE honoured from sql.TxOptions"},
+			{Name: "Savepoints", Parse: Planned, Exec: Planned},
+			{Name: "MVCC snapshot isolation", Parse: Planned, Exec: Planned,
+				Note: "readers never block writers"},
+		},
+	},
+	{
+		Name: "Driver and diagnostics",
+		Features: []Feature{
+			{Name: "Named in-memory instances", Parse: Yes, Exec: Yes,
+				Note: "one data source name per test; Drop releases an instance"},
+			{Name: "Multi-statement Exec", Parse: Yes, Exec: Yes,
+				Note:  "a fixture can be one semicolon-separated batch",
+				Setup: probeTable,
+				SQL:   "INSERT INTO t (a) VALUES (1); INSERT INTO t (a) VALUES (2)"},
+			{Name: "Prepared statements", Parse: Yes, Exec: Yes,
+				Note: "bound once, executed repeatedly"},
+			{Name: "Column type introspection", Parse: Yes, Exec: Yes,
+				Note: "ScanType, DatabaseTypeName and Nullable for ORMs"},
+			{Name: "Context cancellation", Parse: Yes, Exec: Yes,
+				Note: "checked inside the operator loop, so a running query stops"},
+			{Name: "SQLSTATE on every error", Parse: Yes, Exec: Yes,
+				Note: "errors satisfy interface{ SQLState() string }, as pgx and lib/pq do"},
+			{Name: "File-backed storage", Parse: Planned, Exec: Planned,
+				Note: "WAL plus periodic snapshot"},
+		},
+	},
+	{
+		Name: "Lexical",
+		Features: []Feature{
+			{Name: "Comments", Parse: Yes, Exec: Yes,
+				Note: "-- to end of line, and nestable /* */",
+				SQL:  "SELECT 1 -- trailing\n/* block /* nested */ */"},
+			{Name: "Quoted identifiers", Parse: Yes, Exec: Yes,
+				Note:  "case preserving, doubled quote escapes",
+				Setup: []string{`CREATE TABLE "User" ("Name" TEXT)`},
+				SQL:   `SELECT "Name" FROM "User"`},
+			{Name: "String literals", Parse: Yes, Exec: Yes,
+				Note: "doubled-quote escapes and E-prefixed backslash escapes",
+				SQL:  `SELECT 'it''s', E'a\nb'`},
+			{Name: "Dollar quoting", Parse: Yes, Exec: Yes,
+				Note: "$$ and $tag$, contents taken verbatim",
+				SQL:  "SELECT $tag$ raw 'text' $tag$"},
+			{Name: "Positional errors", Parse: Yes, Exec: Yes,
+				Note: "every error carries a byte offset into the statement"},
+		},
+	},
+}
+
+// Markdown renders the whole matrix.
+func Markdown() string {
+	var b strings.Builder
+
+	b.WriteString("| | Feature | Parses | Executes | Notes |\n")
+	b.WriteString("|---|---|:---:|:---:|---|\n")
+	for _, g := range Groups {
+		fmt.Fprintf(&b, "| | **%s** | | | |\n", g.Name)
+		for _, f := range g.Features {
+			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n",
+				mark[f.Overall()], f.Name, mark[f.Parse], mark[f.Exec], f.Note)
+		}
+	}
+
+	b.WriteString("\n")
+	b.WriteString("✅ supported &nbsp;&nbsp; 🟡 partial &nbsp;&nbsp; ⬜ planned &nbsp;&nbsp; ❌ out of scope\n")
+	return b.String()
+}
+
+// Summary counts features by overall status, for the README's headline.
+func Summary() (yes, partial, planned, no int) {
+	for _, g := range Groups {
+		for _, f := range g.Features {
+			switch f.Overall() {
+			case Yes:
+				yes++
+			case Partial:
+				partial++
+			case Planned:
+				planned++
+			default:
+				no++
+			}
+		}
+	}
+	return
+}

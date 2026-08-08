@@ -1,0 +1,7 @@
+# Fuzzing corpora found by `go test -fuzz` are cached outside the repo; only
+# crashers land here, and those should be committed deliberately as testdata.
+/**/testdata/fuzz/
+
+# Local build and coverage output.
+*.out
+*.test
