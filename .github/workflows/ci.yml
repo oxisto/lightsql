@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The workflow only reads the repository. Nothing here needs write access, and a
+# workflow that cannot write cannot be turned into one by a malicious pull
+# request from a fork.
+permissions:
+  contents: read
+
+# A new push to a branch makes the run in progress irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # Tracks the go directive rather than pinning a version here, so the
+          # toolchain cannot drift from what the module declares.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./... -count=1 -timeout 5m
+
+      # The race detector is a separate step so a failure says plainly whether
+      # the problem is logic or concurrency. It matters here because
+      # database/sql hands a single engine to many pooled connections.
+      - name: Test with the race detector
+        run: go test ./... -race -count=1 -timeout 10m
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # A stale go.mod or go.sum is caught here rather than by whoever next runs
+      # a build. The repository also promises no runtime dependencies outside
+      # golang.org/x, which TestNoRuntimeDependencies enforces in the test job.
+      - name: go mod tidy is a no-op
+        run: |
+          go mod tidy
+          if ! git diff --quiet -- go.mod go.sum; then
+            echo "go mod tidy changed go.mod or go.sum; commit the result:" >&2
+            git diff -- go.mod go.sum >&2
+            exit 1
+          fi
+
+  commit-style:
+    name: commit-style
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The full history is needed to walk the commits the PR adds.
+          fetch-depth: 0
+
+      # Both are checked because the repository squash-merges with
+      # COMMIT_OR_PR_TITLE: a single-commit PR takes that commit's subject, and
+      # anything larger takes the PR title. Either can end up on main.
+      #
+      # The check reuses .githooks/commit-msg rather than restating the rule, so
+      # the local hook and CI cannot disagree about what is valid.
+      - name: Pull request title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$PR_TITLE" > /tmp/pr-title
+          echo "Checking pull request title: $PR_TITLE"
+          ./.githooks/commit-msg /tmp/pr-title
+
+      - name: Commit subjects
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Not named "status": that identifier is read-only in zsh, so anyone
+          # running these steps locally would hit an error rather than a result.
+          failed=0
+          # Iterating over hashes rather than subjects keeps the loop safe for
+          # subjects containing spaces or quotes.
+          for sha in $(git rev-list "$BASE_SHA".."$HEAD_SHA"); do
+            git log -1 --format=%B "$sha" > /tmp/commit-msg
+            subject=$(git log -1 --format=%s "$sha")
+            if ./.githooks/commit-msg /tmp/commit-msg; then
+              echo "ok   $(git rev-parse --short "$sha")  $subject"
+            else
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo >&2
+            echo "Enable the hook locally to catch this before pushing:" >&2
+            echo "  git config core.hooksPath .githooks" >&2
+          fi
+          exit "$failed"
