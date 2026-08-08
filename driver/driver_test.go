@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -775,6 +776,197 @@ func TestOrderByErrors(t *testing.T) {
 				t.Errorf("SQLSTATE = %s, want %s (error: %v)", got, tt.want, err)
 			}
 		})
+	}
+}
+
+// sqlstate returns the SQLSTATE an error carries, or "" if it carries none.
+func sqlstate(err error) string {
+	var coded interface{ SQLState() string }
+	if errors.As(err, &coded) {
+		return coded.SQLState()
+	}
+	return ""
+}
+
+// TestUniqueConstraint is the regression test for constraints that parsed and
+// were then silently ignored. A test asserting that a duplicate is rejected used
+// to pass while the duplicate was happily inserted, which is worse than the
+// feature being missing.
+func TestUniqueConstraint(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT);
+		INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'Alice');
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"duplicate primary key", `INSERT INTO users (id, email) VALUES (1, 'b@x')`},
+		{"duplicate unique column", `INSERT INTO users (id, email) VALUES (2, 'a@x')`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := db.Exec(tt.query)
+			if err == nil {
+				t.Fatalf("%s was accepted, want a unique violation", tt.query)
+			}
+			if got := sqlstate(err); got != "23505" {
+				t.Errorf("SQLSTATE = %q, want 23505 (error: %v)", got, err)
+			}
+		})
+	}
+
+	// The rejected rows must not have landed.
+	if got := queryInts(t, db, `SELECT id FROM users`); !equalInts(got, []int{1}) {
+		t.Errorf("ids = %v, want [1]; a rejected insert was applied", got)
+	}
+
+	// A distinct value is still accepted.
+	if _, err := db.Exec(`INSERT INTO users (id, email) VALUES (2, 'b@x')`); err != nil {
+		t.Fatalf("distinct row rejected: %v", err)
+	}
+}
+
+// TestUniqueAllowsMultipleNulls pins the rule that surprises people most: a NULL
+// is never equal to anything, including another NULL, so UNIQUE permits any
+// number of them. Using the grouping form of equality here — the one GROUP BY
+// needs, where two NULLs are the same — would wrongly reject the second row.
+func TestUniqueAllowsMultipleNulls(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`CREATE TABLE t (id INT PRIMARY KEY, code TEXT UNIQUE)`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		if _, err := db.Exec(`INSERT INTO t (id, code) VALUES ($1, NULL)`, i); err != nil {
+			t.Fatalf("row %d with a NULL unique column was rejected: %v", i, err)
+		}
+	}
+	if got := queryInts(t, db, `SELECT id FROM t`); !equalInts(got, []int{1, 2, 3}) {
+		t.Errorf("ids = %v, want [1 2 3]", got)
+	}
+
+	// A primary key column cannot be NULL at all, which is a different rule.
+	if _, err := db.Exec(`INSERT INTO t (id, code) VALUES (NULL, 'x')`); sqlstate(err) != "23502" {
+		t.Errorf("NULL primary key gave %v, want a not-null violation", err)
+	}
+}
+
+// TestCompositeKeyChecksTheCombination is why constraints are modelled as a list
+// of columns rather than a flag per column. PRIMARY KEY (a, b) requires the pair
+// to be unique; treating it as "a is unique and b is unique" would reject rows
+// that SQL permits.
+func TestCompositeKeyChecksTheCombination(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (a INT, b INT, note TEXT, PRIMARY KEY (a, b));
+		INSERT INTO t (a, b) VALUES (1, 1);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// Repeating either column alone is fine; only the pair must be unique.
+	for _, q := range []string{
+		`INSERT INTO t (a, b) VALUES (1, 2)`,
+		`INSERT INTO t (a, b) VALUES (2, 1)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Errorf("%s was rejected, but only the combination must be unique: %v", q, err)
+		}
+	}
+
+	if _, err := db.Exec(`INSERT INTO t (a, b) VALUES (1, 1)`); sqlstate(err) != "23505" {
+		t.Errorf("duplicate pair gave %v, want a unique violation", err)
+	}
+}
+
+// TestUniqueOnUpdate covers the cases a naive check gets wrong: a row must not
+// conflict with itself, and a statement may pass through colliding intermediate
+// states as long as the result is valid.
+func TestUniqueOnUpdate(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (id INT PRIMARY KEY, rank INT UNIQUE);
+		INSERT INTO t (id, rank) VALUES (1, 10), (2, 20), (3, 30);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// Rewriting a row with its own value is not a conflict with itself.
+	if _, err := db.Exec(`UPDATE t SET rank = rank WHERE id = 1`); err != nil {
+		t.Errorf("updating a row to its own value was rejected: %v", err)
+	}
+
+	// Every row shifts by one. Checking row by row would see 20 collide with
+	// the not-yet-updated row 2, but the final set is unique.
+	if _, err := db.Exec(`UPDATE t SET rank = rank + 10`); err != nil {
+		t.Errorf("a shift that only collides mid-statement was rejected: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT rank FROM t ORDER BY rank`); !equalInts(got, []int{20, 30, 40}) {
+		t.Errorf("ranks = %v, want [20 30 40]", got)
+	}
+
+	// A genuine collision is still refused, and leaves the table unchanged.
+	if _, err := db.Exec(`UPDATE t SET rank = 20 WHERE id = 3`); sqlstate(err) != "23505" {
+		t.Errorf("colliding update gave %v, want a unique violation", err)
+	}
+	if got := queryInts(t, db, `SELECT rank FROM t ORDER BY rank`); !equalInts(got, []int{20, 30, 40}) {
+		t.Errorf("ranks = %v after a refused update, want [20 30 40] unchanged", got)
+	}
+
+	// Deleting a row frees its value for another.
+	if _, err := db.Exec(`DELETE FROM t WHERE id = 1`); err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE t SET rank = 20 WHERE id = 3`); err != nil {
+		t.Errorf("reusing a deleted row's value was rejected: %v", err)
+	}
+}
+
+// TestUniqueViolationNamesTheConstraint checks the message, since application
+// code and humans both use it to tell which constraint failed.
+func TestUniqueViolationNamesTheConstraint(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE);
+		INSERT INTO users (id, email) VALUES (1, 'a@x');
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tests := []struct {
+		query string
+		want  string
+	}{
+		// PostgreSQL derives these names, and application code sometimes
+		// matches on them.
+		{`INSERT INTO users (id, email) VALUES (1, 'b@x')`, "users_pkey"},
+		{`INSERT INTO users (id, email) VALUES (2, 'a@x')`, "users_email_key"},
+	}
+	for _, tt := range tests {
+		_, err := db.Exec(tt.query)
+		if err == nil {
+			t.Fatalf("%s was accepted", tt.query)
+		}
+		if !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("error %q does not name the constraint %q", err, tt.want)
+		}
+	}
+
+	// An explicitly named constraint is reported under that name.
+	if _, err := db.Exec(`
+		CREATE TABLE c (a INT, CONSTRAINT my_key UNIQUE (a));
+		INSERT INTO c (a) VALUES (1);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	_, err := db.Exec(`INSERT INTO c (a) VALUES (1)`)
+	if err == nil || !strings.Contains(err.Error(), "my_key") {
+		t.Errorf("error %v does not name the constraint my_key", err)
 	}
 }
 

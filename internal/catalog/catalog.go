@@ -10,7 +10,9 @@ package catalog
 
 import (
 	"cmp"
+	"hash/maphash"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/oxisto/lightsql/internal/pgerr"
@@ -26,10 +28,45 @@ type Column struct {
 	Type Type
 	// NotNull is set by a NOT NULL constraint or implied by PRIMARY KEY.
 	NotNull bool
-	// PrimaryKey marks membership of the table's primary key.
+	// PrimaryKey marks membership of the table's primary key. It is a hint for
+	// introspection only; the constraint itself lives in Table.Constraints,
+	// because a key over several columns is one constraint on the combination
+	// rather than one per column.
 	PrimaryKey bool
-	// Unique marks a single-column UNIQUE constraint.
-	Unique bool
+}
+
+// ConstraintKind distinguishes a primary key from an ordinary unique
+// constraint. They are enforced identically; only the reported name differs.
+type ConstraintKind uint8
+
+const (
+	// PrimaryKeyConstraint is the table's primary key, of which there is at
+	// most one. Its columns are implicitly NOT NULL.
+	PrimaryKeyConstraint ConstraintKind = iota
+	// UniqueConstraint is a UNIQUE constraint. Unlike a primary key, its
+	// columns may be NULL.
+	UniqueConstraint
+)
+
+func (k ConstraintKind) String() string {
+	if k == PrimaryKeyConstraint {
+		return "primary key"
+	}
+	return "unique"
+}
+
+// Constraint is a uniqueness requirement over one or more columns.
+//
+// Columns holds ordinals rather than names, and the constraint covers their
+// combination. Modelling this as a flag on each column instead would make
+// PRIMARY KEY (a, b) mean "a is unique and b is unique", which is a strictly
+// stronger and wrong requirement.
+type Constraint struct {
+	// Name is the constraint name, either as written after CONSTRAINT or
+	// derived in PostgreSQL's style, e.g. users_pkey or users_email_key.
+	Name    string
+	Kind    ConstraintKind
+	Columns []int
 }
 
 // Table is a table definition together with its data.
@@ -42,6 +79,9 @@ type Table struct {
 	Name   string
 
 	Columns []Column
+	// Constraints are the table's uniqueness constraints, checked on every
+	// insert and update.
+	Constraints []Constraint
 	// byName resolves a column name to its ordinal. Every reference below the
 	// binder is an ordinal; this map is consulted during binding only.
 	byName map[string]int
@@ -75,6 +115,11 @@ func (t *Table) Insert(row []types.Value) error {
 	defer t.mu.Unlock()
 
 	if err := t.checkRow(row); err != nil {
+		return err
+	}
+	// The rows already stored are unique among themselves, so only the new row
+	// has to be checked against them.
+	if err := t.checkUniqueRow(row); err != nil {
 		return err
 	}
 	t.rows = append(t.rows, row)
@@ -133,12 +178,15 @@ func (t *Table) Mutate(fn func(row []types.Value) (replacement []types.Value, er
 		}
 		next = append(next, replacement)
 	}
+	if err := t.checkUnique(next); err != nil {
+		return err
+	}
 	t.rows = next
 	return nil
 }
 
-// checkRow enforces the constraints that apply to a stored row. The caller must
-// hold the write lock.
+// checkRow enforces the per-row constraints. The caller must hold the write
+// lock.
 func (t *Table) checkRow(row []types.Value) error {
 	for i, col := range t.Columns {
 		if col.NotNull && row[i].IsNull() {
@@ -148,6 +196,108 @@ func (t *Table) checkRow(row []types.Value) error {
 		}
 	}
 	return nil
+}
+
+// checkUniqueRow verifies a candidate row against the rows already stored.
+//
+// This is the insert path, where everything already present is known to be
+// unique among itself. It is a linear scan: there are no indexes yet, so the
+// cost of an insert is proportional to the table. That is acceptable at the
+// scale lightsql targets and is the first thing an index would fix.
+//
+// The caller must hold the write lock.
+func (t *Table) checkUniqueRow(row []types.Value) error {
+	for _, c := range t.Constraints {
+		if anyNull(row, c.Columns) {
+			continue // see checkUnique for why a NULL never conflicts
+		}
+		for _, existing := range t.rows {
+			if !anyNull(existing, c.Columns) && keyEqual(row, existing, c.Columns) {
+				return t.uniqueViolation(c, row)
+			}
+		}
+	}
+	return nil
+}
+
+// checkUnique verifies every uniqueness constraint over a whole row set.
+//
+// The update path validates the result as a whole rather than testing each
+// changed row against the others, which is what PostgreSQL does by deferring the
+// check to the end of the statement. That matters twice over: a row keeping its
+// own value must not conflict with itself, and `UPDATE t SET a = a + 1` passes
+// through states that collide but ends in a state that does not.
+//
+// The caller must hold the write lock.
+func (t *Table) checkUnique(rows [][]types.Value) error {
+	for _, c := range t.Constraints {
+		// Rows are grouped by hash so the check is linear rather than
+		// quadratic. The candidates in a bucket are still compared properly,
+		// since a hash collision is not a duplicate.
+		buckets := make(map[uint64][]int, len(rows))
+		seed := maphash.MakeSeed()
+
+		for i, row := range rows {
+			// A NULL is never equal to anything, including another NULL, so a
+			// row with a NULL in any key column cannot violate the constraint.
+			// This is why UNIQUE permits any number of NULLs — the single most
+			// surprising rule in this area, and one that using the grouping
+			// form of equality would silently get wrong.
+			if anyNull(row, c.Columns) {
+				continue
+			}
+
+			var h maphash.Hash
+			h.SetSeed(seed)
+			for _, ord := range c.Columns {
+				row[ord].Hash(&h)
+			}
+			sum := h.Sum64()
+
+			for _, j := range buckets[sum] {
+				if keyEqual(row, rows[j], c.Columns) {
+					return t.uniqueViolation(c, row)
+				}
+			}
+			buckets[sum] = append(buckets[sum], i)
+		}
+	}
+	return nil
+}
+
+func anyNull(row []types.Value, cols []int) bool {
+	for _, ord := range cols {
+		if row[ord].IsNull() {
+			return true
+		}
+	}
+	return false
+}
+
+// keyEqual reports whether two rows agree on every key column. Only non-NULL
+// rows reach here, so the grouping form of equality is the right one.
+func keyEqual(a, b []types.Value, cols []int) bool {
+	for _, ord := range cols {
+		if !types.Equal(a[ord], b[ord]) {
+			return false
+		}
+	}
+	return true
+}
+
+// uniqueViolation builds the error, mirroring PostgreSQL's wording so that a
+// parity test can compare the two.
+func (t *Table) uniqueViolation(c Constraint, row []types.Value) error {
+	names := make([]string, len(c.Columns))
+	vals := make([]string, len(c.Columns))
+	for i, ord := range c.Columns {
+		names[i] = t.Columns[ord].Name
+		vals[i] = row[ord].String()
+	}
+	return pgerr.Newf(pgerr.UniqueViolation,
+		"duplicate key value violates unique constraint %q", c.Name).
+		WithDetail("Key (%s)=(%s) already exists.",
+			strings.Join(names, ", "), strings.Join(vals, ", "))
 }
 
 // NextSerial returns and consumes the next value of a serial column.

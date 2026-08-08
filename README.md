@@ -120,8 +120,8 @@ the two.
 | | **Data definition** | | | |
 | ✅ | CREATE TABLE | ✅ | ✅ |  |
 | ✅ | CREATE TABLE IF NOT EXISTS | ✅ | ✅ |  |
-| 🟡 | Column constraints | ✅ | 🟡 | NOT NULL and PRIMARY KEY are enforced; UNIQUE, DEFAULT, CHECK and REFERENCES parse but are not applied |
-| 🟡 | Table constraints | ✅ | 🟡 | PRIMARY KEY only |
+| 🟡 | Column constraints | ✅ | 🟡 | NOT NULL, PRIMARY KEY and UNIQUE are enforced; DEFAULT, CHECK and REFERENCES parse but are not applied |
+| 🟡 | Table constraints | ✅ | 🟡 | PRIMARY KEY and UNIQUE, including over several columns, where the combination must be unique; FOREIGN KEY and CHECK parse only |
 | ⬜ | Referential actions | ✅ | ⬜ | ON DELETE / ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT |
 | ⬜ | DROP TABLE | ⬜ | ⬜ |  |
 | ⬜ | ALTER TABLE | ⬜ | ⬜ |  |
@@ -183,6 +183,8 @@ the two.
 | ✅ | Multi-statement Exec | ✅ | ✅ | a fixture can be one semicolon-separated batch |
 | ✅ | Prepared statements | ✅ | ✅ | bound once, executed repeatedly |
 | ✅ | Column type introspection | ✅ | ✅ | ScanType, DatabaseTypeName and Nullable for ORMs |
+| ⬜ | information_schema | ✅ | ⬜ | tables, columns, table_constraints and key_column_usage as read-only views over the catalog; ORMs query these when migrating |
+| ⬜ | pg_catalog | ⬜ | ⬜ | the subset ORMs actually read, such as pg_class and pg_attribute |
 | ✅ | Context cancellation | ✅ | ✅ | checked inside the operator loop, so a running query stops |
 | ✅ | SQLSTATE on every error | ✅ | ✅ | errors satisfy interface{ SQLState() string }, as pgx and lib/pq do |
 | ⬜ | File-backed storage | ⬜ | ⬜ | WAL plus periodic snapshot |
