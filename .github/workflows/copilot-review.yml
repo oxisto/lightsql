@@ -1,0 +1,43 @@
+name: Copilot review
+
+# Requests a Copilot code review on every pull request.
+#
+# This is a workflow rather than a repository ruleset because the ruleset
+# pull_request rule does not accept automatic_copilot_code_review_enabled here:
+# the API takes the field and drops it silently, so the setting never persists.
+# If that changes, this workflow should be deleted in favour of the rule, which
+# would also cover pull requests from forks.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  request:
+    name: request review
+    # A draft is not ready to be reviewed, and Copilot's own review would be
+    # stale by the time it is.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request a review from Copilot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The endpoint answers 200 whether or not the reviewer was actually
+          # added — an unavailable reviewer is dropped without an error. So a
+          # green run here means "asked", not "will review", and the review
+          # itself arrives a few minutes later if at all. Do not treat this job
+          # as evidence that a review happened.
+          gh api --method POST \
+            "repos/$REPO/pulls/$PR/requested_reviewers" \
+            -f 'reviewers[]=copilot-pull-request-reviewer[bot]'
+
+          echo "Requested. Reviewers now on the pull request:"
+          gh api "repos/$REPO/pulls/$PR" --jq '.requested_reviewers[].login // "none yet"'
