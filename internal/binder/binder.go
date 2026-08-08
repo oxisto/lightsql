@@ -208,17 +208,48 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 	// fails at CREATE TABLE rather than at the first INSERT.
 	sc := &scope{}
 	sc.addTable(t, t.Name)
+
+	// Names already spoken for, so a derived name cannot collide with one the
+	// statement wrote explicitly.
+	taken := make(map[string]bool, len(t.Constraints)+len(checks))
+	for _, c := range t.Constraints {
+		taken[c.Name] = true
+	}
+	for _, c := range checks {
+		if c.Name != "" {
+			taken[c.Name] = true
+		}
+	}
 	for i, c := range checks {
 		if _, err := b.bindCheck(c, sc); err != nil {
 			return nil, err
 		}
 		if c.Name == "" {
-			checks[i].Name = t.Name + "_check"
+			checks[i].Name = uniqueCheckName(t.Name, taken)
+			taken[checks[i].Name] = true
 		}
 	}
 	t.Checks = checks
 
 	return &plan.CreateTable{Table: t, IfNotExists: s.IfNotExists}, nil
+}
+
+// uniqueCheckName derives a name for an unnamed CHECK, following PostgreSQL:
+// the first is <table>_check, then <table>_check1, <table>_check2 and so on.
+//
+// Numbering matters because a violation reports the constraint name, and a
+// table with two unnamed checks would otherwise attribute both to the same one.
+func uniqueCheckName(table string, taken map[string]bool) string {
+	base := table + "_check"
+	if !taken[base] {
+		return base
+	}
+	for i := 1; ; i++ {
+		name := base + strconv.Itoa(i)
+		if !taken[name] {
+			return name
+		}
+	}
 }
 
 // bindDefault binds a DEFAULT expression and coerces it to the column's type.

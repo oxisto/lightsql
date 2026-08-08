@@ -646,8 +646,11 @@ func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (Resu
 		for _, ord := range ins.Serials {
 			row[ord] = types.Int(ins.Table.NextSerial(ord))
 		}
-		// A DEFAULT is evaluated per row rather than once, so that a
-		// non-constant default would see each row's own context.
+		// A DEFAULT is evaluated once per row rather than hoisted out of the
+		// loop. Every default is a constant expression today, so this makes no
+		// difference yet — but a sequence-backed default such as nextval must
+		// yield a distinct value per row, and hoisting would quietly give a
+		// multi-row INSERT the same one throughout.
 		for ord, eval := range defaults {
 			if row[ord], err = eval(args, nil); err != nil {
 				return res, err

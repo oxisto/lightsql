@@ -1175,6 +1175,47 @@ func TestCheckConstraint(t *testing.T) {
 	}
 }
 
+// TestUnnamedChecksGetDistinctNames pins that two unnamed CHECKs on one table
+// are named apart, so a violation says which one failed. Naming both after the
+// table would attribute either failure to the same constraint.
+func TestUnnamedChecksGetDistinctNames(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (a INT CHECK (a > 0), b INT CHECK (b > 0), c INT CHECK (c > 0));
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// PostgreSQL numbers them t_check, t_check1, t_check2.
+	tests := []struct {
+		query string
+		want  string
+	}{
+		{`INSERT INTO t (a, b, c) VALUES (-1, 1, 1)`, "t_check"},
+		{`INSERT INTO t (a, b, c) VALUES (1, -1, 1)`, "t_check1"},
+		{`INSERT INTO t (a, b, c) VALUES (1, 1, -1)`, "t_check2"},
+	}
+	for _, tt := range tests {
+		_, err := db.Exec(tt.query)
+		if err == nil {
+			t.Fatalf("%s was accepted", tt.query)
+		}
+		if !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("error %q does not name %q", err, tt.want)
+		}
+	}
+
+	// A derived name must not collide with one written explicitly.
+	if _, err := db.Exec(`
+		CREATE TABLE u (a INT CONSTRAINT u_check CHECK (a > 0), b INT CHECK (b > 0));
+		INSERT INTO u (a, b) VALUES (1, -1);
+	`); err == nil {
+		t.Fatal("violating row was accepted")
+	} else if !strings.Contains(err.Error(), "u_check1") {
+		t.Errorf("error %q should name u_check1, since u_check was taken explicitly", err)
+	}
+}
+
 // TestConstraintsRejectedAtCreate checks that a bad DEFAULT or CHECK fails when
 // the table is created, not at the first insert — by which point the schema is
 // already in place and the error is far from its cause.
