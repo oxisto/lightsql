@@ -384,7 +384,9 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 	}
 
 	sc := &scope{}
-	var node plan.Node
+	// A SELECT without FROM is evaluated over one empty row, so every node
+	// below always has an input and no consumer needs a nil special case.
+	var node plan.Node = &plan.SingleRow{}
 
 	if len(s.From) == 1 {
 		ref, ok := s.From[0].(*ast.TableRef)
@@ -415,9 +417,6 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		if node == nil {
-			return nil, pgerr.New(pgerr.SyntaxError, "WHERE requires a FROM clause").At(s.Where.Pos())
-		}
 		node = &plan.Filter{Input: node, Pred: pred}
 	}
 
@@ -433,10 +432,6 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		keys, err := b.bindOrderBy(s.OrderBy, sc, proj)
 		if err != nil {
 			return nil, err
-		}
-		if node == nil {
-			return nil, pgerr.New(pgerr.SyntaxError,
-				"ORDER BY requires a FROM clause").At(s.OrderBy[0].Expr.Pos())
 		}
 		node = &plan.Sort{Input: node, Keys: keys}
 	}
@@ -456,8 +451,6 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 	return &plan.Query{Root: out}, nil
 }
 
-// bindSelectItems builds the projection, expanding any star into the columns
-// currently in scope.
 // bindOrderBy resolves the ORDER BY terms against the select list and the input
 // scope.
 //
@@ -530,6 +523,8 @@ func (b *Binder) bindSortTerm(e ast.Expr, sc *scope, proj *plan.Project) (plan.E
 	return bindExpr(e, sc)
 }
 
+// bindSelectItems builds the projection, expanding any star into the columns
+// currently in scope.
 func (b *Binder) bindSelectItems(items []ast.SelectItem, sc *scope, input plan.Node) (*plan.Project, error) {
 	proj := &plan.Project{Input: input}
 

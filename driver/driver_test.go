@@ -715,6 +715,36 @@ func TestOrderByIsStable(t *testing.T) {
 	}
 }
 
+// TestClausesWithoutFrom pins that a SELECT with no FROM still accepts the
+// clauses SQL allows on it. A missing FROM is a single-row source, not the
+// absence of one, so nothing downstream needs to special-case it.
+func TestClausesWithoutFrom(t *testing.T) {
+	db := open(t)
+
+	tests := []struct {
+		name  string
+		query string
+		want  []int
+	}{
+		{"order by a position", `SELECT 1 ORDER BY 1`, []int{1}},
+		{"order by an expression", `SELECT 2 ORDER BY 1 DESC`, []int{2}},
+		{"where true", `SELECT 3 WHERE 1 = 1`, []int{3}},
+		// A false predicate returns no rows rather than being rejected.
+		{"where false", `SELECT 4 WHERE 1 = 2`, nil},
+		{"limit", `SELECT 5 LIMIT 1`, []int{5}},
+		{"limit zero", `SELECT 6 LIMIT 0`, nil},
+		{"everything at once", `SELECT 7 WHERE 1 = 1 ORDER BY 1 LIMIT 1`, []int{7}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := queryInts(t, db, tt.query); !equalInts(got, tt.want) {
+				t.Errorf("%s\n got: %v\nwant: %v", tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestOrderByErrors(t *testing.T) {
 	db := open(t)
 	if _, err := db.Exec(`CREATE TABLE t (a INT)`); err != nil {

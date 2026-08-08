@@ -42,17 +42,16 @@ func Build(n plan.Node, args []types.Value) (Operator, error) {
 		}
 		return &filterOp{input: input, pred: pred, args: args}, nil
 
+	case *plan.SingleRow:
+		return &singleRowOp{}, nil
+
 	case *plan.Project:
-		var input Operator = &emptyRowOp{}
-		if n.Input != nil {
-			var err error
-			if input, err = Build(n.Input, args); err != nil {
-				return nil, err
-			}
+		input, err := Build(n.Input, args)
+		if err != nil {
+			return nil, err
 		}
 		evals := make([]Eval, len(n.Exprs))
 		for i, e := range n.Exprs {
-			var err error
 			if evals[i], err = Compile(e); err != nil {
 				return nil, err
 			}
@@ -140,15 +139,14 @@ func (o *scanOp) Next(ctx context.Context) (Row, bool, error) {
 
 func (o *scanOp) Close() error { return nil }
 
-// emptyRowOp yields exactly one empty row, which is what a SELECT without FROM
-// projects over.
+// singleRowOp yields exactly one empty row, executing plan.SingleRow.
 //
 // The receiver must be a pointer: with a value receiver the assignment to done
 // would be made on a copy, the operator would yield rows forever, and a query
 // such as SELECT 1 would never terminate.
-type emptyRowOp struct{ done bool }
+type singleRowOp struct{ done bool }
 
-func (o *emptyRowOp) Next(ctx context.Context) (Row, bool, error) {
+func (o *singleRowOp) Next(ctx context.Context) (Row, bool, error) {
 	if o.done {
 		return nil, false, nil
 	}
@@ -159,7 +157,7 @@ func (o *emptyRowOp) Next(ctx context.Context) (Row, bool, error) {
 	return Row{}, true, nil
 }
 
-func (o *emptyRowOp) Close() error { return nil }
+func (o *singleRowOp) Close() error { return nil }
 
 // SliceOp yields rows that have already been computed, which is how a RETURNING
 // clause is served: the statement has to finish modifying the table before its
