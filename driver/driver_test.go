@@ -1024,6 +1024,186 @@ func TestUniqueViolationNamesTheConstraint(t *testing.T) {
 	}
 }
 
+func TestColumnDefaults(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (
+			id     INT PRIMARY KEY,
+			n      INT  DEFAULT 42,
+			s      TEXT DEFAULT 'pending',
+			flag   BOOLEAN DEFAULT true,
+			calc   INT  DEFAULT 6 * 7,
+			maybe  INT  DEFAULT NULL,
+			plain  INT
+		);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// An omitted column takes its default.
+	if _, err := db.Exec(`INSERT INTO t (id) VALUES (1)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	var (
+		n, calc      int
+		s            string
+		flag         bool
+		maybe, plain sql.NullInt64
+	)
+	if err := db.QueryRow(`SELECT n, s, flag, calc, maybe, plain FROM t WHERE id = 1`).
+		Scan(&n, &s, &flag, &calc, &maybe, &plain); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	switch {
+	case n != 42:
+		t.Errorf("n = %d, want 42", n)
+	case s != "pending":
+		t.Errorf("s = %q, want \"pending\"", s)
+	case !flag:
+		t.Error("flag = false, want true")
+	case calc != 42:
+		t.Errorf("calc = %d, want 42 from the expression 6 * 7", calc)
+	case maybe.Valid:
+		t.Errorf("maybe = %v, want NULL from DEFAULT NULL", maybe)
+	case plain.Valid:
+		t.Errorf("plain = %v, want NULL for a column with no default", plain)
+	}
+
+	// An explicit value wins over the default, including an explicit NULL.
+	if _, err := db.Exec(`INSERT INTO t (id, n, s) VALUES (2, 7, NULL)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	var n2 int
+	var s2 sql.NullString
+	if err := db.QueryRow(`SELECT n, s FROM t WHERE id = 2`).Scan(&n2, &s2); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if n2 != 7 {
+		t.Errorf("n = %d, want the explicit 7 rather than the default", n2)
+	}
+	if s2.Valid {
+		t.Errorf("s = %v, want an explicit NULL rather than the default", s2)
+	}
+
+	// SERIAL is itself a default, so a table with both must not have the two
+	// fight over the same omitted column.
+	if _, err := db.Exec(`
+		CREATE TABLE u (id BIGSERIAL PRIMARY KEY, n INT DEFAULT 5);
+		INSERT INTO u (n) VALUES (1);
+		INSERT INTO u (n) VALUES (2);
+	`); err != nil {
+		t.Fatalf("serial with a defaulted column: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT id FROM u ORDER BY id`); !equalInts(got, []int{1, 2}) {
+		t.Errorf("serial ids = %v, want [1 2]", got)
+	}
+	// Omitting both takes the sequence for id and the default for n.
+	if _, err := db.Exec(`INSERT INTO u (id) VALUES (99)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT n FROM u WHERE id = 99`); !equalInts(got, []int{5}) {
+		t.Errorf("n = %v for an omitted defaulted column, want [5]", got)
+	}
+}
+
+// TestCheckConstraint pins the rule that is the exact inverse of a WHERE clause:
+// a CHECK is satisfied by true *or unknown*, and violated only by false.
+func TestCheckConstraint(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (
+			id  INT PRIMARY KEY,
+			n   INT CHECK (n >= 0),
+			lo  INT,
+			hi  INT,
+			CONSTRAINT lo_below_hi CHECK (lo < hi)
+		);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO t (id, n, lo, hi) VALUES (1, 5, 1, 2)`); err != nil {
+		t.Fatalf("a satisfying row was rejected: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"column check", `INSERT INTO t (id, n, lo, hi) VALUES (2, -1, 1, 2)`},
+		{"table check", `INSERT INTO t (id, n, lo, hi) VALUES (3, 1, 9, 2)`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := db.Exec(tt.query)
+			if err == nil {
+				t.Fatalf("%s was accepted, want a check violation", tt.query)
+			}
+			if got := sqlstate(err); got != "23514" {
+				t.Errorf("SQLSTATE = %q, want 23514 (error: %v)", got, err)
+			}
+		})
+	}
+
+	// A NULL makes the predicate unknown, and unknown satisfies a CHECK. Using
+	// the filter rule — keep only true — would turn every CHECK into an
+	// implicit NOT NULL, which is the mistake this pins.
+	if _, err := db.Exec(`INSERT INTO t (id, n, lo, hi) VALUES (4, NULL, NULL, 2)`); err != nil {
+		t.Errorf("a row whose check is unknown was rejected: %v", err)
+	}
+
+	// Updates are checked too, and a violation leaves the table unchanged.
+	if _, err := db.Exec(`UPDATE t SET n = -1 WHERE id = 1`); sqlstate(err) != "23514" {
+		t.Errorf("violating update gave %v, want a check violation", err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT n FROM t WHERE id = 1`).Scan(&n); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if n != 5 {
+		t.Errorf("n = %d after a refused update, want 5 unchanged", n)
+	}
+	if _, err := db.Exec(`UPDATE t SET n = 10 WHERE id = 1`); err != nil {
+		t.Errorf("a satisfying update was rejected: %v", err)
+	}
+
+	// The constraint is named in the error, using the written name where there
+	// is one.
+	_, err := db.Exec(`INSERT INTO t (id, lo, hi) VALUES (5, 9, 2)`)
+	if err == nil || !strings.Contains(err.Error(), "lo_below_hi") {
+		t.Errorf("error %v does not name the constraint lo_below_hi", err)
+	}
+}
+
+// TestConstraintsRejectedAtCreate checks that a bad DEFAULT or CHECK fails when
+// the table is created, not at the first insert — by which point the schema is
+// already in place and the error is far from its cause.
+func TestConstraintsRejectedAtCreate(t *testing.T) {
+	db := open(t)
+
+	tests := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{"check names an unknown column", `CREATE TABLE a (n INT CHECK (nope > 0))`, "42703"},
+		{"check is not boolean", `CREATE TABLE b (n INT CHECK (n + 1))`, "42804"},
+		{"default references a column", `CREATE TABLE c (n INT, m INT DEFAULT n)`, "42703"},
+		{"default has the wrong type", `CREATE TABLE d (n INT DEFAULT 'abc')`, "22P02"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := db.Exec(tt.query)
+			if err == nil {
+				t.Fatalf("%s was accepted, want an error", tt.query)
+			}
+			if got := sqlstate(err); got != tt.want {
+				t.Errorf("SQLSTATE = %q, want %q (error: %v)", got, tt.want, err)
+			}
+		})
+	}
+}
+
 // TestErrorsCarrySQLState checks the contract application code relies on to tell
 // one failure from another, using the same interface pgx and lib/pq expose.
 func TestErrorsCarrySQLState(t *testing.T) {

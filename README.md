@@ -4,10 +4,11 @@ A small, embeddable SQL engine for Go that speaks the PostgreSQL dialect and plu
 straight into `database/sql`. Run it entirely in memory for tests, or point it at a
 directory for a small file-backed deployment.
 
-> **Status: early, but CRUD works.** `CREATE TABLE`, `INSERT`, `SELECT ... WHERE
+> **Status: the core engine works.** `CREATE TABLE`, `INSERT`, `SELECT ... WHERE
 > ... ORDER BY ... LIMIT`, `UPDATE`, `DELETE` and `RETURNING` all run end to end
-> through `database/sql`. Joins, aggregates, transactions and file-backed storage are
-> not implemented yet.
+> through `database/sql`, with `NOT NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT` and
+> `CHECK` enforced. Joins, aggregates, transactions and file-backed storage are not
+> implemented yet.
 > The compatibility matrix below is generated from the code, and every row is backed by
 > a probe that is actually run — see [Compatibility](#compatibility).
 
@@ -120,8 +121,10 @@ the two.
 | | **Data definition** | | | |
 | ✅ | CREATE TABLE | ✅ | ✅ |  |
 | ✅ | CREATE TABLE IF NOT EXISTS | ✅ | ✅ |  |
-| 🟡 | Column constraints | ✅ | 🟡 | NOT NULL, PRIMARY KEY and UNIQUE are enforced; DEFAULT, CHECK and REFERENCES parse but are not applied |
-| 🟡 | Table constraints | ✅ | 🟡 | PRIMARY KEY and UNIQUE, including over several columns, where the combination must be unique; FOREIGN KEY and CHECK parse only |
+| 🟡 | Column constraints | ✅ | 🟡 | NOT NULL, PRIMARY KEY, UNIQUE, DEFAULT and CHECK are enforced; REFERENCES is rejected until foreign keys land |
+| 🟡 | Table constraints | ✅ | 🟡 | PRIMARY KEY, UNIQUE and CHECK, with keys over several columns requiring the combination to be unique; FOREIGN KEY is rejected until foreign keys land |
+| ✅ | DEFAULT values | ✅ | ✅ | any constant expression; an omitted column takes it, an explicit NULL overrides it |
+| ✅ | CHECK constraints | ✅ | ✅ | column and table level, enforced on insert and update; satisfied by true or unknown, so a NULL does not violate one |
 | ⬜ | Referential actions | ✅ | ⬜ | ON DELETE / ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT |
 | ⬜ | DROP TABLE | ⬜ | ⬜ |  |
 | ⬜ | ALTER TABLE | ⬜ | ⬜ |  |

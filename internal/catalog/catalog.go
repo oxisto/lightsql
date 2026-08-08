@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/oxisto/lightsql/internal/ast"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/types"
 )
@@ -33,6 +34,14 @@ type Column struct {
 	// because a key over several columns is one constraint on the combination
 	// rather than one per column.
 	PrimaryKey bool
+	// Default is the DEFAULT expression as written, or nil when the column has
+	// none.
+	//
+	// The catalog holds the syntax rather than a bound expression because the
+	// binder and the plan both sit above it; storing a plan expression here
+	// would invert that. Each statement binds it afresh, which costs one bind
+	// per statement rather than per row.
+	Default ast.Expr
 }
 
 // ConstraintKind distinguishes a primary key from an ordinary unique
@@ -69,6 +78,18 @@ type Constraint struct {
 	Columns []int
 }
 
+// Check is a CHECK constraint: a predicate over a single row.
+//
+// It is kept apart from Constraint because the two are enforced by different
+// machinery — a uniqueness constraint compares rows against each other, while a
+// check evaluates an expression over one row and never looks at the others.
+type Check struct {
+	Name string
+	// Expr is the predicate as written; see Column.Default for why the catalog
+	// stores syntax rather than a bound expression.
+	Expr ast.Expr
+}
+
 // Table is a table definition together with its data.
 //
 // Definition and storage live in one struct because a table's rows are only ever
@@ -82,6 +103,8 @@ type Table struct {
 	// Constraints are the table's uniqueness constraints, checked on every
 	// insert and update.
 	Constraints []Constraint
+	// Checks are the table's CHECK constraints, evaluated per row.
+	Checks []Check
 	// byName resolves a column name to its ordinal. Every reference below the
 	// binder is an ordinal; this map is consulted during binding only.
 	byName map[string]int
