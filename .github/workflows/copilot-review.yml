@@ -21,7 +21,13 @@ jobs:
     name: request review
     # A draft is not ready to be reviewed, and Copilot's own review would be
     # stale by the time it is.
-    if: github.event.pull_request.draft == false
+    #
+    # Fork pull requests are skipped rather than attempted. On the pull_request
+    # event their token is read-only, so the POST below would fail with 403 and
+    # leave a red check on a contribution that did nothing wrong.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Request a review from Copilot
@@ -39,5 +45,13 @@ jobs:
             "repos/$REPO/pulls/$PR/requested_reviewers" \
             -f 'reviewers[]=copilot-pull-request-reviewer[bot]'
 
+          # Spelled as an explicit length check rather than `.[] .login // "…"`.
+          # The `//` form does work — it is a stream-level alternative, so an
+          # empty left side yields the right side — but relying on that is
+          # subtle enough that a reader can reasonably doubt it, and this
+          # message exists precisely to make a silent no-op unmistakable.
           echo "Requested. Reviewers now on the pull request:"
-          gh api "repos/$REPO/pulls/$PR" --jq '.requested_reviewers[].login // "none yet"'
+          gh api "repos/$REPO/pulls/$PR" \
+            --jq 'if (.requested_reviewers | length) == 0
+                  then "  none — the request was dropped, so no review is coming"
+                  else (.requested_reviewers[] | "  " + .login) end'
