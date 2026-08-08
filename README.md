@@ -184,7 +184,7 @@ the two.
 | ✅ | Prepared statements | ✅ | ✅ | bound once, executed repeatedly |
 | ✅ | Column type introspection | ✅ | ✅ | ScanType, DatabaseTypeName and Nullable for ORMs |
 | ⬜ | information_schema | ✅ | ⬜ | tables, columns, table_constraints and key_column_usage as read-only views over the catalog; ORMs query these when migrating |
-| ⬜ | pg_catalog | ⬜ | ⬜ | the subset ORMs actually read, such as pg_class and pg_attribute |
+| ⬜ | pg_catalog | ✅ | ⬜ | the subset ORMs actually read, such as pg_class and pg_attribute |
 | ✅ | Context cancellation | ✅ | ✅ | checked inside the operator loop, so a running query stops |
 | ✅ | SQLSTATE on every error | ✅ | ✅ | errors satisfy interface{ SQLState() string }, as pgx and lib/pq do |
 | ⬜ | File-backed storage | ⬜ | ⬜ | WAL plus periodic snapshot |

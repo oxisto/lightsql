@@ -884,6 +884,60 @@ func TestCompositeKeyChecksTheCombination(t *testing.T) {
 	}
 }
 
+// TestCompositeUniqueWithNulls covers the intersection of the two rules that are
+// individually easy to get wrong: a UNIQUE constraint over several columns where
+// one of them is NULL.
+//
+// A composite primary key cannot exercise this, because its columns are NOT
+// NULL, and a single-column UNIQUE does not exercise the composite path. The
+// combination is the case that a check written for either rule alone gets wrong.
+func TestCompositeUniqueWithNulls(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, UNIQUE (a, b));
+		INSERT INTO t (id, a, b) VALUES (1, 1, 1);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// Only the pair must be unique, so repeating either column alone is fine.
+	for _, q := range []string{
+		`INSERT INTO t (id, a, b) VALUES (2, 1, 2)`,
+		`INSERT INTO t (id, a, b) VALUES (3, 2, 1)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Errorf("%s was rejected, but only the combination must be unique: %v", q, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO t (id, a, b) VALUES (4, 1, 1)`); sqlstate(err) != "23505" {
+		t.Errorf("duplicate pair gave %v, want a unique violation", err)
+	}
+
+	// A NULL in any key column takes the row out of the check entirely, so
+	// these rows do not conflict with each other even though their non-NULL
+	// parts are identical. Comparing only the non-NULL columns, or treating
+	// two NULLs as equal, would reject the second.
+	for _, q := range []string{
+		`INSERT INTO t (id, a, b) VALUES (5, 9, NULL)`,
+		`INSERT INTO t (id, a, b) VALUES (6, 9, NULL)`,
+		`INSERT INTO t (id, a, b) VALUES (7, NULL, 9)`,
+		`INSERT INTO t (id, a, b) VALUES (8, NULL, NULL)`,
+		`INSERT INTO t (id, a, b) VALUES (9, NULL, NULL)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Errorf("%s was rejected; a NULL key column cannot conflict: %v", q, err)
+		}
+	}
+
+	// Filling in the NULL is checked again, and must then conflict.
+	if _, err := db.Exec(`UPDATE t SET b = 2 WHERE id = 5`); err != nil {
+		t.Fatalf("UPDATE: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE t SET a = 9, b = 2 WHERE id = 6`); sqlstate(err) != "23505" {
+		t.Errorf("filling a NULL into a colliding pair gave %v, want a unique violation", err)
+	}
+}
+
 // TestUniqueOnUpdate covers the cases a naive check gets wrong: a row must not
 // conflict with itself, and a statement may pass through colliding intermediate
 // states as long as the result is valid.

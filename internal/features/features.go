@@ -307,8 +307,11 @@ var Groups = []Group{
 			{Name: "information_schema", Parse: Yes, Exec: Planned,
 				Note: "tables, columns, table_constraints and key_column_usage as read-only views over the catalog; ORMs query these when migrating",
 				SQL:  "SELECT table_name FROM information_schema.tables"},
-			{Name: "pg_catalog", Parse: Planned, Exec: Planned,
-				Note: "the subset ORMs actually read, such as pg_class and pg_attribute"},
+			// Like information_schema, the name already parses; only the
+			// views are missing.
+			{Name: "pg_catalog", Parse: Yes, Exec: Planned,
+				Note: "the subset ORMs actually read, such as pg_class and pg_attribute",
+				SQL:  "SELECT relname FROM pg_catalog.pg_class"},
 			{Name: "Context cancellation", Parse: Yes, Exec: Yes,
 				Note: "checked inside the operator loop, so a running query stops"},
 			{Name: "SQLSTATE on every error", Parse: Yes, Exec: Yes,
