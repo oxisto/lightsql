@@ -145,6 +145,31 @@ func (o *emptyRowOp) Next(ctx context.Context) (Row, bool, error) {
 
 func (o *emptyRowOp) Close() error { return nil }
 
+// SliceOp yields rows that have already been computed, which is how a RETURNING
+// clause is served: the statement has to finish modifying the table before its
+// output can be read, so those rows are materialised rather than streamed.
+type SliceOp struct {
+	rows []Row
+	i    int
+}
+
+// NewSliceOp returns an operator over an existing slice of rows.
+func NewSliceOp(rows []Row) *SliceOp { return &SliceOp{rows: rows} }
+
+func (o *SliceOp) Next(ctx context.Context) (Row, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if o.i >= len(o.rows) {
+		return nil, false, nil
+	}
+	row := o.rows[o.i]
+	o.i++
+	return row, true, nil
+}
+
+func (o *SliceOp) Close() error { return nil }
+
 // filterOp drops rows whose predicate is not true. A predicate that evaluates to
 // unknown drops the row just as false does; that is SQL's rule and the reason
 // comparisons return three-valued results.
@@ -225,14 +250,180 @@ func (o *limitOp) Next(ctx context.Context) (Row, bool, error) {
 
 func (o *limitOp) Close() error { return o.input.Close() }
 
-// ExecInsert runs an INSERT and reports how many rows it added.
-func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (int64, error) {
-	width := len(ins.Table.Columns)
+// Result is what a data-modifying statement produced: a count, and the rows a
+// RETURNING clause asked for.
+type Result struct {
+	Affected int64
+	// Rows is nil unless the statement had a RETURNING clause.
+	Rows []Row
+}
 
-	var n int64
+// returningEval compiles a RETURNING list once, ahead of the row loop.
+type returningEval struct {
+	evals []Eval
+}
+
+func compileReturning(r *plan.Returning) (*returningEval, error) {
+	if r == nil {
+		return nil, nil
+	}
+	evals := make([]Eval, len(r.Exprs))
+	for i, e := range r.Exprs {
+		var err error
+		if evals[i], err = Compile(e); err != nil {
+			return nil, err
+		}
+	}
+	return &returningEval{evals: evals}, nil
+}
+
+// row evaluates the RETURNING list against one affected row. A fresh slice is
+// allocated per row because, unlike an operator's output, these are accumulated
+// rather than consumed immediately.
+func (r *returningEval) row(args []types.Value, in Row) (Row, error) {
+	out := make(Row, len(r.evals))
+	for i, eval := range r.evals {
+		var err error
+		if out[i], err = eval(args, in); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// ExecUpdate applies an UPDATE.
+func ExecUpdate(ctx context.Context, up *plan.Update, args []types.Value) (Result, error) {
+	pred, err := compilePredicate(up.Where)
+	if err != nil {
+		return Result{}, err
+	}
+	ret, err := compileReturning(up.Returning)
+	if err != nil {
+		return Result{}, err
+	}
+	assign := make([]Eval, len(up.Assignments))
+	for i, a := range up.Assignments {
+		if assign[i], err = Compile(a.Value); err != nil {
+			return Result{}, err
+		}
+	}
+
+	var res Result
+	err = up.Table.Mutate(func(_ int, row []types.Value) ([]types.Value, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		match, err := pred(args, row)
+		if err != nil {
+			return nil, err
+		}
+		if !match {
+			return row, nil
+		}
+
+		// The replacement is a copy, so a concurrent reader holding the old row
+		// never observes a partially applied update. Every assignment also
+		// evaluates against the original row, which is what makes
+		// `SET a = b, b = a` a swap rather than two copies of b.
+		next := make([]types.Value, len(row))
+		copy(next, row)
+		for i, a := range up.Assignments {
+			v, err := assign[i](args, row)
+			if err != nil {
+				return nil, err
+			}
+			next[a.Ordinal] = v
+		}
+
+		res.Affected++
+		if ret != nil {
+			// RETURNING on an UPDATE reports the new values.
+			out, err := ret.row(args, next)
+			if err != nil {
+				return nil, err
+			}
+			res.Rows = append(res.Rows, out)
+		}
+		return next, nil
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return res, nil
+}
+
+// ExecDelete applies a DELETE.
+func ExecDelete(ctx context.Context, del *plan.Delete, args []types.Value) (Result, error) {
+	pred, err := compilePredicate(del.Where)
+	if err != nil {
+		return Result{}, err
+	}
+	ret, err := compileReturning(del.Returning)
+	if err != nil {
+		return Result{}, err
+	}
+
+	var res Result
+	err = del.Table.Mutate(func(_ int, row []types.Value) ([]types.Value, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		match, err := pred(args, row)
+		if err != nil {
+			return nil, err
+		}
+		if !match {
+			return row, nil
+		}
+		res.Affected++
+		if ret != nil {
+			// RETURNING on a DELETE reports the row as it was before removal.
+			out, err := ret.row(args, row)
+			if err != nil {
+				return nil, err
+			}
+			res.Rows = append(res.Rows, out)
+		}
+		return nil, nil // delete
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return res, nil
+}
+
+// compilePredicate turns an optional WHERE into a row test. A missing clause
+// matches every row, and a clause evaluating to unknown matches none — the same
+// rule a Filter operator applies.
+func compilePredicate(e plan.Expr) (func(args []types.Value, row Row) (bool, error), error) {
+	if e == nil {
+		return func([]types.Value, Row) (bool, error) { return true, nil }, nil
+	}
+	eval, err := Compile(e)
+	if err != nil {
+		return nil, err
+	}
+	return func(args []types.Value, row Row) (bool, error) {
+		v, err := eval(args, row)
+		if err != nil {
+			return false, err
+		}
+		return v.Truth().IsTrue(), nil
+	}, nil
+}
+
+// ExecInsert runs an INSERT.
+func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (Result, error) {
+	width := len(ins.Table.Columns)
+	ret, err := compileReturning(ins.Returning)
+	if err != nil {
+		return Result{}, err
+	}
+
+	var res Result
 	for _, exprs := range ins.Rows {
 		if err := ctx.Err(); err != nil {
-			return n, err
+			return res, err
 		}
 
 		// Columns the statement did not name start as NULL, then serials are
@@ -244,11 +435,11 @@ func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (int6
 		for i, e := range exprs {
 			eval, err := Compile(e)
 			if err != nil {
-				return n, err
+				return res, err
 			}
 			v, err := eval(args, nil)
 			if err != nil {
-				return n, err
+				return res, err
 			}
 			row[ins.Targets[i]] = v
 		}
@@ -257,11 +448,21 @@ func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (int6
 		}
 
 		if err := ins.Table.Insert(row); err != nil {
-			return n, err
+			return res, err
 		}
-		n++
+		res.Affected++
+
+		// RETURNING is evaluated after the row is complete, so a generated
+		// serial is visible to it.
+		if ret != nil {
+			out, err := ret.row(args, row)
+			if err != nil {
+				return res, err
+			}
+			res.Rows = append(res.Rows, out)
+		}
 	}
-	return n, nil
+	return res, nil
 }
 
 // ExecCreateTable runs a CREATE TABLE.

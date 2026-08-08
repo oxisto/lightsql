@@ -156,6 +156,42 @@ type Insert struct {
 	// Serials lists ordinals of serial columns that the statement omitted and
 	// which must therefore be filled from the column's sequence.
 	Serials []int
+	// Returning is nil unless the statement had a RETURNING clause.
+	Returning *Returning
+}
+
+// Assignment sets one column of a row being updated.
+type Assignment struct {
+	// Ordinal is the column's position, resolved by the binder.
+	Ordinal int
+	Value   Expr
+}
+
+// Update modifies rows matching Where.
+//
+// Unlike a query, this is not built on a Scan node. Row modification needs to
+// identify the storage slot a row occupies, which the row itself does not carry,
+// so the executor walks the table directly. Once indexes exist and the optimizer
+// can choose an access path, this becomes a node over a scan.
+type Update struct {
+	Table       *catalog.Table
+	Where       Expr // nil means every row
+	Assignments []Assignment
+	Returning   *Returning
+}
+
+// Delete removes rows matching Where.
+type Delete struct {
+	Table     *catalog.Table
+	Where     Expr // nil means every row
+	Returning *Returning
+}
+
+// Returning describes a RETURNING clause. It is shared by INSERT, UPDATE and
+// DELETE, all of which may produce rows as well as a count.
+type Returning struct {
+	Exprs []Expr
+	Cols  []ResultColumn
 }
 
 // Query is a statement that returns rows.
@@ -165,4 +201,6 @@ type Query struct {
 
 func (*CreateTable) stmtNode() {}
 func (*Insert) stmtNode()      {}
+func (*Update) stmtNode()      {}
+func (*Delete) stmtNode()      {}
 func (*Query) stmtNode()       {}

@@ -48,6 +48,17 @@ type scopeColumn struct {
 	typ     catalog.Type
 }
 
+// addTable brings every column of a table into scope under the given qualifier.
+// The qualifier is the alias when one was written, and only the alias:
+// PostgreSQL hides the original name once a table is aliased.
+func (s *scope) addTable(t *catalog.Table, qualifier string) {
+	for i, c := range t.Columns {
+		s.cols = append(s.cols, scopeColumn{
+			table: qualifier, name: c.Name, ordinal: i, typ: c.Type,
+		})
+	}
+}
+
 // resolve finds a column by an optionally qualified name. An unqualified name
 // that matches more than one table is ambiguous, which SQL rejects rather than
 // silently picking one.
@@ -83,6 +94,10 @@ func (b *Binder) Bind(stmt ast.Stmt) (plan.Stmt, error) {
 		return b.bindCreateTable(s)
 	case *ast.InsertStmt:
 		return b.bindInsert(s)
+	case *ast.UpdateStmt:
+		return b.bindUpdate(s)
+	case *ast.DeleteStmt:
+		return b.bindDelete(s)
 	case *ast.SelectStmt:
 		return b.bindSelect(s)
 	default:
@@ -166,10 +181,6 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 		return nil, pgerr.New(pgerr.FeatureNotSupported,
 			"INSERT ... SELECT is not supported yet").At(s.Pos())
 	}
-	if len(s.Returning) > 0 {
-		return nil, pgerr.New(pgerr.FeatureNotSupported,
-			"RETURNING is not supported yet").At(s.Pos())
-	}
 
 	t, err := b.cat.Lookup(s.Table.Schema.Name, s.Table.Name.Name)
 	if err != nil {
@@ -228,7 +239,127 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 			ins.Serials = append(ins.Serials, i)
 		}
 	}
+
+	// RETURNING sees the row as stored, including generated serial values —
+	// which is the whole point of `INSERT ... RETURNING id`.
+	if len(s.Returning) > 0 {
+		sc := &scope{}
+		sc.addTable(t, t.Name)
+		if ins.Returning, err = b.bindReturning(s.Returning, sc); err != nil {
+			return nil, err
+		}
+	}
 	return ins, nil
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE and DELETE
+// ---------------------------------------------------------------------------
+
+func (b *Binder) bindUpdate(s *ast.UpdateStmt) (plan.Stmt, error) {
+	t, sc, err := b.bindTarget(s.Table, s.Alias)
+	if err != nil {
+		return nil, err
+	}
+
+	up := &plan.Update{Table: t}
+	seen := make(map[int]bool, len(s.Assignments))
+	for _, a := range s.Assignments {
+		i := t.ColumnIndex(a.Column.Name)
+		if i < 0 {
+			return nil, pgerr.Newf(pgerr.UndefinedColumn,
+				"column %q of relation %q does not exist", a.Column.Name, t.Name).At(a.Column.Pos())
+		}
+		// PostgreSQL rejects a repeated target rather than picking one, since
+		// either choice would be arbitrary.
+		if seen[i] {
+			return nil, pgerr.Newf(pgerr.SyntaxError,
+				"multiple assignments to same column %q", a.Column.Name).At(a.Column.Pos())
+		}
+		seen[i] = true
+
+		// The right-hand side is bound in the table's scope, so an assignment
+		// may read the row it is updating: SET n = n + 1 sees the old value.
+		val, err := bindExpr(a.Value, sc)
+		if err != nil {
+			return nil, err
+		}
+		if val, err = coerce(val, t.Columns[i].Type.Kind, a.Value.Pos()); err != nil {
+			return nil, err
+		}
+		up.Assignments = append(up.Assignments, plan.Assignment{Ordinal: i, Value: val})
+	}
+
+	if up.Where, err = b.bindPredicate(s.Where, sc, "WHERE"); err != nil {
+		return nil, err
+	}
+	if up.Returning, err = b.bindReturning(s.Returning, sc); err != nil {
+		return nil, err
+	}
+	return up, nil
+}
+
+func (b *Binder) bindDelete(s *ast.DeleteStmt) (plan.Stmt, error) {
+	t, sc, err := b.bindTarget(s.Table, s.Alias)
+	if err != nil {
+		return nil, err
+	}
+
+	del := &plan.Delete{Table: t}
+	if del.Where, err = b.bindPredicate(s.Where, sc, "WHERE"); err != nil {
+		return nil, err
+	}
+	// RETURNING on a DELETE reports the rows as they were before removal, which
+	// is the only thing it could usefully mean.
+	if del.Returning, err = b.bindReturning(s.Returning, sc); err != nil {
+		return nil, err
+	}
+	return del, nil
+}
+
+// bindTarget resolves the table a DML statement operates on and builds the scope
+// its expressions see.
+func (b *Binder) bindTarget(name *ast.TableName, alias ast.Name) (*catalog.Table, *scope, error) {
+	t, err := b.cat.Lookup(name.Schema.Name, name.Name.Name)
+	if err != nil {
+		return nil, nil, at(err, name.Pos())
+	}
+	qualifier := t.Name
+	if !alias.IsEmpty() {
+		qualifier = alias.Name
+	}
+	sc := &scope{}
+	sc.addTable(t, qualifier)
+	return t, sc, nil
+}
+
+// bindPredicate binds a clause that must yield a boolean.
+func (b *Binder) bindPredicate(e ast.Expr, sc *scope, clause string) (plan.Expr, error) {
+	if e == nil {
+		return nil, nil
+	}
+	pred, err := bindExpr(e, sc)
+	if err != nil {
+		return nil, err
+	}
+	if pred.Type() != types.KindBool && pred.Type() != types.KindNull {
+		return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+			"argument of %s must be boolean, not %s", clause, pred.Type()).At(e.Pos())
+	}
+	return pred, nil
+}
+
+// bindReturning binds a RETURNING list, which is a select list evaluated over
+// the affected row.
+func (b *Binder) bindReturning(items []ast.SelectItem, sc *scope) (*plan.Returning, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	proj, err := b.bindSelectItems(items, sc, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &plan.Returning{Exprs: proj.Exprs, Cols: proj.Cols}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -266,31 +397,23 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 			return nil, at(err, ref.Pos())
 		}
 
-		// A table is referred to by its alias if it has one, and only by that
-		// alias: PostgreSQL hides the original name once aliased.
 		qualifier := t.Name
 		if !ref.Alias.IsEmpty() {
 			qualifier = ref.Alias.Name
 		}
+		sc.addTable(t, qualifier)
 
 		cols := make([]plan.ResultColumn, len(t.Columns))
 		for i, c := range t.Columns {
 			cols[i] = plan.ResultColumn{Name: c.Name, Type: c.Type}
-			sc.cols = append(sc.cols, scopeColumn{
-				table: qualifier, name: c.Name, ordinal: i, typ: c.Type,
-			})
 		}
 		node = &plan.Scan{Table: t, Cols: cols}
 	}
 
 	if s.Where != nil {
-		pred, err := bindExpr(s.Where, sc)
+		pred, err := b.bindPredicate(s.Where, sc, "WHERE")
 		if err != nil {
 			return nil, err
-		}
-		if pred.Type() != types.KindBool {
-			return nil, pgerr.Newf(pgerr.DatatypeMismatch,
-				"argument of WHERE must be boolean, not %s", pred.Type()).At(s.Where.Pos())
 		}
 		if node == nil {
 			return nil, pgerr.New(pgerr.SyntaxError, "WHERE requires a FROM clause").At(s.Where.Pos())

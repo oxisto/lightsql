@@ -482,6 +482,43 @@ type InsertStmt struct {
 func (s *InsertStmt) Pos() token.Pos { return s.InsertPos }
 
 // ---------------------------------------------------------------------------
+// UPDATE and DELETE
+// ---------------------------------------------------------------------------
+
+// Assignment is one `column = expression` of an UPDATE SET clause.
+type Assignment struct {
+	Column Name
+	Value  Expr
+}
+
+func (a *Assignment) Pos() token.Pos { return a.Column.NamePos }
+
+// UpdateStmt is an UPDATE statement.
+type UpdateStmt struct {
+	UpdatePos token.Pos
+	Table     *TableName
+	// Alias renames the table for the rest of the statement, as in
+	// `UPDATE t AS x SET ... WHERE x.a = 1`.
+	Alias       Name
+	Assignments []*Assignment
+	Where       Expr
+	Returning   []SelectItem
+}
+
+func (s *UpdateStmt) Pos() token.Pos { return s.UpdatePos }
+
+// DeleteStmt is a DELETE statement.
+type DeleteStmt struct {
+	DeletePos token.Pos
+	Table     *TableName
+	Alias     Name
+	Where     Expr
+	Returning []SelectItem
+}
+
+func (s *DeleteStmt) Pos() token.Pos { return s.DeletePos }
+
+// ---------------------------------------------------------------------------
 // CREATE TABLE
 // ---------------------------------------------------------------------------
 
@@ -587,4 +624,6 @@ func (s *CreateTableStmt) Pos() token.Pos { return s.CreatePos }
 
 func (*SelectStmt) stmtNode()      {}
 func (*InsertStmt) stmtNode()      {}
+func (*UpdateStmt) stmtNode()      {}
+func (*DeleteStmt) stmtNode()      {}
 func (*CreateTableStmt) stmtNode() {}

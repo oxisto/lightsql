@@ -73,12 +73,8 @@ func (t *Table) Insert(row []types.Value) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	for i, col := range t.Columns {
-		if col.NotNull && row[i].IsNull() {
-			return pgerr.Newf(pgerr.NotNullViolation,
-				"null value in column %q of relation %q violates not-null constraint",
-				col.Name, t.Name)
-		}
+	if err := t.checkRow(row); err != nil {
+		return err
 	}
 	t.rows = append(t.rows, row)
 	return nil
@@ -94,6 +90,55 @@ func (t *Table) Rows() [][]types.Value {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.rows[:len(t.rows):len(t.rows)]
+}
+
+// Mutate applies a function to every row under the table's write lock.
+//
+// The callback returns the row's replacement, or nil to delete it. Modifying
+// rows this way, rather than handing out the slice, keeps two properties that
+// matter:
+//
+//   - The whole statement observes one consistent state, because the lock is
+//     held for its duration.
+//   - Readers that already obtained a snapshot from Rows are unaffected, since
+//     both the row slice and each replaced row are copied rather than written
+//     through. That is a weak stand-in for the MVCC snapshots to come, but it
+//     stops a concurrent scan from seeing a half-applied UPDATE.
+//
+// The callback must not call back into the table.
+func (t *Table) Mutate(fn func(i int, row []types.Value) (replacement []types.Value, err error)) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	next := make([][]types.Value, 0, len(t.rows))
+	for i, row := range t.rows {
+		replacement, err := fn(i, row)
+		if err != nil {
+			return err
+		}
+		if replacement == nil {
+			continue // deleted
+		}
+		if err := t.checkRow(replacement); err != nil {
+			return err
+		}
+		next = append(next, replacement)
+	}
+	t.rows = next
+	return nil
+}
+
+// checkRow enforces the constraints that apply to a stored row. The caller must
+// hold the write lock.
+func (t *Table) checkRow(row []types.Value) error {
+	for i, col := range t.Columns {
+		if col.NotNull && row[i].IsNull() {
+			return pgerr.Newf(pgerr.NotNullViolation,
+				"null value in column %q of relation %q violates not-null constraint",
+				col.Name, t.Name)
+		}
+	}
+	return nil
 }
 
 // NextSerial returns and consumes the next value of a serial column.
