@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  # The root module promises no runtime dependencies outside golang.org/x, so
+  # this mostly watches those. TestNoRuntimeDependencies fails the build if an
+  # update ever introduces something else.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      golang-x:
+        patterns:
+          - golang.org/x/*
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
