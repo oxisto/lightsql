@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/oxisto/lightsql/internal/types"
@@ -85,7 +86,7 @@ func TestMutateIsAtomic(t *testing.T) {
 		next[1] = types.Int(999)
 		return next, nil
 	})
-	if err != wantErr {
+	if !errors.Is(err, wantErr) {
 		t.Fatalf("Mutate returned %v, want the callback's error", err)
 	}
 
