@@ -4,12 +4,11 @@ A small, embeddable SQL engine for Go that speaks the PostgreSQL dialect and plu
 straight into `database/sql`. Run it entirely in memory for tests, or point it at a
 directory for a small file-backed deployment.
 
-> **Status: early, but it runs.** The full pipeline is wired end to end — you can
-> `CREATE TABLE`, `INSERT` and `SELECT ... WHERE ... LIMIT` through `database/sql` and
-> scan the results. Joins, aggregates, `ORDER BY`, `UPDATE`, `DELETE`, transactions and
-> file-backed storage are not implemented yet. The compatibility matrix below is
-> generated from the code, and every row is backed by a probe that is actually run —
-> see [Compatibility](#compatibility).
+> **Status: early, but CRUD works.** `CREATE TABLE`, `INSERT`, `SELECT ... WHERE`,
+> `UPDATE`, `DELETE` and `RETURNING` all run end to end through `database/sql`. Joins,
+> aggregates, `ORDER BY`, transactions and file-backed storage are not implemented yet.
+> The compatibility matrix below is generated from the code, and every row is backed by
+> a probe that is actually run — see [Compatibility](#compatibility).
 
 ```go
 import (
@@ -132,9 +131,9 @@ the two.
 | | **Data manipulation** | | | |
 | ✅ | INSERT ... VALUES | ✅ | ✅ | including multi-row VALUES |
 | ⬜ | INSERT ... SELECT | ✅ | ⬜ |  |
-| ⬜ | RETURNING | ✅ | ⬜ | on INSERT; UPDATE and DELETE pending |
-| ⬜ | UPDATE | ⬜ | ⬜ |  |
-| ⬜ | DELETE | ⬜ | ⬜ |  |
+| ✅ | RETURNING | ✅ | ✅ | on INSERT, UPDATE and DELETE; sees generated serial values |
+| ✅ | UPDATE | ✅ | ✅ | assignments all read the original row, so SET a = b, b = a swaps |
+| ✅ | DELETE | ✅ | ✅ | row order is preserved for the rows that remain |
 | ⬜ | ON CONFLICT | ⬜ | ⬜ |  |
 | ⬜ | TRUNCATE | ⬜ | ⬜ |  |
 | | **Queries** | | | |

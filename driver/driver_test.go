@@ -368,6 +368,218 @@ func equalInts(a, b []int) bool {
 	return true
 }
 
+// queryInts runs a query and collects a single integer column, so the CRUD tests
+// can state their expectations as a slice.
+func queryInts(t *testing.T, db *sql.DB, query string, args ...any) []int {
+	t.Helper()
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	defer rows.Close()
+
+	var got []int
+	for rows.Next() {
+		var n sql.NullInt64
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got = append(got, int(n.Int64))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	return got
+}
+
+func TestUpdate(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (id INT, a INT, b INT);
+		INSERT INTO t (id, a, b) VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	res, err := db.Exec(`UPDATE t SET a = 99 WHERE id = 2`)
+	if err != nil {
+		t.Fatalf("UPDATE: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Errorf("RowsAffected = %d, want 1", n)
+	}
+	if got := queryInts(t, db, `SELECT a FROM t`); !equalInts(got, []int{10, 99, 30}) {
+		t.Errorf("after update, a = %v, want [10 99 30]", got)
+	}
+
+	// The right-hand side reads the row being updated.
+	if _, err := db.Exec(`UPDATE t SET a = a + 1`); err != nil {
+		t.Fatalf("UPDATE with self-reference: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT a FROM t`); !equalInts(got, []int{11, 100, 31}) {
+		t.Errorf("after increment, a = %v, want [11 100 31]", got)
+	}
+
+	// Every assignment sees the original row, so this is a swap rather than two
+	// copies of the same value. Applying assignments left to right would give
+	// both columns the value of b.
+	if _, err := db.Exec(`UPDATE t SET a = b, b = a WHERE id = 1`); err != nil {
+		t.Fatalf("UPDATE swap: %v", err)
+	}
+	var a, b int
+	if err := db.QueryRow(`SELECT a, b FROM t WHERE id = 1`).Scan(&a, &b); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if a != 100 || b != 11 {
+		t.Errorf("after swap, a=%d b=%d; want a=100 b=11", a, b)
+	}
+
+	// A WHERE that matches nothing is not an error.
+	res, err = db.Exec(`UPDATE t SET a = 0 WHERE id = 999`)
+	if err != nil {
+		t.Fatalf("UPDATE matching nothing: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 0 {
+		t.Errorf("RowsAffected = %d, want 0", n)
+	}
+}
+
+func TestDelete(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (id INT, a INT);
+		INSERT INTO t (id, a) VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	res, err := db.Exec(`DELETE FROM t WHERE a > 25`)
+	if err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 2 {
+		t.Errorf("RowsAffected = %d, want 2", n)
+	}
+	// Deleting must not disturb the order of the rows that remain.
+	if got := queryInts(t, db, `SELECT id FROM t`); !equalInts(got, []int{1, 2}) {
+		t.Errorf("remaining ids = %v, want [1 2]", got)
+	}
+
+	// A comparison against NULL is unknown, so a NULL row is not deleted by an
+	// ordinary predicate.
+	if _, err := db.Exec(`INSERT INTO t (id, a) VALUES (5, NULL)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM t WHERE a > 0`); err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT id FROM t`); !equalInts(got, []int{5}) {
+		t.Errorf("ids after deleting a > 0 = %v, want [5] (the NULL row survives)", got)
+	}
+
+	// DELETE without WHERE empties the table.
+	if _, err := db.Exec(`DELETE FROM t`); err != nil {
+		t.Fatalf("DELETE all: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT id FROM t`); len(got) != 0 {
+		t.Errorf("table not empty after unqualified DELETE: %v", got)
+	}
+}
+
+func TestReturning(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`CREATE TABLE t (id BIGSERIAL PRIMARY KEY, a INT)`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// The generated serial is visible to RETURNING; this is the portable
+	// replacement for LastInsertId.
+	var id int64
+	if err := db.QueryRow(`INSERT INTO t (a) VALUES (7) RETURNING id`).Scan(&id); err != nil {
+		t.Fatalf("INSERT RETURNING: %v", err)
+	}
+	if id != 1 {
+		t.Errorf("returned id = %d, want 1", id)
+	}
+
+	// A multi-row INSERT returns one row per inserted row.
+	got := queryInts(t, db, `INSERT INTO t (a) VALUES (8), (9) RETURNING id`)
+	if !equalInts(got, []int{2, 3}) {
+		t.Errorf("returned ids = %v, want [2 3]", got)
+	}
+
+	// UPDATE ... RETURNING reports the new value, not the old one.
+	got = queryInts(t, db, `UPDATE t SET a = a * 10 WHERE a >= 8 RETURNING a`)
+	if !equalInts(got, []int{80, 90}) {
+		t.Errorf("UPDATE returned %v, want [80 90] (the new values)", got)
+	}
+
+	// DELETE ... RETURNING reports the row as it was before removal.
+	got = queryInts(t, db, `DELETE FROM t WHERE a = 80 RETURNING a`)
+	if !equalInts(got, []int{80}) {
+		t.Errorf("DELETE returned %v, want [80]", got)
+	}
+	if got := queryInts(t, db, `SELECT a FROM t`); !equalInts(got, []int{7, 90}) {
+		t.Errorf("after delete, a = %v, want [7 90]", got)
+	}
+
+	// RETURNING * expands to every column, and an alias renames the output.
+	rows, err := db.Query(`INSERT INTO t (a) VALUES (5) RETURNING *`)
+	if err != nil {
+		t.Fatalf("RETURNING *: %v", err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("Columns: %v", err)
+	}
+	if len(cols) != 2 || cols[0] != "id" || cols[1] != "a" {
+		t.Errorf("RETURNING * columns = %v, want [id a]", cols)
+	}
+}
+
+// TestExecDiscardsReturning checks that a RETURNING statement run through Exec
+// still applies, and reports its count rather than failing for having rows.
+func TestExecDiscardsReturning(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`CREATE TABLE t (a INT)`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	res, err := db.Exec(`INSERT INTO t (a) VALUES (1), (2) RETURNING a`)
+	if err != nil {
+		t.Fatalf("Exec with RETURNING: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 2 {
+		t.Errorf("RowsAffected = %d, want 2", n)
+	}
+	if got := queryInts(t, db, `SELECT a FROM t`); !equalInts(got, []int{1, 2}) {
+		t.Errorf("rows = %v, want [1 2]; the insert must still have happened", got)
+	}
+}
+
+// TestUpdateFailureLeavesTableUnchanged pins that a statement failing partway
+// does not leave half its work applied. Real atomicity arrives with MVCC; until
+// then the mutation is staged and swapped in, which is what makes this hold.
+func TestUpdateFailureLeavesTableUnchanged(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (id INT, a INT NOT NULL);
+		INSERT INTO t (id, a) VALUES (1, 10), (2, 20);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// The second row violates NOT NULL, so the whole statement must fail.
+	if _, err := db.Exec(`UPDATE t SET a = NULL WHERE id = 2`); err == nil {
+		t.Fatal("UPDATE to NULL on a NOT NULL column succeeded, want an error")
+	}
+	if got := queryInts(t, db, `SELECT a FROM t`); !equalInts(got, []int{10, 20}) {
+		t.Errorf("after the failed update, a = %v, want [10 20] unchanged", got)
+	}
+}
+
 // TestErrorsCarrySQLState checks the contract application code relies on to tell
 // one failure from another, using the same interface pgx and lib/pq expose.
 func TestErrorsCarrySQLState(t *testing.T) {

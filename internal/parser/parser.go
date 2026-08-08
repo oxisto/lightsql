@@ -187,10 +187,14 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 		return p.parseSelect()
 	case token.Insert:
 		return p.parseInsert()
+	case token.Update:
+		return p.parseUpdate()
+	case token.Delete:
+		return p.parseDelete()
 	case token.Create:
 		return p.parseCreate()
 	default:
-		return nil, p.unexpected("SELECT, INSERT or CREATE")
+		return nil, p.unexpected("SELECT, INSERT, UPDATE, DELETE or CREATE")
 	}
 }
 
@@ -561,12 +565,104 @@ func (p *parser) parseInsert() (*ast.InsertStmt, error) {
 		return nil, p.unexpected("VALUES or SELECT")
 	}
 
-	if p.accept(token.Returning) {
-		items, err := p.parseSelectItems()
+	if stmt.Returning, err = p.parseReturning(); err != nil {
+		return nil, err
+	}
+	return stmt, nil
+}
+
+// parseReturning parses an optional RETURNING list, shared by INSERT, UPDATE and
+// DELETE. It reuses the select-list production, so RETURNING supports the same
+// expressions and aliases a SELECT does.
+func (p *parser) parseReturning() ([]ast.SelectItem, error) {
+	if !p.accept(token.Returning) {
+		return nil, nil
+	}
+	return p.parseSelectItems()
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE and DELETE
+// ---------------------------------------------------------------------------
+
+func (p *parser) parseUpdate() (*ast.UpdateStmt, error) {
+	stmt := &ast.UpdateStmt{UpdatePos: p.cur().Pos}
+	p.next()
+
+	name, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Table = name
+
+	// An alias may only be introduced with AS here. Without that restriction the
+	// bare-identifier form would swallow the mandatory SET keyword's position in
+	// statements such as `UPDATE t x SET ...`, which PostgreSQL also rejects
+	// unless AS is used.
+	if p.accept(token.As) {
+		if stmt.Alias, err = p.expectName(); err != nil {
+			return nil, err
+		}
+	}
+
+	if _, err := p.expect(token.Set); err != nil {
+		return nil, err
+	}
+	for {
+		col, err := p.expectName()
 		if err != nil {
 			return nil, err
 		}
-		stmt.Returning = items
+		if _, err := p.expect(token.Eq); err != nil {
+			return nil, err
+		}
+		val, err := p.parseExpr(bpNone)
+		if err != nil {
+			return nil, err
+		}
+		stmt.Assignments = append(stmt.Assignments, &ast.Assignment{Column: col, Value: val})
+		if !p.accept(token.Comma) {
+			break
+		}
+	}
+
+	if p.accept(token.Where) {
+		if stmt.Where, err = p.parseExpr(bpNone); err != nil {
+			return nil, err
+		}
+	}
+	if stmt.Returning, err = p.parseReturning(); err != nil {
+		return nil, err
+	}
+	return stmt, nil
+}
+
+func (p *parser) parseDelete() (*ast.DeleteStmt, error) {
+	stmt := &ast.DeleteStmt{DeletePos: p.cur().Pos}
+	p.next()
+	if _, err := p.expect(token.From); err != nil {
+		return nil, err
+	}
+
+	name, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Table = name
+
+	if p.accept(token.As) {
+		if stmt.Alias, err = p.expectName(); err != nil {
+			return nil, err
+		}
+	}
+
+	if p.accept(token.Where) {
+		if stmt.Where, err = p.parseExpr(bpNone); err != nil {
+			return nil, err
+		}
+	}
+	if stmt.Returning, err = p.parseReturning(); err != nil {
+		return nil, err
 	}
 	return stmt, nil
 }

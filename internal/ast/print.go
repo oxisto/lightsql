@@ -69,6 +69,25 @@ func (p *printer) exprList(name string, xs []Expr) {
 	p.close()
 }
 
+// returning prints a RETURNING list, which INSERT, UPDATE and DELETE share.
+func (p *printer) returning(items []SelectItem) {
+	if len(items) == 0 {
+		return
+	}
+	p.open("returning")
+	for _, it := range items {
+		if it.Alias.IsEmpty() {
+			p.node(it.Expr)
+			continue
+		}
+		p.open("as")
+		p.name(it.Alias)
+		p.node(it.Expr)
+		p.close()
+	}
+	p.close()
+}
+
 func (p *printer) name(n Name) {
 	if n.IsEmpty() {
 		return
@@ -150,13 +169,37 @@ func (p *printer) node(n Node) {
 		if n.Select != nil {
 			p.field("select", n.Select)
 		}
-		if len(n.Returning) > 0 {
-			p.open("returning")
-			for _, it := range n.Returning {
-				p.node(it.Expr)
-			}
+		p.returning(n.Returning)
+		p.close()
+
+	case *UpdateStmt:
+		p.open("update")
+		p.atom("%s", n.Table)
+		if !n.Alias.IsEmpty() {
+			p.atom("as")
+			p.name(n.Alias)
+		}
+		p.open("set")
+		for _, a := range n.Assignments {
+			p.open("=")
+			p.name(a.Column)
+			p.node(a.Value)
 			p.close()
 		}
+		p.close()
+		p.field("where", n.Where)
+		p.returning(n.Returning)
+		p.close()
+
+	case *DeleteStmt:
+		p.open("delete")
+		p.atom("%s", n.Table)
+		if !n.Alias.IsEmpty() {
+			p.atom("as")
+			p.name(n.Alias)
+		}
+		p.field("where", n.Where)
+		p.returning(n.Returning)
 		p.close()
 
 	case *CreateTableStmt:

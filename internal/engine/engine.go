@@ -55,34 +55,83 @@ func (e *Engine) Prepare(sql string) (*Prepared, error) {
 
 // ReturnsRows reports whether executing the statement produces a result set,
 // which the driver needs in order to route Exec and Query correctly.
+//
+// A data-modifying statement returns rows exactly when it has a RETURNING
+// clause, so this is not simply "is it a SELECT".
+//
+// This is deliberately distinct from IsQuery: `INSERT ... RETURNING` returns
+// rows but is not a query, and the two need different handling when a caller
+// asks for a row count.
 func (p *Prepared) ReturnsRows() bool {
+	switch s := p.stmt.(type) {
+	case *plan.Query:
+		return true
+	case *plan.Insert:
+		return s.Returning != nil
+	case *plan.Update:
+		return s.Returning != nil
+	case *plan.Delete:
+		return s.Returning != nil
+	default:
+		return false
+	}
+}
+
+// IsQuery reports whether the statement is a SELECT. A data-modifying statement
+// with a RETURNING clause also produces rows, but it still has a meaningful
+// affected count, so the two cases are told apart here.
+func (p *Prepared) IsQuery() bool {
 	_, ok := p.stmt.(*plan.Query)
 	return ok
 }
 
-// Exec runs a statement that does not return rows.
+// Exec runs a statement and reports how many rows it affected. Any RETURNING
+// rows are discarded, matching what a caller using Exec has asked for.
 func (p *Prepared) Exec(ctx context.Context, args []types.Value) (affected int64, err error) {
-	switch s := p.stmt.(type) {
-	case *plan.CreateTable:
-		return 0, exec.ExecCreateTable(p.eng.cat, s)
-	case *plan.Insert:
-		return exec.ExecInsert(ctx, s, args)
-	default:
-		return 0, pgerr.New(pgerr.SyntaxError, "statement returns rows; use Query")
-	}
+	res, _, err := p.run(ctx, args)
+	return res.Affected, err
 }
 
-// Query runs a statement that returns rows.
+// Query runs a statement and returns its rows.
 func (p *Prepared) Query(ctx context.Context, args []types.Value) (*Rows, error) {
-	q, ok := p.stmt.(*plan.Query)
-	if !ok {
-		return nil, pgerr.New(pgerr.SyntaxError, "statement does not return rows; use Exec")
+	if q, ok := p.stmt.(*plan.Query); ok {
+		op, err := exec.Build(q.Root, args)
+		if err != nil {
+			return nil, err
+		}
+		return &Rows{cols: q.Root.Result(), op: op}, nil
 	}
-	op, err := exec.Build(q.Root, args)
+
+	res, ret, err := p.run(ctx, args)
 	if err != nil {
 		return nil, err
 	}
-	return &Rows{cols: q.Root.Result(), op: op}, nil
+	if ret == nil {
+		return nil, pgerr.New(pgerr.SyntaxError, "statement does not return rows; use Exec")
+	}
+	return &Rows{cols: ret.Cols, op: exec.NewSliceOp(res.Rows)}, nil
+}
+
+// run executes the statement, returning its result and the shape of any
+// RETURNING clause. Both Exec and Query go through here so that the two cannot
+// disagree about what a statement does.
+func (p *Prepared) run(ctx context.Context, args []types.Value) (exec.Result, *plan.Returning, error) {
+	switch s := p.stmt.(type) {
+	case *plan.CreateTable:
+		return exec.Result{}, nil, exec.ExecCreateTable(p.eng.cat, s)
+	case *plan.Insert:
+		res, err := exec.ExecInsert(ctx, s, args)
+		return res, s.Returning, err
+	case *plan.Update:
+		res, err := exec.ExecUpdate(ctx, s, args)
+		return res, s.Returning, err
+	case *plan.Delete:
+		res, err := exec.ExecDelete(ctx, s, args)
+		return res, s.Returning, err
+	default:
+		return exec.Result{}, nil, pgerr.New(pgerr.SyntaxError,
+			"statement returns rows; use Query")
+	}
 }
 
 // ExecBatch runs one or more statements separated by semicolons, returning the
@@ -101,7 +150,10 @@ func (e *Engine) ExecBatch(ctx context.Context, sql string, args []types.Value) 
 			return 0, err
 		}
 		p := &Prepared{eng: e, stmt: bound}
-		if p.ReturnsRows() {
+		// Only a genuine query is drained for its rows. A data-modifying
+		// statement goes through Exec even when it has a RETURNING clause, so
+		// that it still reports how many rows it changed.
+		if p.IsQuery() {
 			// A query inside a batch is legal but discards its rows, matching
 			// what a server does for a multi-statement command.
 			rows, err := p.Query(ctx, args)

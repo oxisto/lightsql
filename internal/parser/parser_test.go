@@ -271,6 +271,38 @@ func TestParseStatements(t *testing.T) {
 			sql:  "SELECT 1 FROM public.users",
 			want: "(select (items (lit 1)) (from (table public.users)))",
 		},
+		{
+			name: "update",
+			sql:  "UPDATE t SET a = 1, b = b + 1 WHERE c = $1",
+			want: "(update t (set (= a (lit 1)) (= b (+ (col b) (lit 1)))) " +
+				"(where (= (col c) (param 1))))",
+		},
+		{
+			name: "update without where affects every row",
+			sql:  "UPDATE t SET a = 1",
+			want: "(update t (set (= a (lit 1))))",
+		},
+		{
+			name: "update with alias and returning",
+			sql:  "UPDATE t AS x SET a = 1 WHERE x.b = 2 RETURNING x.a AS n",
+			want: "(update t as x (set (= a (lit 1))) (where (= (col x.b) (lit 2))) " +
+				"(returning (as n (col x.a))))",
+		},
+		{
+			name: "delete",
+			sql:  "DELETE FROM t WHERE a = 1",
+			want: "(delete t (where (= (col a) (lit 1))))",
+		},
+		{
+			name: "delete without where empties the table",
+			sql:  "DELETE FROM t",
+			want: "(delete t)",
+		},
+		{
+			name: "delete returning star",
+			sql:  "DELETE FROM t WHERE a = 1 RETURNING *",
+			want: "(delete t (where (= (col a) (lit 1))) (returning (star)))",
+		},
 	}
 
 	for _, tt := range tests {
@@ -386,6 +418,12 @@ func TestParseErrors(t *testing.T) {
 		// A bare NOT in infix position is only valid before IN, LIKE or
 		// BETWEEN, so the error names the NOT rather than what follows it.
 		{"not alone", "SELECT a NOT b", 9, `at or near "NOT"`},
+		{"update without set", "UPDATE t WHERE a = 1", 9, "SET"},
+		{"update assignment without value", "UPDATE t SET a =", 16, "end of input"},
+		{"delete without from", "DELETE t", 7, "FROM"},
+		// An UPDATE alias must be introduced with AS, so a bare identifier here
+		// is reported against the missing SET rather than silently accepted.
+		{"update bare alias", "UPDATE t x SET a = 1", 9, "SET"},
 	}
 
 	for _, tt := range tests {
