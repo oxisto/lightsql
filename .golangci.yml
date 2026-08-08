@@ -1,0 +1,53 @@
+version: "2"
+
+# The point of this config is to catch the mistakes that review reliably misses:
+# reimplementing something the standard library already does, parameters that no
+# caller uses, and error handling that quietly loses information. Style is left
+# to gofmt.
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - errorlint # errors compared with == rather than errors.Is
+    - gocritic
+    - intrange # pre-1.22 loops that a range over int expresses better
+    - copyloopvar
+    - nakedret
+    - perfsprint # fmt.Sprintf where a strconv call is both clearer and cheaper
+    - unconvert # conversions that do nothing
+    - unparam # unused parameters and results
+    - usestdlibvars # magic strings that the standard library already names
+    - wastedassign
+
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - opinionated
+        - performance
+      disabled-checks:
+        # The codebase deliberately uses if/else chains where a switch would
+        # read no better, and comments longer than the line limit.
+        - ifElseChain
+        - commentFormatting
+
+  exclusions:
+    rules:
+      # A deferred Close in a test is idiomatic Go, not an unchecked error.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+      # These tests exercise the Query path deliberately — that a query fails,
+      # or that a cancelled context reaches it — so Exec is not the right call.
+      - path: _test\.go
+        text: "sqlQuery"
+
+      # internal/features is a static registry read once when rendering the
+      # compatibility table. Value semantics read better there than a pointer,
+      # and hugeParam stays enabled everywhere it could matter.
+      - path: internal/features/
+        text: "hugeParam"
+
+formatters:
+  enable:
+    - gofmt

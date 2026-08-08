@@ -62,6 +62,15 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # golangci-lint carries the checks that review reliably misses:
+      # reimplementing something the standard library already does, parameters
+      # no caller uses, and error handling that quietly loses information.
+      # The linter set lives in .golangci.yml.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
       # A stale go.mod or go.sum is caught here rather than by whoever next runs
       # a build. The repository also promises no runtime dependencies outside
       # golang.org/x, which TestNoRuntimeDependencies enforces in the test job.

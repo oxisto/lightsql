@@ -370,10 +370,10 @@ func equalInts(a, b []int) bool {
 
 // queryInts runs a query and collects a single integer column, so the CRUD tests
 // can state their expectations as a slice.
-func queryInts(t *testing.T, db *sql.DB, query string, args ...any) []int {
+func queryInts(t *testing.T, db *sql.DB, query string) []int {
 	t.Helper()
 
-	rows, err := db.Query(query, args...)
+	rows, err := db.Query(query)
 	if err != nil {
 		t.Fatalf("%s: %v", query, err)
 	}

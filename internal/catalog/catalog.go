@@ -9,7 +9,8 @@
 package catalog
 
 import (
-	"strings"
+	"cmp"
+	"slices"
 	"sync"
 
 	"github.com/oxisto/lightsql/internal/pgerr"
@@ -94,25 +95,33 @@ func (t *Table) Rows() [][]types.Value {
 
 // Mutate applies a function to every row under the table's write lock.
 //
-// The callback returns the row's replacement, or nil to delete it. Modifying
-// rows this way, rather than handing out the slice, keeps two properties that
-// matter:
+// The callback receives each row and returns its replacement, or nil to delete
+// it. Two contracts hold, and only one of them is enforced here:
 //
-//   - The whole statement observes one consistent state, because the lock is
-//     held for its duration.
-//   - Readers that already obtained a snapshot from Rows are unaffected, since
-//     both the row slice and each replaced row are copied rather than written
-//     through. That is a weak stand-in for the MVCC snapshots to come, but it
-//     stops a concurrent scan from seeing a half-applied UPDATE.
+//   - Mutate builds a new outer slice and swaps it in at the end, so a reader
+//     that already obtained a snapshot from Rows keeps iterating the old one.
+//     A statement that fails partway therefore leaves the table untouched.
+//   - The row passed to the callback is the stored row itself, not a copy.
+//     A callback that wants to change a value must return a **new** slice;
+//     writing through the argument would be visible to a reader holding a
+//     snapshot and would defeat the guarantee above.
+//
+// Copying every row defensively would cost an allocation for the rows a
+// statement does not even touch, so the second contract is left to the caller.
+// TestMutateDoesNotDisturbSnapshots checks that the callers honour it.
+//
+// Together this is a weak stand-in for the MVCC snapshots planned for M2: it
+// stops a concurrent scan from seeing a half-applied UPDATE, but it does not
+// give a reader a stable view of a row it has already returned.
 //
 // The callback must not call back into the table.
-func (t *Table) Mutate(fn func(i int, row []types.Value) (replacement []types.Value, err error)) error {
+func (t *Table) Mutate(fn func(row []types.Value) (replacement []types.Value, err error)) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	next := make([][]types.Value, 0, len(t.rows))
-	for i, row := range t.rows {
-		replacement, err := fn(i, row)
+	for _, row := range t.rows {
+		replacement, err := fn(row)
 		if err != nil {
 			return err
 		}
@@ -234,10 +243,8 @@ func (c *Catalog) Tables() []*Table {
 	}
 	// A stable order keeps introspection output deterministic across runs,
 	// which map iteration would not.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && strings.Compare(out[j-1].QualifiedName(), out[j].QualifiedName()) > 0; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
+	slices.SortFunc(out, func(a, b *Table) int {
+		return cmp.Compare(a.QualifiedName(), b.QualifiedName())
+	})
 	return out
 }

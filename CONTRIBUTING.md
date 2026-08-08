@@ -57,6 +57,9 @@ people out:
   indexing; `types.Eq` and friends implement SQL semantics where NULL poisons the
   result. They are different functions on purpose.
 - **Errors carry a SQLSTATE and a position.** Build them with `pgerr`.
+- **Do not reimplement the standard library.** `cmp.Compare`, `slices`, `maps`,
+  `strconv` and `errors.AsType` before a hand-written loop. The linter config in
+  `.golangci.yml` enforces most of this; `golangci-lint run ./...` must be clean.
 
 ## Testing
 
@@ -161,7 +164,8 @@ The description should cover, briefly:
 
 Before opening:
 
-- `gofmt -l .` prints nothing, `go vet ./...` is clean, `go test ./...` passes.
+- `gofmt -l .` prints nothing, `go vet ./...` is clean, `golangci-lint run ./...`
+  reports no issues, and `go test ./...` passes.
 - One logical change per PR.
 - New behaviour comes with tests; new SQL comes with a `features` entry and a
   regenerated README.

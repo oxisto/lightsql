@@ -173,7 +173,7 @@ func bindBinary(e *ast.BinaryExpr, sc *scope) (plan.Expr, error) {
 // with anything, and an integer promotes to a float when the other side is one.
 // Anything else is a type error reported here rather than producing a surprising
 // answer at runtime.
-func unify(l, r plan.Expr, e *ast.BinaryExpr) (plan.Expr, plan.Expr, error) {
+func unify(l, r plan.Expr, e *ast.BinaryExpr) (left, right plan.Expr, err error) {
 	lt, rt := l.Type(), r.Type()
 
 	if p, ok := l.(*plan.Param); ok && lt == types.KindNull && rt != types.KindNull {

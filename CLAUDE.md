@@ -7,12 +7,13 @@ design problems are the reason several rules below are absolute.
 ## Commands
 
 ```sh
-go test ./...                              # everything
+go test ./...                               # everything
 go test ./internal/parser -run TestExpr     # one area
 go test ./internal/features -update         # regenerate the README matrix
 go test ./internal/scanner -fuzz FuzzScan -fuzztime 30s
 go test ./... -race
 gofmt -l .                                  # must print nothing
+golangci-lint run ./...                     # must print "0 issues"
 ```
 
 ## Architecture
@@ -74,6 +75,12 @@ These are load-bearing. Breaking one is a design change, not a detail.
 
 9. **No package-level mutable state, and no global logger configuration.** A library
    does not set the process log level. Configuration arrives through the connector.
+
+10. **Do not reimplement the standard library.** Reach for `cmp.Compare`, `slices`,
+    `maps`, `strconv`, `strings` and `errors.AsType` before writing a loop that does
+    the same thing. This was the single most common problem in the first pass:
+    hand-rolled comparators, two separate `atoi`s, an insertion sort, and a hand-parsed
+    `go.mod`. `golangci-lint run` catches most of it.
 
 ## Adding a SQL feature
 

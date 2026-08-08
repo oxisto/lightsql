@@ -1,6 +1,8 @@
 package parser
 
 import (
+	"strconv"
+
 	"github.com/oxisto/lightsql/internal/ast"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/token"
@@ -162,7 +164,7 @@ func (p *parser) parseIs(lhs ast.Expr) (ast.Expr, error) {
 		return &ast.BinaryExpr{Op: op, OpPos: isPos, X: lhs, Y: lit}, nil
 
 	case p.accept(token.Distinct):
-		if _, err := p.expect(token.From); err != nil {
+		if err := p.expect(token.From); err != nil {
 			return nil, err
 		}
 		rhs, err := p.parseExpr(bpIs + 1)
@@ -204,7 +206,7 @@ func (p *parser) parseRange(lhs ast.Expr, negate bool) (ast.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, err := p.expect(token.And); err != nil {
+		if err := p.expect(token.And); err != nil {
 			return nil, err
 		}
 		hi, err := p.parseExpr(bpRange + 1)
@@ -214,7 +216,7 @@ func (p *parser) parseRange(lhs ast.Expr, negate bool) (ast.Expr, error) {
 		return &ast.BetweenExpr{X: lhs, BetweenPos: tok.Pos, Negate: negate, Lo: lo, Hi: hi}, nil
 
 	default: // token.In
-		if _, err := p.expect(token.LParen); err != nil {
+		if err := p.expect(token.LParen); err != nil {
 			return nil, err
 		}
 		in := &ast.InExpr{X: lhs, InPos: tok.Pos, Negate: negate}
@@ -236,7 +238,7 @@ func (p *parser) parseRange(lhs ast.Expr, negate bool) (ast.Expr, error) {
 				}
 			}
 		}
-		if _, err := p.expect(token.RParen); err != nil {
+		if err := p.expect(token.RParen); err != nil {
 			return nil, err
 		}
 		return in, nil
@@ -337,7 +339,7 @@ func (p *parser) parseParen() (ast.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, err := p.expect(token.RParen); err != nil {
+		if err := p.expect(token.RParen); err != nil {
 			return nil, err
 		}
 		return &ast.SubqueryExpr{Lparen: lparen, Select: sel}, nil
@@ -347,21 +349,21 @@ func (p *parser) parseParen() (ast.Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(token.RParen); err != nil {
+	if err := p.expect(token.RParen); err != nil {
 		return nil, err
 	}
 	return &ast.ParenExpr{Lparen: lparen, X: x}, nil
 }
 
 func (p *parser) parseParenSelect() (*ast.SelectStmt, error) {
-	if _, err := p.expect(token.LParen); err != nil {
+	if err := p.expect(token.LParen); err != nil {
 		return nil, err
 	}
 	sel, err := p.parseSelect()
 	if err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(token.RParen); err != nil {
+	if err := p.expect(token.RParen); err != nil {
 		return nil, err
 	}
 	return sel, nil
@@ -394,7 +396,7 @@ func (p *parser) parseCase() (ast.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, err := p.expect(token.Then); err != nil {
+		if err := p.expect(token.Then); err != nil {
 			return nil, err
 		}
 		val, err := p.parseExpr(bpNone)
@@ -414,7 +416,7 @@ func (p *parser) parseCase() (ast.Expr, error) {
 		}
 		c.Else = els
 	}
-	if _, err := p.expect(token.End); err != nil {
+	if err := p.expect(token.End); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -425,21 +427,21 @@ func (p *parser) parseCase() (ast.Expr, error) {
 func (p *parser) parseCastCall() (ast.Expr, error) {
 	castPos := p.cur().Pos
 	p.next()
-	if _, err := p.expect(token.LParen); err != nil {
+	if err := p.expect(token.LParen); err != nil {
 		return nil, err
 	}
 	x, err := p.parseExpr(bpNone)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(token.As); err != nil {
+	if err := p.expect(token.As); err != nil {
 		return nil, err
 	}
 	typ, err := p.parseTypeName()
 	if err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(token.RParen); err != nil {
+	if err := p.expect(token.RParen); err != nil {
 		return nil, err
 	}
 	return &ast.CastExpr{CastPos: castPos, X: x, Type: typ}, nil
@@ -512,7 +514,7 @@ func (p *parser) parseCall(name ast.Name) (ast.Expr, error) {
 			}
 		}
 	}
-	if _, err := p.expect(token.RParen); err != nil {
+	if err := p.expect(token.RParen); err != nil {
 		return nil, err
 	}
 	return call, nil
@@ -555,8 +557,10 @@ func (p *parser) parseTypeName() (*ast.TypeName, error) {
 				return nil, p.unexpected("a type modifier")
 			}
 			p.next()
-			mod, ok := atoiStrict(n.Val)
-			if !ok {
+			// A modifier must be a plain integer. strconv rejects the "1.5"
+			// and "1e3" that token.Number also admits.
+			mod, err := strconv.Atoi(n.Val)
+			if err != nil {
 				return nil, pgerr.Syntaxf(n.Pos, "invalid type modifier %q", n.Val)
 			}
 			typ.Mods = append(typ.Mods, mod)
@@ -564,7 +568,7 @@ func (p *parser) parseTypeName() (*ast.TypeName, error) {
 				break
 			}
 		}
-		if _, err := p.expect(token.RParen); err != nil {
+		if err := p.expect(token.RParen); err != nil {
 			return nil, err
 		}
 	}
@@ -589,19 +593,4 @@ func (p *parser) parseTypeName() (*ast.TypeName, error) {
 	}
 
 	return typ, nil
-}
-
-func atoiStrict(s string) (int, bool) {
-	if s == "" || len(s) > 9 {
-		return 0, false
-	}
-	n := 0
-	for i := range len(s) {
-		c := s[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n, true
 }

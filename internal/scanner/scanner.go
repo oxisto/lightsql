@@ -19,6 +19,7 @@
 package scanner
 
 import (
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -78,7 +79,7 @@ func (s *Scanner) Scan() (token.Token, error) {
 
 	// E'...' is a PostgreSQL escape string, so the E is not an identifier. This
 	// has to be tested before the identifier case would swallow it.
-	if (c == 'E' || c == 'e') && s.peekAt(1) == '\'' {
+	if (c == 'E' || c == 'e') && s.peek() == '\'' {
 		s.pos++
 		return s.scanString(true)
 	}
@@ -88,7 +89,7 @@ func (s *Scanner) Scan() (token.Token, error) {
 		return s.scanIdent(), nil
 	case isDigit(c):
 		return s.scanNumber()
-	case c == '.' && s.peekAt(1) != 0 && isDigit(s.peekAt(1)):
+	case c == '.' && s.peek() != 0 && isDigit(s.peek()):
 		// A qualified name can never have a digit after the dot, so ".5" is
 		// unambiguously a numeric literal.
 		return s.scanNumber()
@@ -114,12 +115,12 @@ func (s *Scanner) skipSpaceAndComments() error {
 		switch {
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
 			s.pos++
-		case c == '-' && s.peekAt(1) == '-':
+		case c == '-' && s.peek() == '-':
 			s.pos += 2
 			for s.pos < len(s.src) && s.src[s.pos] != '\n' {
 				s.pos++
 			}
-		case c == '/' && s.peekAt(1) == '*':
+		case c == '/' && s.peek() == '*':
 			if err := s.skipBlockComment(); err != nil {
 				return err
 			}
@@ -137,10 +138,10 @@ func (s *Scanner) skipBlockComment() error {
 	depth := 0
 	for s.pos < len(s.src) {
 		switch {
-		case s.src[s.pos] == '/' && s.peekAt(1) == '*':
+		case s.src[s.pos] == '/' && s.peek() == '*':
 			depth++
 			s.pos += 2
-		case s.src[s.pos] == '*' && s.peekAt(1) == '/':
+		case s.src[s.pos] == '*' && s.peek() == '/':
 			depth--
 			s.pos += 2
 			if depth == 0 {
@@ -216,7 +217,7 @@ func (s *Scanner) scanString(escapes bool) (token.Token, error) {
 		c := s.src[s.pos]
 		switch {
 		case c == '\'':
-			if s.peekAt(1) == '\'' {
+			if s.peek() == '\'' {
 				b.WriteByte('\'')
 				s.pos += 2
 				continue
@@ -267,7 +268,7 @@ func (s *Scanner) scanQuotedIdent() (token.Token, error) {
 		}
 		c := s.src[s.pos]
 		if c == '"' {
-			if s.peekAt(1) == '"' {
+			if s.peek() == '"' {
 				b.WriteByte('"')
 				s.pos += 2
 				continue
@@ -287,14 +288,17 @@ func (s *Scanner) scanQuotedIdent() (token.Token, error) {
 // a $$ dollar-quoted string, or a $tag$ dollar-quoted string.
 func (s *Scanner) scanDollar() (token.Token, error) {
 	start := s.pos
-	if isDigit(s.peekAt(1)) {
+	if isDigit(s.peek()) {
 		s.pos++ // $
 		numStart := s.pos
 		for s.pos < len(s.src) && isDigit(s.src[s.pos]) {
 			s.pos++
 		}
-		ord, ok := atoi(s.src[numStart:s.pos])
-		if !ok || ord == 0 {
+		// strconv reports the overflow that a hand-rolled loop would silently
+		// wrap, so a pathological $99999999999999999999 is an error rather than
+		// an arbitrary ordinal.
+		ord, err := strconv.Atoi(s.src[numStart:s.pos])
+		if err != nil || ord == 0 {
 			return token.Token{}, pgerr.Syntaxf(token.Pos(start), "invalid parameter number")
 		}
 		if s.usedQM {
@@ -389,13 +393,14 @@ func (s *Scanner) scanOperator() (token.Token, error) {
 	return token.Token{}, pgerr.Syntaxf(token.Pos(s.pos), "unexpected character %q", r)
 }
 
-// peekAt returns the byte n positions ahead, or 0 at end of input. Returning 0
-// is safe because a NUL byte is not valid anywhere in SQL text we accept.
-func (s *Scanner) peekAt(n int) byte {
-	if s.pos+n >= len(s.src) {
+// peek returns the next byte after the current one, or 0 at end of input.
+// Returning 0 is safe because a NUL byte is not valid anywhere in SQL text we
+// accept.
+func (s *Scanner) peek() byte {
+	if s.pos+1 >= len(s.src) {
 		return 0
 	}
-	return s.src[s.pos+n]
+	return s.src[s.pos+1]
 }
 
 func isDigit(c byte) bool { return '0' <= c && c <= '9' }
@@ -413,7 +418,7 @@ func isIdentPart(c byte) bool { return isIdentStart(c) || isDigit(c) }
 // The common case is pure ASCII, which avoids allocating when already folded.
 func foldASCII(s string) string {
 	needs := false
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		if 'A' <= c && c <= 'Z' {
 			needs = true
@@ -431,16 +436,4 @@ func foldASCII(s string) string {
 		}
 	}
 	return string(b)
-}
-
-// atoi parses a run of digits, reporting failure instead of overflowing.
-func atoi(s string) (int, bool) {
-	if s == "" || len(s) > 9 {
-		return 0, false
-	}
-	n := 0
-	for i := 0; i < len(s); i++ {
-		n = n*10 + int(s[i]-'0')
-	}
-	return n, true
 }
