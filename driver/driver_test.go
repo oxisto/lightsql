@@ -580,6 +580,204 @@ func TestUpdateFailureLeavesTableUnchanged(t *testing.T) {
 	}
 }
 
+// queryStrings collects a single column as strings, so a test can state an
+// expected ordering including NULLs.
+func queryStrings(t *testing.T, db *sql.DB, query string) []string {
+	t.Helper()
+
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var v sql.NullString
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		if !v.Valid {
+			got = append(got, "NULL")
+			continue
+		}
+		got = append(got, v.String)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	return got
+}
+
+func TestOrderBy(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (a INT, b INT, s TEXT);
+		INSERT INTO t (a, b, s) VALUES
+			(3, 1, 'c'), (1, 2, 'a'), (2, 1, 'b'), (1, 1, 'a');
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  []int
+	}{
+		{"ascending is the default", `SELECT a FROM t ORDER BY a`, []int{1, 1, 2, 3}},
+		{"explicit asc", `SELECT a FROM t ORDER BY a ASC`, []int{1, 1, 2, 3}},
+		{"descending", `SELECT a FROM t ORDER BY a DESC`, []int{3, 2, 1, 1}},
+		// The second key only decides rows that tie on the first.
+		{"two keys", `SELECT b FROM t ORDER BY a, b DESC`, []int{2, 1, 1, 1}},
+		// An expression is a legal sort term.
+		{"by expression", `SELECT a FROM t ORDER BY a * -1`, []int{3, 2, 1, 1}},
+		// A position refers to the select list.
+		{"by position", `SELECT a FROM t ORDER BY 1 DESC`, []int{3, 2, 1, 1}},
+		// A bare integer is a position, but an expression that merely contains
+		// one is not: this sorts every row by the same constant, leaving the
+		// input order rather than sorting by column 2.
+		{"an arithmetic term is not a position", `SELECT a FROM t ORDER BY 1 + 1`, []int{3, 1, 2, 1}},
+		// An output alias wins over anything else of that name.
+		{"by alias", `SELECT a AS z FROM t ORDER BY z DESC`, []int{3, 2, 1, 1}},
+		// A sort column need not appear in the select list at all.
+		{"by an unselected column", `SELECT b FROM t ORDER BY s DESC, b`, []int{1, 1, 1, 2}},
+		// ORDER BY runs before LIMIT, or the wrong rows survive.
+		{"with limit", `SELECT a FROM t ORDER BY a DESC LIMIT 2`, []int{3, 2}},
+		{"with offset", `SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 2`, []int{2, 3}},
+		// The filter runs before the sort.
+		{"with where", `SELECT a FROM t WHERE a > 1 ORDER BY a DESC`, []int{3, 2}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := queryInts(t, db, tt.query); !equalInts(got, tt.want) {
+				t.Errorf("%s\n got: %v\nwant: %v", tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOrderByNulls pins where NULLs land. PostgreSQL treats NULL as larger than
+// every other value, so the default follows the direction — and an explicit
+// NULLS clause overrides it independently of that direction, which is the part
+// that is easy to get backwards.
+func TestOrderByNulls(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (a INT);
+		INSERT INTO t (a) VALUES (2), (NULL), (1);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"asc defaults to nulls last", `SELECT a FROM t ORDER BY a`, []string{"1", "2", "NULL"}},
+		{"desc defaults to nulls first", `SELECT a FROM t ORDER BY a DESC`, []string{"NULL", "2", "1"}},
+		{"asc nulls first", `SELECT a FROM t ORDER BY a ASC NULLS FIRST`, []string{"NULL", "1", "2"}},
+		// The combination that a naive implementation gets wrong: reversing the
+		// comparison would move the NULLs too.
+		{"desc nulls last", `SELECT a FROM t ORDER BY a DESC NULLS LAST`, []string{"2", "1", "NULL"}},
+		{"asc nulls last", `SELECT a FROM t ORDER BY a ASC NULLS LAST`, []string{"1", "2", "NULL"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := queryStrings(t, db, tt.query)
+			if len(got) != len(tt.want) {
+				t.Fatalf("%s returned %v, want %v", tt.query, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("%s\n got: %v\nwant: %v", tt.query, got, tt.want)
+					break
+				}
+			}
+		})
+	}
+}
+
+// TestOrderByIsStable checks that rows tying on every key keep their input
+// order, so a test asserting on output is not at the mercy of the sort.
+func TestOrderByIsStable(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (k INT, seq INT);
+		INSERT INTO t (k, seq) VALUES (1, 1), (1, 2), (1, 3), (1, 4), (1, 5);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT seq FROM t ORDER BY k`); !equalInts(got, []int{1, 2, 3, 4, 5}) {
+		t.Errorf("rows tying on the sort key were reordered: %v", got)
+	}
+}
+
+// TestClausesWithoutFrom pins that a SELECT with no FROM still accepts the
+// clauses SQL allows on it. A missing FROM is a single-row source, not the
+// absence of one, so nothing downstream needs to special-case it.
+func TestClausesWithoutFrom(t *testing.T) {
+	db := open(t)
+
+	tests := []struct {
+		name  string
+		query string
+		want  []int
+	}{
+		{"order by a position", `SELECT 1 ORDER BY 1`, []int{1}},
+		{"order by an expression", `SELECT 2 ORDER BY 1 DESC`, []int{2}},
+		{"where true", `SELECT 3 WHERE 1 = 1`, []int{3}},
+		// A false predicate returns no rows rather than being rejected.
+		{"where false", `SELECT 4 WHERE 1 = 2`, nil},
+		{"limit", `SELECT 5 LIMIT 1`, []int{5}},
+		{"limit zero", `SELECT 6 LIMIT 0`, nil},
+		{"everything at once", `SELECT 7 WHERE 1 = 1 ORDER BY 1 LIMIT 1`, []int{7}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := queryInts(t, db, tt.query); !equalInts(got, tt.want) {
+				t.Errorf("%s\n got: %v\nwant: %v", tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOrderByErrors(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`CREATE TABLE t (a INT)`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{"unknown column", `SELECT a FROM t ORDER BY nope`, "42703"},
+		{"position out of range", `SELECT a FROM t ORDER BY 2`, "42601"},
+		{"position zero", `SELECT a FROM t ORDER BY 0`, "42601"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := db.Query(tt.query)
+			if err == nil {
+				t.Fatalf("%s succeeded, want an error", tt.query)
+			}
+			var coded interface{ SQLState() string }
+			if !errors.As(err, &coded) {
+				t.Fatalf("error %v does not expose SQLState", err)
+			}
+			if got := coded.SQLState(); got != tt.want {
+				t.Errorf("SQLSTATE = %s, want %s (error: %v)", got, tt.want, err)
+			}
+		})
+	}
+}
+
 // TestErrorsCarrySQLState checks the contract application code relies on to tell
 // one failure from another, using the same interface pgx and lib/pq expose.
 func TestErrorsCarrySQLState(t *testing.T) {

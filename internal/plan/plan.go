@@ -97,6 +97,15 @@ type Node interface {
 	planNode()
 }
 
+// SingleRow produces exactly one row with no columns.
+//
+// It is what a SELECT without FROM is evaluated over, and it exists so that
+// every other node always has an input. Representing "no FROM clause" as a nil
+// input instead means each consumer has to remember the special case, which is
+// how `SELECT 1 ORDER BY 1` — valid SQL — ended up rejected while
+// `SELECT 1` worked.
+type SingleRow struct{}
+
 // Scan reads every row of a table.
 type Scan struct {
 	Table *catalog.Table
@@ -119,21 +128,49 @@ type Project struct {
 	Cols  []ResultColumn
 }
 
+// SortKey is one ORDER BY term.
+//
+// NullsFirst is resolved here rather than carried as a three-state default,
+// because the default depends on the direction: PostgreSQL sorts NULL as the
+// largest value, so ASC puts NULLs last and DESC puts them first. Leaving that
+// to the executor would mean re-deriving it per comparison.
+type SortKey struct {
+	Expr       Expr
+	Desc       bool
+	NullsFirst bool
+}
+
+// Sort orders its input.
+//
+// It sits below Project, not above it, because ORDER BY may name a column that
+// the select list does not output — `SELECT a FROM t ORDER BY b` is valid SQL.
+// Its keys are therefore bound in the input's scope. A term that names an output
+// alias is resolved by reusing that select item's bound expression, which is an
+// input-scope expression too, so both forms land in the same place.
+type Sort struct {
+	Input Node
+	Keys  []SortKey
+}
+
 // Limit restricts the row count. Count is nil when only OFFSET was given.
 type Limit struct {
 	Input         Node
 	Count, Offset Expr
 }
 
-func (n *Scan) Result() []ResultColumn    { return n.Cols }
-func (n *Filter) Result() []ResultColumn  { return n.Input.Result() }
-func (n *Project) Result() []ResultColumn { return n.Cols }
-func (n *Limit) Result() []ResultColumn   { return n.Input.Result() }
+func (n *SingleRow) Result() []ResultColumn { return nil }
+func (n *Scan) Result() []ResultColumn      { return n.Cols }
+func (n *Filter) Result() []ResultColumn    { return n.Input.Result() }
+func (n *Project) Result() []ResultColumn   { return n.Cols }
+func (n *Sort) Result() []ResultColumn      { return n.Input.Result() }
+func (n *Limit) Result() []ResultColumn     { return n.Input.Result() }
 
-func (*Scan) planNode()    {}
-func (*Filter) planNode()  {}
-func (*Project) planNode() {}
-func (*Limit) planNode()   {}
+func (*SingleRow) planNode() {}
+func (*Scan) planNode()      {}
+func (*Filter) planNode()    {}
+func (*Project) planNode()   {}
+func (*Sort) planNode()      {}
+func (*Limit) planNode()     {}
 
 // Stmt is a bound statement.
 type Stmt interface {

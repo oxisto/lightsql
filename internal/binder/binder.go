@@ -16,6 +16,7 @@ package binder
 import (
 	"errors"
 	"slices"
+	"strconv"
 
 	"github.com/oxisto/lightsql/internal/ast"
 	"github.com/oxisto/lightsql/internal/catalog"
@@ -374,7 +375,6 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		{s.Distinct, "DISTINCT"},
 		{len(s.GroupBy) > 0, "GROUP BY"},
 		{s.Having != nil, "HAVING"},
-		{len(s.OrderBy) > 0, "ORDER BY"},
 		{len(s.From) > 1, "multiple FROM items"},
 	} {
 		if unsupported.cond {
@@ -384,7 +384,9 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 	}
 
 	sc := &scope{}
-	var node plan.Node
+	// A SELECT without FROM is evaluated over one empty row, so every node
+	// below always has an input and no consumer needs a nil special case.
+	var node plan.Node = &plan.SingleRow{}
 
 	if len(s.From) == 1 {
 		ref, ok := s.From[0].(*ast.TableRef)
@@ -415,16 +417,25 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		if node == nil {
-			return nil, pgerr.New(pgerr.SyntaxError, "WHERE requires a FROM clause").At(s.Where.Pos())
-		}
 		node = &plan.Filter{Input: node, Pred: pred}
 	}
 
-	proj, err := b.bindSelectItems(s.Items, sc, node)
+	// The select list is bound before ORDER BY so that a term naming an output
+	// alias can reuse the item's already-bound expression. Its input is attached
+	// afterwards, once any Sort has been slotted underneath.
+	proj, err := b.bindSelectItems(s.Items, sc, nil)
 	if err != nil {
 		return nil, err
 	}
+
+	if len(s.OrderBy) > 0 {
+		keys, err := b.bindOrderBy(s.OrderBy, sc, proj)
+		if err != nil {
+			return nil, err
+		}
+		node = &plan.Sort{Input: node, Keys: keys}
+	}
+	proj.Input = node
 
 	var out plan.Node = proj
 	if s.Limit != nil || s.Offset != nil {
@@ -438,6 +449,78 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		out = lim
 	}
 	return &plan.Query{Root: out}, nil
+}
+
+// bindOrderBy resolves the ORDER BY terms against the select list and the input
+// scope.
+//
+// SQL allows a term to be written three ways, and they are tried in the order
+// PostgreSQL uses:
+//
+//  1. An output column name or alias — `SELECT a AS x ... ORDER BY x`. Output
+//     names win over input columns here, which is why this is checked first.
+//  2. An ordinal position into the select list — `ORDER BY 1`. Only a bare
+//     integer counts; `ORDER BY 1 + 1` is an expression that sorts every row by
+//     the same constant, not a reference to column 2.
+//  3. Any expression over the input — `SELECT a FROM t ORDER BY b` is valid even
+//     though b is not selected.
+//
+// All three produce an expression in the input's scope, which is what lets Sort
+// sit below Project.
+func (b *Binder) bindOrderBy(items []ast.OrderByItem, sc *scope, proj *plan.Project) ([]plan.SortKey, error) {
+	keys := make([]plan.SortKey, 0, len(items))
+
+	for _, item := range items {
+		expr, err := b.bindSortTerm(item.Expr, sc, proj)
+		if err != nil {
+			return nil, err
+		}
+		desc := item.Dir == ast.SortDesc
+		keys = append(keys, plan.SortKey{
+			Expr: expr,
+			Desc: desc,
+			// PostgreSQL treats NULL as larger than every other value, so the
+			// default follows the direction: last for ASC, first for DESC.
+			NullsFirst: nullsFirst(item.Nulls, desc),
+		})
+	}
+	return keys, nil
+}
+
+func nullsFirst(order ast.NullsOrder, desc bool) bool {
+	switch order {
+	case ast.NullsFirst:
+		return true
+	case ast.NullsLast:
+		return false
+	default:
+		return desc
+	}
+}
+
+func (b *Binder) bindSortTerm(e ast.Expr, sc *scope, proj *plan.Project) (plan.Expr, error) {
+	// An unqualified name matching an output column refers to it.
+	if ref, ok := e.(*ast.ColumnRef); ok && ref.Table.IsEmpty() && ref.Schema.IsEmpty() {
+		for i, col := range proj.Cols {
+			if col.Name == ref.Column.Name {
+				return proj.Exprs[i], nil
+			}
+		}
+	}
+
+	// A bare integer is a position in the select list.
+	if lit, ok := e.(*ast.Literal); ok && lit.Kind == ast.LitNumber {
+		n, err := strconv.Atoi(lit.Val)
+		if err == nil {
+			if n < 1 || n > len(proj.Exprs) {
+				return nil, pgerr.Newf(pgerr.SyntaxError,
+					"ORDER BY position %d is not in the select list", n).At(lit.Pos())
+			}
+			return proj.Exprs[n-1], nil
+		}
+	}
+
+	return bindExpr(e, sc)
 }
 
 // bindSelectItems builds the projection, expanding any star into the columns

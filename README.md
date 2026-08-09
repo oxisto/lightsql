@@ -4,9 +4,10 @@ A small, embeddable SQL engine for Go that speaks the PostgreSQL dialect and plu
 straight into `database/sql`. Run it entirely in memory for tests, or point it at a
 directory for a small file-backed deployment.
 
-> **Status: early, but CRUD works.** `CREATE TABLE`, `INSERT`, `SELECT ... WHERE`,
-> `UPDATE`, `DELETE` and `RETURNING` all run end to end through `database/sql`. Joins,
-> aggregates, `ORDER BY`, transactions and file-backed storage are not implemented yet.
+> **Status: early, but CRUD works.** `CREATE TABLE`, `INSERT`, `SELECT ... WHERE
+> ... ORDER BY ... LIMIT`, `UPDATE`, `DELETE` and `RETURNING` all run end to end
+> through `database/sql`. Joins, aggregates, transactions and file-backed storage are
+> not implemented yet.
 > The compatibility matrix below is generated from the code, and every row is backed by
 > a probe that is actually run — see [Compatibility](#compatibility).
 
@@ -145,7 +146,7 @@ the two.
 | ⬜ | Inner and outer joins | ✅ | ⬜ | INNER, LEFT, RIGHT, FULL, CROSS, with ON or USING |
 | ⬜ | GROUP BY / HAVING | ✅ | ⬜ |  |
 | ⬜ | Aggregate functions | ✅ | ⬜ | parsed generically; the function library is pending |
-| ⬜ | ORDER BY | ✅ | ⬜ | ASC/DESC and NULLS FIRST/LAST |
+| ✅ | ORDER BY | ✅ | ✅ | ASC/DESC, NULLS FIRST/LAST, output aliases, select-list positions, and expressions over unselected columns |
 | ⬜ | DISTINCT / DISTINCT ON | ✅ | ⬜ |  |
 | ⬜ | Subqueries | ✅ | ⬜ | scalar, IN, EXISTS, and derived tables |
 | ⬜ | UNION / INTERSECT / EXCEPT | ⬜ | ⬜ |  |
