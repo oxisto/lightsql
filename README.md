@@ -7,8 +7,9 @@ directory for a small file-backed deployment.
 > **Status: the core engine works.** `CREATE TABLE`, `INSERT`, `SELECT ... WHERE
 > ... ORDER BY ... LIMIT`, `UPDATE`, `DELETE` and `RETURNING` all run end to end
 > through `database/sql`, with `NOT NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT` and
-> `CHECK` enforced. Joins, aggregates, transactions and file-backed storage are not
-> implemented yet.
+> `CHECK` enforced, and real transactions on MVCC — `Begin`, `Commit` and
+> `Rollback` work, and `sql.TxOptions` isolation levels are honoured rather than
+> ignored. Joins, aggregates and file-backed storage are not implemented yet.
 > The compatibility matrix below is generated from the code, and every row is backed by
 > a probe that is actually run — see [Compatibility](#compatibility).
 
@@ -178,10 +179,13 @@ the two.
 | 🟡 | NUMERIC / DECIMAL | ✅ | 🟡 | stored as double precision; exact decimal arithmetic is pending |
 | 🟡 | UUID | ✅ | 🟡 | accepted and stored as text; no validation |
 | | **Transactions and sessions** | | | |
-| ⬜ | BEGIN / COMMIT / ROLLBACK | ⬜ | ⬜ | via database/sql Tx |
-| ⬜ | Isolation levels | ⬜ | ⬜ | READ COMMITTED, REPEATABLE READ, SERIALIZABLE honoured from sql.TxOptions |
+| ✅ | BEGIN / COMMIT / ROLLBACK | ✅ | ✅ | via database/sql Tx; rollback discards inserts, updates and deletes alike |
+| 🟡 | Isolation levels | ✅ | 🟡 | READ COMMITTED and REPEATABLE READ honoured from sql.TxOptions; SERIALIZABLE is accepted but behaves as REPEATABLE READ, since write-skew detection is not implemented |
+| ✅ | Read-only transactions | ✅ | ✅ | sql.TxOptions.ReadOnly refuses data-modifying statements with SQLSTATE 25006 |
+| ✅ | Failed transaction state | ✅ | ✅ | a statement error aborts the transaction; later commands are refused with 25P02 until rollback |
+| ✅ | MVCC snapshot isolation | ✅ | ✅ | readers never block writers; a write conflict is reported as SQLSTATE 40001 |
 | ⬜ | Savepoints | ⬜ | ⬜ |  |
-| ⬜ | MVCC snapshot isolation | ⬜ | ⬜ | readers never block writers |
+| ⬜ | VACUUM | ⬜ | ⬜ | the storage layer can reclaim dead row versions, but no statement exposes it and nothing triggers it automatically yet |
 | | **Driver and diagnostics** | | | |
 | ✅ | Named in-memory instances | ✅ | ✅ | one data source name per test; Drop releases an instance |
 | ✅ | Multi-statement Exec | ✅ | ✅ | a fixture can be one semicolon-separated batch |

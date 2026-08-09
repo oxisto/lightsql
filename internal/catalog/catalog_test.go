@@ -1,151 +1,191 @@
 package catalog
 
 import (
-	"errors"
 	"testing"
 
+	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
 )
 
-// newTestTable returns a two-column table holding the given integer rows.
-func newTestTable(t *testing.T, values ...int64) *Table {
+// fixture returns a two-column table holding the given integer rows, already
+// committed, plus the manager the caller needs to start further transactions.
+func fixture(t *testing.T, values ...int64) (*Table, *storage.TxManager) {
 	t.Helper()
 
 	intType, err := ResolveType("bigint", nil)
 	if err != nil {
 		t.Fatalf("ResolveType: %v", err)
 	}
+	mgr := storage.NewTxManager()
 	tbl := &Table{
 		Name:    "t",
 		Columns: []Column{{Name: "a", Type: intType}, {Name: "b", Type: intType}},
 	}
-	if _, err := New().CreateTable(tbl, false); err != nil {
+	if _, err := New(mgr).CreateTable(tbl, false); err != nil {
 		t.Fatalf("CreateTable: %v", err)
 	}
+
+	tx := mgr.BeginTx(storage.ReadCommitted, false)
 	for _, v := range values {
-		if err := tbl.Insert([]types.Value{types.Int(v), types.Int(v * 10)}); err != nil {
+		if err := tbl.Insert(tx, []types.Value{types.Int(v), types.Int(v * 10)}); err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
 	}
-	return tbl
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	return tbl, mgr
 }
 
-// TestMutateDoesNotDisturbSnapshots is the test the doc comment on Mutate points
-// at. Mutate swaps in a new outer slice, but it hands the callback the stored
-// row itself, so the no-write-through rule lives in the callback. A caller that
-// edited the row in place would corrupt a reader that already holds a snapshot,
-// and nothing but this test would notice.
-func TestMutateDoesNotDisturbSnapshots(t *testing.T) {
-	tbl := newTestTable(t, 1, 2, 3)
-
-	// A reader takes its snapshot before the write starts, as a running scan
-	// would.
-	snapshot := tbl.Rows()
-	if len(snapshot) != 3 {
-		t.Fatalf("snapshot has %d rows, want 3", len(snapshot))
+func colA(rows [][]types.Value) []int64 {
+	out := make([]int64, len(rows))
+	for i, r := range rows {
+		out[i] = r[0].AsInt()
 	}
-
-	// A well-behaved caller returns a fresh slice rather than editing in place.
-	err := tbl.Mutate(func(row []types.Value) ([]types.Value, error) {
-		next := make([]types.Value, len(row))
-		copy(next, row)
-		next[1] = types.Int(999)
-		return next, nil
-	})
-	if err != nil {
-		t.Fatalf("Mutate: %v", err)
-	}
-
-	// The snapshot must still show the values it was taken with.
-	for i, row := range snapshot {
-		if got, want := row[1].AsInt(), int64((i+1)*10); got != want {
-			t.Errorf("snapshot row %d column b = %d, want %d; the update wrote through",
-				i, got, want)
-		}
-	}
-	// And the table must show the new ones.
-	for i, row := range tbl.Rows() {
-		if got := row[1].AsInt(); got != 999 {
-			t.Errorf("table row %d column b = %d, want 999", i, got)
-		}
-	}
+	return out
 }
 
-// TestMutateIsAtomic pins that a callback failing partway leaves the table
-// exactly as it was, rather than applying the rows it had already reached.
-func TestMutateIsAtomic(t *testing.T) {
-	tbl := newTestTable(t, 1, 2, 3)
-
-	wantErr := errSentinel("boom")
-	err := tbl.Mutate(func(row []types.Value) ([]types.Value, error) {
-		if row[0].AsInt() == 2 {
-			return nil, wantErr
+func equal(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
-		next := make([]types.Value, len(row))
-		copy(next, row)
-		next[1] = types.Int(999)
-		return next, nil
-	})
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("Mutate returned %v, want the callback's error", err)
+	}
+	return true
+}
+
+// TestReaderKeepsItsSnapshot is what the previous hand-rolled stand-in could
+// only approximate. A reader that took its snapshot before an update keeps
+// seeing the values it started with, even after the writer commits.
+func TestReaderKeepsItsSnapshot(t *testing.T) {
+	tbl, mgr := fixture(t, 1, 2, 3)
+
+	// The reader runs at REPEATABLE READ, so its snapshot is taken once and
+	// kept for the whole transaction.
+	reader := mgr.BeginTx(storage.RepeatableRead, false)
+	before := colA(tbl.Rows(reader))
+
+	writer := mgr.BeginTx(storage.ReadCommitted, false)
+	for _, v := range tbl.Scan(writer) {
+		if err := tbl.Update(writer, v, []types.Value{types.Int(99), v.Vals[1]}); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+	}
+	if err := writer.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
 	}
 
-	rows := tbl.Rows()
-	if len(rows) != 3 {
-		t.Fatalf("table has %d rows, want 3 after a failed mutation", len(rows))
+	if got := colA(tbl.Rows(reader)); !equal(got, before) {
+		t.Errorf("the reader's view changed under it: %v, want %v", got, before)
 	}
-	for i, row := range rows {
-		if got, want := row[1].AsInt(), int64((i+1)*10); got != want {
-			t.Errorf("row %d column b = %d, want %d; a failed mutation was partly applied",
-				i, got, want)
-		}
+	// A transaction started afterwards does see the new values.
+	after := mgr.BeginTx(storage.ReadCommitted, false)
+	if got := colA(tbl.Rows(after)); !equal(got, []int64{99, 99, 99}) {
+		t.Errorf("a new transaction saw %v, want [99 99 99]", got)
 	}
 }
 
-// TestMutateDeletesAndPreservesOrder checks that returning nil removes a row and
-// that the survivors keep their relative order.
-func TestMutateDeletesAndPreservesOrder(t *testing.T) {
-	tbl := newTestTable(t, 1, 2, 3, 4)
+// TestRollbackDiscardsEverything is the property ramsql gets wrong: its undo log
+// silently fails to roll back updates and deletes. Here rollback is one flag, so
+// there is no partial application to get wrong.
+func TestRollbackDiscardsEverything(t *testing.T) {
+	tbl, mgr := fixture(t, 1, 2, 3)
 
-	err := tbl.Mutate(func(row []types.Value) ([]types.Value, error) {
-		if row[0].AsInt()%2 == 0 {
-			return nil, nil // delete the even ones
-		}
-		return row, nil
-	})
-	if err != nil {
-		t.Fatalf("Mutate: %v", err)
+	tx := mgr.BeginTx(storage.ReadCommitted, false)
+	rows := tbl.Scan(tx)
+	if err := tbl.Update(tx, rows[0], []types.Value{types.Int(99), types.Int(0)}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if err := tbl.Delete(tx, rows[1]); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := tbl.Insert(tx, []types.Value{types.Int(4), types.Int(40)}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	// The transaction sees its own work.
+	if got := colA(tbl.Rows(tx)); !equal(got, []int64{3, 99, 4}) {
+		t.Errorf("the writer saw %v of its own changes, want [3 99 4]", got)
 	}
 
-	var got []int64
-	for _, row := range tbl.Rows() {
-		got = append(got, row[0].AsInt())
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
 	}
-	if len(got) != 2 || got[0] != 1 || got[1] != 3 {
-		t.Errorf("remaining rows = %v, want [1 3]", got)
+
+	after := mgr.BeginTx(storage.ReadCommitted, false)
+	if got := colA(tbl.Rows(after)); !equal(got, []int64{1, 2, 3}) {
+		t.Errorf("after rollback the table shows %v, want [1 2 3]; an update or "+
+			"delete was left applied", got)
 	}
 }
 
-// TestMutateEnforcesNotNull checks that a replacement row is validated, so a
-// constraint cannot be bypassed by going through an update.
-func TestMutateEnforcesNotNull(t *testing.T) {
-	tbl := newTestTable(t, 1)
+// TestUpdateRewritesTheRow records where an updated row ends up. A version is
+// never edited in place, so the new one is appended and the row moves to the
+// end. SQL guarantees no order without ORDER BY, and this states what actually
+// happens rather than implying otherwise.
+func TestUpdateRewritesTheRow(t *testing.T) {
+	tbl, mgr := fixture(t, 1, 2, 3)
+
+	tx := mgr.BeginTx(storage.ReadCommitted, false)
+	rows := tbl.Scan(tx)
+	if err := tbl.Update(tx, rows[1], []types.Value{types.Int(20), types.Int(200)}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	after := mgr.BeginTx(storage.ReadCommitted, false)
+	if got := colA(tbl.Rows(after)); !equal(got, []int64{1, 3, 20}) {
+		t.Errorf("rows = %v, want [1 3 20]", got)
+	}
+}
+
+func TestNotNullIsEnforcedOnUpdate(t *testing.T) {
+	tbl, mgr := fixture(t, 1)
 	tbl.Columns[1].NotNull = true
 
-	err := tbl.Mutate(func(row []types.Value) ([]types.Value, error) {
-		next := make([]types.Value, len(row))
-		copy(next, row)
-		next[1] = types.Null()
-		return next, nil
-	})
-	if err == nil {
-		t.Fatal("Mutate accepted a NULL in a NOT NULL column")
+	tx := mgr.BeginTx(storage.ReadCommitted, false)
+	v := tbl.Scan(tx)[0]
+	if err := tbl.Update(tx, v, []types.Value{types.Int(1), types.Null()}); err == nil {
+		t.Fatal("an update to NULL on a NOT NULL column was accepted")
 	}
-	if got := tbl.Rows()[0][1].AsInt(); got != 10 {
-		t.Errorf("row was modified despite the error: column b = %d, want 10", got)
+	// The row is untouched, because the check runs before anything is written.
+	if got := colA(tbl.Rows(tx)); !equal(got, []int64{1}) {
+		t.Errorf("rows = %v after a refused update, want [1]", got)
 	}
 }
 
-type errSentinel string
+// TestConcurrentTransactionsSeeConsistentViews is the race-detector case at the
+// catalog level: pooled connections make concurrent statements normal here.
+func TestConcurrentTransactionsSeeConsistentViews(t *testing.T) {
+	tbl, mgr := fixture(t, 1, 2, 3)
 
-func (e errSentinel) Error() string { return string(e) }
+	done := make(chan bool, 4)
+	for range 4 {
+		go func() {
+			tx := mgr.BeginTx(storage.RepeatableRead, false)
+			first := colA(tbl.Rows(tx))
+			// Reading twice through one snapshot must give the same answer,
+			// whatever else is happening.
+			second := colA(tbl.Rows(tx))
+			done <- equal(first, second)
+		}()
+	}
+	// Meanwhile a writer keeps changing the table.
+	go func() {
+		for i := range 10 {
+			tx := mgr.BeginTx(storage.ReadCommitted, false)
+			_ = tbl.Insert(tx, []types.Value{types.Int(int64(100 + i)), types.Int(0)})
+			_ = tx.Commit()
+		}
+	}()
+
+	for range 4 {
+		if !<-done {
+			t.Error("a transaction saw its own view change between two reads")
+		}
+	}
+}

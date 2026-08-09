@@ -22,6 +22,7 @@ import (
 	"github.com/oxisto/lightsql/internal/engine"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/plan"
+	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
 )
 
@@ -85,12 +86,17 @@ func (c *Connector) Driver() driver.Driver { return c.driver }
 // makes database/sql's connection pool transparent: a test does not have to
 // care which pooled connection ran which statement.
 type Conn struct {
-	eng    *engine.Engine
+	eng *engine.Engine
+	// tx is the explicit transaction this connection is inside, or nil when it
+	// is in autocommit. database/sql guarantees a connection is used by one
+	// goroutine at a time, so this needs no lock.
+	tx     *storage.Tx
 	closed bool
 }
 
 var (
 	_ driver.Conn               = (*Conn)(nil)
+	_ driver.ConnBeginTx        = (*Conn)(nil)
 	_ driver.ConnPrepareContext = (*Conn)(nil)
 	_ driver.ExecerContext      = (*Conn)(nil)
 	_ driver.QueryerContext     = (*Conn)(nil)
@@ -111,19 +117,92 @@ func (c *Conn) PrepareContext(_ context.Context, query string) (driver.Stmt, err
 	if err != nil {
 		return nil, err
 	}
-	return &Stmt{prepared: p}, nil
+	return &Stmt{prepared: p, conn: c}, nil
 }
 
 // Close implements driver.Conn. The engine outlives the connection, so this only
 // marks the connection unusable.
 func (c *Conn) Close() error {
+	// Closing with a transaction open rolls it back, rather than leaving its
+	// writes in limbo where a later snapshot might still be deciding about them.
+	if c.tx != nil {
+		_ = c.tx.Rollback()
+		c.tx = nil
+	}
 	c.closed = true
 	return nil
 }
 
 // Begin implements driver.Conn.
 func (c *Conn) Begin() (driver.Tx, error) {
-	return nil, pgerr.New(pgerr.FeatureNotSupported, "transactions are not supported yet")
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+// BeginTx implements driver.ConnBeginTx.
+//
+// The requested isolation level is honoured rather than accepted and ignored: a
+// caller that asks for REPEATABLE READ and silently gets READ COMMITTED has no
+// way to discover the difference except by hitting a bug in production.
+func (c *Conn) BeginTx(_ context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if c.closed {
+		return nil, driver.ErrBadConn
+	}
+	if c.tx != nil {
+		return nil, pgerr.New(pgerr.InvalidTransactionState,
+			"there is already a transaction in progress")
+	}
+	iso, err := isolationOf(opts.Isolation)
+	if err != nil {
+		return nil, err
+	}
+	c.tx = c.eng.BeginTx(iso, opts.ReadOnly)
+	return &Tx{conn: c}, nil
+}
+
+// isolationOf maps database/sql's levels onto the engine's.
+//
+// Levels weaker than READ COMMITTED are raised to it rather than rejected:
+// lightsql never shows uncommitted data, so READ UNCOMMITTED is satisfied by
+// giving something stronger, which the standard explicitly permits.
+func isolationOf(level driver.IsolationLevel) (storage.Isolation, error) {
+	switch sql.IsolationLevel(level) {
+	case sql.LevelDefault, sql.LevelReadUncommitted, sql.LevelReadCommitted:
+		return storage.ReadCommitted, nil
+	case sql.LevelRepeatableRead, sql.LevelSnapshot:
+		return storage.RepeatableRead, nil
+	case sql.LevelSerializable, sql.LevelLinearizable:
+		return storage.Serializable, nil
+	default:
+		return 0, pgerr.Newf(pgerr.FeatureNotSupported,
+			"isolation level %s is not supported", sql.IsolationLevel(level))
+	}
+}
+
+// Tx is an explicit transaction. It exists as its own type, rather than the
+// connection standing in for one, so that a transaction cannot outlive the
+// statement handling that owns it.
+type Tx struct{ conn *Conn }
+
+var _ driver.Tx = (*Tx)(nil)
+
+// Commit implements driver.Tx.
+func (t *Tx) Commit() error {
+	tx := t.conn.tx
+	if tx == nil {
+		return pgerr.New(pgerr.NoActiveTransaction, "there is no transaction in progress")
+	}
+	t.conn.tx = nil
+	return tx.Commit()
+}
+
+// Rollback implements driver.Tx.
+func (t *Tx) Rollback() error {
+	tx := t.conn.tx
+	if tx == nil {
+		return pgerr.New(pgerr.NoActiveTransaction, "there is no transaction in progress")
+	}
+	t.conn.tx = nil
+	return tx.Rollback()
 }
 
 // Ping implements driver.Pinger.
@@ -138,12 +217,18 @@ func (c *Conn) Ping(context.Context) error {
 // the pool rather than handed out again.
 func (c *Conn) IsValid() bool { return !c.closed }
 
-// ResetSession implements driver.SessionResetter. Once transactions exist this
-// must roll back anything left open, which is the step that keeps a leaked
-// transaction from corrupting the next user of a pooled connection.
+// ResetSession implements driver.SessionResetter.
+//
+// A transaction left open is rolled back before the connection is handed to the
+// next user. Without this a leaked transaction would keep its snapshot and its
+// locks alive, and the next caller would silently inherit them.
 func (c *Conn) ResetSession(context.Context) error {
 	if c.closed {
 		return driver.ErrBadConn
+	}
+	if c.tx != nil {
+		_ = c.tx.Rollback()
+		c.tx = nil
 	}
 	return nil
 }
@@ -174,7 +259,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	if err != nil {
 		return nil, err
 	}
-	affected, err := c.eng.ExecBatch(ctx, query, vals)
+	affected, err := c.eng.ExecBatch(ctx, c.tx, query, vals)
 	if err != nil {
 		return nil, err
 	}
@@ -187,13 +272,16 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if err != nil {
 		return nil, err
 	}
-	return queryPrepared(ctx, p, args)
+	return queryPrepared(ctx, p, c.tx, args)
 }
 
 // Stmt is a prepared statement. It is bound once and may be executed repeatedly,
 // which is only sound because nothing rewrites the plan during execution.
 type Stmt struct {
 	prepared *engine.Prepared
+	// conn is retained so that executing the statement joins whatever
+	// transaction the connection is currently in.
+	conn *Conn
 }
 
 var (
@@ -225,7 +313,7 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 	if err != nil {
 		return nil, err
 	}
-	affected, err := s.prepared.Exec(ctx, vals)
+	affected, err := s.prepared.Exec(ctx, s.conn.tx, vals)
 	if err != nil {
 		return nil, err
 	}
@@ -234,15 +322,15 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 
 // QueryContext implements driver.StmtQueryContext.
 func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	return queryPrepared(ctx, s.prepared, args)
+	return queryPrepared(ctx, s.prepared, s.conn.tx, args)
 }
 
-func queryPrepared(ctx context.Context, p *engine.Prepared, args []driver.NamedValue) (driver.Rows, error) {
+func queryPrepared(ctx context.Context, p *engine.Prepared, tx *storage.Tx, args []driver.NamedValue) (driver.Rows, error) {
 	vals, err := convertArgs(args)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := p.Query(ctx, vals)
+	rows, err := p.Query(ctx, tx, vals)
 	if err != nil {
 		return nil, err
 	}

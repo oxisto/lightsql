@@ -112,7 +112,7 @@ func runProbe(f Feature) error {
 	ctx := context.Background()
 
 	for _, s := range f.Setup {
-		if _, err := eng.ExecBatch(ctx, s, nil); err != nil {
+		if _, err := eng.ExecBatch(ctx, nil, s, nil); err != nil {
 			return fmt.Errorf("setup %q: %w", s, err)
 		}
 	}
@@ -120,7 +120,7 @@ func runProbe(f Feature) error {
 	// A batch cannot be prepared, by design, so it runs through the same path a
 	// caller would use for one.
 	if stmts, err := parser.Parse(f.SQL); err == nil && len(stmts) > 1 {
-		_, err := eng.ExecBatch(ctx, f.SQL, nil)
+		_, err := eng.ExecBatch(ctx, nil, f.SQL, nil)
 		return err
 	}
 
@@ -136,10 +136,10 @@ func runProbe(f Feature) error {
 	}
 
 	if !p.ReturnsRows() {
-		_, err := p.Exec(ctx, args)
+		_, err := p.Exec(ctx, nil, args)
 		return err
 	}
-	rows, err := p.Query(ctx, args)
+	rows, err := p.Query(ctx, nil, args)
 	if err != nil {
 		return err
 	}

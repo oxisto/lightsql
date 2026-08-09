@@ -15,19 +15,61 @@ import (
 	"github.com/oxisto/lightsql/internal/parser"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/plan"
+	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
 )
 
 // Engine is one database instance.
 type Engine struct {
+	mgr *storage.TxManager
 	cat *catalog.Catalog
 	bnd *binder.Binder
 }
 
 // New returns an empty in-memory engine.
 func New() *Engine {
-	cat := catalog.New()
-	return &Engine{cat: cat, bnd: binder.New(cat)}
+	mgr := storage.NewTxManager()
+	cat := catalog.New(mgr)
+	return &Engine{mgr: mgr, cat: cat, bnd: binder.New(cat)}
+}
+
+// BeginTx starts an explicit transaction.
+func (e *Engine) BeginTx(iso storage.Isolation, readOnly bool) *storage.Tx {
+	return e.mgr.BeginTx(iso, readOnly)
+}
+
+// implicitTx wraps a single statement in its own transaction.
+//
+// Autocommit and an explicit transaction are then the same code path rather
+// than two, which is what stops the two from drifting apart in their handling
+// of visibility or constraint checking.
+func (e *Engine) implicitTx() *storage.Tx {
+	return e.mgr.BeginTx(storage.ReadCommitted, false)
+}
+
+// run executes fn inside tx when one is given, or inside a fresh implicit
+// transaction otherwise, committing it on success and rolling it back on error.
+func (e *Engine) withTx(tx *storage.Tx, fn func(*storage.Tx) error) error {
+	if tx != nil {
+		if err := tx.NextStatement(); err != nil {
+			return err
+		}
+		if err := fn(tx); err != nil {
+			// A failed statement poisons the transaction: PostgreSQL refuses
+			// every later command until the caller rolls back, rather than
+			// letting them build on a broken state.
+			tx.Fail()
+			return err
+		}
+		return nil
+	}
+
+	own := e.implicitTx()
+	if err := fn(own); err != nil {
+		_ = own.Rollback()
+		return err
+	}
+	return own.Commit()
 }
 
 // Prepared is a statement that has been parsed and bound, ready to execute with
@@ -87,22 +129,32 @@ func (p *Prepared) IsQuery() bool {
 
 // Exec runs a statement and reports how many rows it affected. Any RETURNING
 // rows are discarded, matching what a caller using Exec has asked for.
-func (p *Prepared) Exec(ctx context.Context, args []types.Value) (affected int64, err error) {
-	res, _, err := p.run(ctx, args)
+func (p *Prepared) Exec(ctx context.Context, tx *storage.Tx, args []types.Value) (affected int64, err error) {
+	res, _, err := p.run(ctx, tx, args)
 	return res.Affected, err
 }
 
 // Query runs a statement and returns its rows.
-func (p *Prepared) Query(ctx context.Context, args []types.Value) (*Rows, error) {
+func (p *Prepared) Query(ctx context.Context, tx *storage.Tx, args []types.Value) (*Rows, error) {
 	if q, ok := p.stmt.(*plan.Query); ok {
-		op, err := exec.Build(q.Root, args)
+		// A query is read-only, so its implicit transaction can be committed as
+		// soon as the operator tree has taken its snapshot.
+		var rows *Rows
+		err := p.eng.withTx(tx, func(t *storage.Tx) error {
+			op, err := exec.Build(q.Root, t, args)
+			if err != nil {
+				return err
+			}
+			rows = &Rows{cols: q.Root.Result(), op: op}
+			return nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		return &Rows{cols: q.Root.Result(), op: op}, nil
+		return rows, nil
 	}
 
-	res, ret, err := p.run(ctx, args)
+	res, ret, err := p.run(ctx, tx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -115,29 +167,50 @@ func (p *Prepared) Query(ctx context.Context, args []types.Value) (*Rows, error)
 // run executes the statement, returning its result and the shape of any
 // RETURNING clause. Both Exec and Query go through here so that the two cannot
 // disagree about what a statement does.
-func (p *Prepared) run(ctx context.Context, args []types.Value) (exec.Result, *plan.Returning, error) {
-	switch s := p.stmt.(type) {
-	case *plan.CreateTable:
-		return exec.Result{}, nil, exec.ExecCreateTable(p.eng.cat, s)
-	case *plan.Insert:
-		res, err := exec.ExecInsert(ctx, s, args)
-		return res, s.Returning, err
-	case *plan.Update:
-		res, err := exec.ExecUpdate(ctx, s, args)
-		return res, s.Returning, err
-	case *plan.Delete:
-		res, err := exec.ExecDelete(ctx, s, args)
-		return res, s.Returning, err
-	default:
-		return exec.Result{}, nil, pgerr.New(pgerr.SyntaxError,
-			"statement returns rows; use Query")
-	}
+func (p *Prepared) run(ctx context.Context, tx *storage.Tx, args []types.Value) (exec.Result, *plan.Returning, error) {
+	var (
+		res exec.Result
+		ret *plan.Returning
+	)
+	err := p.eng.withTx(tx, func(t *storage.Tx) error {
+		switch s := p.stmt.(type) {
+		case *plan.CreateTable:
+			return exec.ExecCreateTable(p.eng.cat, s)
+		case *plan.Insert:
+			if err := t.CheckWritable(); err != nil {
+				return err
+			}
+			var err error
+			res, ret = exec.Result{}, s.Returning
+			res, err = exec.ExecInsert(ctx, t, s, args)
+			return err
+		case *plan.Update:
+			if err := t.CheckWritable(); err != nil {
+				return err
+			}
+			var err error
+			ret = s.Returning
+			res, err = exec.ExecUpdate(ctx, t, s, args)
+			return err
+		case *plan.Delete:
+			if err := t.CheckWritable(); err != nil {
+				return err
+			}
+			var err error
+			ret = s.Returning
+			res, err = exec.ExecDelete(ctx, t, s, args)
+			return err
+		default:
+			return pgerr.New(pgerr.SyntaxError, "statement returns rows; use Query")
+		}
+	})
+	return res, ret, err
 }
 
 // ExecBatch runs one or more statements separated by semicolons, returning the
 // rows affected by the last one. It exists because test suites routinely set up
 // a fixture with a single multi-statement Exec.
-func (e *Engine) ExecBatch(ctx context.Context, sql string, args []types.Value) (int64, error) {
+func (e *Engine) ExecBatch(ctx context.Context, tx *storage.Tx, sql string, args []types.Value) (int64, error) {
 	trees, err := parser.Parse(sql)
 	if err != nil {
 		return 0, err
@@ -156,7 +229,7 @@ func (e *Engine) ExecBatch(ctx context.Context, sql string, args []types.Value) 
 		if p.IsQuery() {
 			// A query inside a batch is legal but discards its rows, matching
 			// what a server does for a multi-statement command.
-			rows, err := p.Query(ctx, args)
+			rows, err := p.Query(ctx, tx, args)
 			if err != nil {
 				return 0, err
 			}
@@ -168,7 +241,7 @@ func (e *Engine) ExecBatch(ctx context.Context, sql string, args []types.Value) 
 			affected = 0
 			continue
 		}
-		if affected, err = p.Exec(ctx, args); err != nil {
+		if affected, err = p.Exec(ctx, tx, args); err != nil {
 			return 0, err
 		}
 	}

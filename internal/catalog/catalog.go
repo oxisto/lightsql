@@ -17,6 +17,7 @@ import (
 
 	"github.com/oxisto/lightsql/internal/ast"
 	"github.com/oxisto/lightsql/internal/pgerr"
+	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
 )
 
@@ -109,14 +110,21 @@ type Table struct {
 	// binder is an ordinal; this map is consulted during binding only.
 	byName map[string]int
 
-	// mu guards rows. Storage is a slot slice rather than a linked list: rows
-	// are read far more often than they are deleted, and a slice keeps them
-	// contiguous instead of costing four words of pointers each.
-	mu   sync.RWMutex
-	rows [][]types.Value
+	// heap holds every version of every row. Storage is versioned rather than
+	// overwritten so that a reader keeps seeing what was current when its
+	// snapshot was taken, and so that rollback is one flag rather than an undo
+	// log; see internal/storage.
+	heap *storage.Heap
+
+	// mu guards the sequence counters only. Row access is guarded by the heap.
+	mu sync.Mutex
 	// nextSerial holds the next value for each serial column, keyed by ordinal.
 	// A sequence is per column rather than global so that truncating one table
 	// cannot disturb another.
+	//
+	// Sequences deliberately sit outside the transaction: a rolled back INSERT
+	// still consumes its value, exactly as in PostgreSQL, because handing the
+	// same id to a later transaction would be worse than a gap.
 	nextSerial map[int]int64
 }
 
@@ -131,81 +139,69 @@ func (t *Table) ColumnIndex(name string) int {
 	return -1
 }
 
-// Insert appends a row. The row must already be the right width and have been
-// coerced to each column's type by the binder.
-func (t *Table) Insert(row []types.Value) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
+// Insert adds a row on behalf of a transaction.
+//
+// The row must already be the right width and coerced to each column's type by
+// the binder.
+func (t *Table) Insert(tx *storage.Tx, row []types.Value) error {
 	if err := t.checkRow(row); err != nil {
 		return err
 	}
-	// The rows already stored are unique among themselves, so only the new row
-	// has to be checked against them.
-	if err := t.checkUniqueRow(row); err != nil {
-		return err
-	}
-	t.rows = append(t.rows, row)
+	t.heap.Insert(tx.ID, row)
 	return nil
 }
 
-// Rows returns a snapshot of the table's rows.
+// Scan returns the row versions visible to a transaction.
 //
-// The slice header is copied under the lock, so a scan iterates a stable view
-// while other statements append. This is a placeholder for real MVCC snapshots:
-// it gives a reader a consistent length, but not yet isolation from updates to
-// rows it has already seen.
-func (t *Table) Rows() [][]types.Value {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.rows[:len(t.rows):len(t.rows)]
+// Versions are returned rather than bare rows because a statement that goes on
+// to update or delete a row needs to name the version it read; a row's values
+// alone do not identify it.
+func (t *Table) Scan(tx *storage.Tx) []*storage.Version {
+	return t.heap.Scan(tx.Snapshot(), tx.ID)
 }
 
-// Mutate applies a function to every row under the table's write lock.
-//
-// The callback receives each row and returns its replacement, or nil to delete
-// it. Two contracts hold, and only one of them is enforced here:
-//
-//   - Mutate builds a new outer slice and swaps it in at the end, so a reader
-//     that already obtained a snapshot from Rows keeps iterating the old one.
-//     A statement that fails partway therefore leaves the table untouched.
-//   - The row passed to the callback is the stored row itself, not a copy.
-//     A callback that wants to change a value must return a **new** slice;
-//     writing through the argument would be visible to a reader holding a
-//     snapshot and would defeat the guarantee above.
-//
-// Copying every row defensively would cost an allocation for the rows a
-// statement does not even touch, so the second contract is left to the caller.
-// TestMutateDoesNotDisturbSnapshots checks that the callers honour it.
-//
-// Together this is a weak stand-in for the MVCC snapshots planned for M2: it
-// stops a concurrent scan from seeing a half-applied UPDATE, but it does not
-// give a reader a stable view of a row it has already returned.
-//
-// The callback must not call back into the table.
-func (t *Table) Mutate(fn func(row []types.Value) (replacement []types.Value, err error)) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	next := make([][]types.Value, 0, len(t.rows))
-	for _, row := range t.rows {
-		replacement, err := fn(row)
-		if err != nil {
-			return err
-		}
-		if replacement == nil {
-			continue // deleted
-		}
-		if err := t.checkRow(replacement); err != nil {
-			return err
-		}
-		next = append(next, replacement)
+// Rows returns the values visible to a transaction, for callers that only read.
+func (t *Table) Rows(tx *storage.Tx) [][]types.Value {
+	versions := t.Scan(tx)
+	out := make([][]types.Value, len(versions))
+	for i, v := range versions {
+		out[i] = v.Vals
 	}
-	if err := t.checkUnique(next); err != nil {
+	return out
+}
+
+// Update replaces a row version with new values.
+//
+// The old version is marked deleted by this transaction and a new one is
+// written, so a reader on an older snapshot still sees the old values.
+func (t *Table) Update(tx *storage.Tx, old *storage.Version, vals []types.Value) error {
+	if err := t.checkRow(vals); err != nil {
 		return err
 	}
-	t.rows = next
+	if err := t.heap.Delete(tx.ID, old); err != nil {
+		return err
+	}
+	t.heap.Insert(tx.ID, vals)
 	return nil
+}
+
+// Delete removes a row version.
+func (t *Table) Delete(tx *storage.Tx, v *storage.Version) error {
+	return t.heap.Delete(tx.ID, v)
+}
+
+// CheckConstraints validates the table's uniqueness constraints over the rows
+// the transaction can now see.
+//
+// It runs once at the end of a statement rather than per row, which is what
+// PostgreSQL does by deferring the check. That matters twice over: a row keeping
+// its own value must not conflict with itself, and `UPDATE t SET a = a + 1`
+// passes through states that collide but ends in one that does not.
+func (t *Table) CheckConstraints(tx *storage.Tx) error {
+	if len(t.Constraints) == 0 {
+		return nil
+	}
+	return t.checkUnique(t.Rows(tx))
 }
 
 // checkRow enforces the per-row constraints. The caller must hold the write
@@ -216,28 +212,6 @@ func (t *Table) checkRow(row []types.Value) error {
 			return pgerr.Newf(pgerr.NotNullViolation,
 				"null value in column %q of relation %q violates not-null constraint",
 				col.Name, t.Name)
-		}
-	}
-	return nil
-}
-
-// checkUniqueRow verifies a candidate row against the rows already stored.
-//
-// This is the insert path, where everything already present is known to be
-// unique among itself. It is a linear scan: there are no indexes yet, so the
-// cost of an insert is proportional to the table. That is acceptable at the
-// scale lightsql targets and is the first thing an index would fix.
-//
-// The caller must hold the write lock.
-func (t *Table) checkUniqueRow(row []types.Value) error {
-	for _, c := range t.Constraints {
-		if anyNull(row, c.Columns) {
-			continue // see checkUnique for why a NULL never conflicts
-		}
-		for _, existing := range t.rows {
-			if !anyNull(existing, c.Columns) && keyEqual(row, existing, c.Columns) {
-				return t.uniqueViolation(c, row)
-			}
 		}
 	}
 	return nil
@@ -341,13 +315,17 @@ func (t *Table) NextSerial(ordinal int) int64 {
 
 // Catalog is the set of tables in one database instance.
 type Catalog struct {
+	// mgr is handed to each table's heap so that visibility is judged
+	// consistently across the whole instance.
+	mgr *storage.TxManager
+
 	mu     sync.RWMutex
 	tables map[string]*Table
 }
 
-// New returns an empty catalog.
-func New() *Catalog {
-	return &Catalog{tables: make(map[string]*Table)}
+// New returns an empty catalog whose tables share one transaction manager.
+func New(mgr *storage.TxManager) *Catalog {
+	return &Catalog{mgr: mgr, tables: make(map[string]*Table)}
 }
 
 func key(schema, name string) string { return schema + "." + name }
@@ -362,6 +340,7 @@ func (c *Catalog) CreateTable(t *Table, ifNotExists bool) (created bool, err err
 	if err := t.index(); err != nil {
 		return false, err
 	}
+	t.heap = storage.NewHeap(c.mgr)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
