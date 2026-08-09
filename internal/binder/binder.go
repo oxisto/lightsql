@@ -120,6 +120,7 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 	// Constraints are collected while walking, then applied once every column
 	// ordinal is known: a table-level key may name a column declared later.
 	var keys []keySpec
+	var checks []catalog.Check
 
 	for _, cd := range s.Columns {
 		typ, err := catalog.ResolveType(cd.Type.Name, cd.Type.Mods)
@@ -149,6 +150,15 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 					name: c.Name.Name, kind: catalog.UniqueConstraint,
 					cols: []int{ordinal}, pos: c.Pos(),
 				})
+			case ast.ConstraintDefault:
+				// Bound now only to reject a bad expression at CREATE TABLE
+				// rather than at the first INSERT; the catalog keeps the syntax.
+				if _, err := b.bindDefault(c.Expr, typ.Kind); err != nil {
+					return nil, err
+				}
+				col.Default = c.Expr
+			case ast.ConstraintCheck:
+				checks = append(checks, catalog.Check{Name: c.Name.Name, Expr: c.Expr})
 			case ast.ConstraintNull:
 				// Explicit NULL is the default and carries no information.
 			default:
@@ -166,6 +176,9 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 			kind = catalog.PrimaryKeyConstraint
 		case ast.ConstraintUnique:
 			kind = catalog.UniqueConstraint
+		case ast.ConstraintCheck:
+			checks = append(checks, catalog.Check{Name: tc.Name.Name, Expr: tc.Expr})
+			continue
 		default:
 			return nil, pgerr.Newf(pgerr.FeatureNotSupported,
 				"table-level %s constraints are not supported yet", tc.Kind).At(tc.Pos())
@@ -190,7 +203,98 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 	if err := applyKeys(t, keys); err != nil {
 		return nil, err
 	}
+
+	// Checks are bound once here so that a predicate naming an unknown column
+	// fails at CREATE TABLE rather than at the first INSERT.
+	sc := &scope{}
+	sc.addTable(t, t.Name)
+
+	// Names already spoken for, so a derived name cannot collide with one the
+	// statement wrote explicitly.
+	taken := make(map[string]bool, len(t.Constraints)+len(checks))
+	for _, c := range t.Constraints {
+		taken[c.Name] = true
+	}
+	for _, c := range checks {
+		if c.Name != "" {
+			taken[c.Name] = true
+		}
+	}
+	for i, c := range checks {
+		if _, err := b.bindCheck(c, sc); err != nil {
+			return nil, err
+		}
+		if c.Name == "" {
+			checks[i].Name = uniqueCheckName(t.Name, taken)
+			taken[checks[i].Name] = true
+		}
+	}
+	t.Checks = checks
+
 	return &plan.CreateTable{Table: t, IfNotExists: s.IfNotExists}, nil
+}
+
+// uniqueCheckName derives a name for an unnamed CHECK, following PostgreSQL:
+// the first is <table>_check, then <table>_check1, <table>_check2 and so on.
+//
+// Numbering matters because a violation reports the constraint name, and a
+// table with two unnamed checks would otherwise attribute both to the same one.
+func uniqueCheckName(table string, taken map[string]bool) string {
+	base := table + "_check"
+	if !taken[base] {
+		return base
+	}
+	for i := 1; ; i++ {
+		name := base + strconv.Itoa(i)
+		if !taken[name] {
+			return name
+		}
+	}
+}
+
+// bindDefault binds a DEFAULT expression and coerces it to the column's type.
+//
+// A default is evaluated in an empty scope: it may not reference any column,
+// including the one it belongs to, because there is no row to read when the
+// value is being produced.
+func (b *Binder) bindDefault(e ast.Expr, want types.Kind) (plan.Expr, error) {
+	bound, err := bindExpr(e, &scope{})
+	if err != nil {
+		return nil, err
+	}
+	return coerce(bound, want, e.Pos())
+}
+
+// bindCheck binds a CHECK predicate against the table's own columns.
+func (b *Binder) bindCheck(c catalog.Check, sc *scope) (plan.Expr, error) {
+	pred, err := bindExpr(c.Expr, sc)
+	if err != nil {
+		return nil, err
+	}
+	if pred.Type() != types.KindBool && pred.Type() != types.KindNull {
+		return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+			"argument of CHECK must be boolean, not %s", pred.Type()).At(c.Expr.Pos())
+	}
+	return pred, nil
+}
+
+// bindChecks binds every CHECK on a table, for a statement that writes rows.
+func (b *Binder) bindChecks(t *catalog.Table) ([]plan.Check, error) {
+	if len(t.Checks) == 0 {
+		return nil, nil
+	}
+	sc := &scope{}
+	sc.addTable(t, t.Name)
+
+	out := make([]plan.Check, len(t.Checks))
+	for i, c := range t.Checks {
+		pred, err := b.bindCheck(c, sc)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = plan.Check{Name: c.Name, Pred: pred}
+	}
+	return out, nil
 }
 
 // keySpec is a uniqueness constraint collected while walking the statement,
@@ -318,11 +422,30 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 		ins.Rows = append(ins.Rows, bound)
 	}
 
-	// Serial columns the statement did not name are filled from their sequence.
+	// Columns the statement did not name are filled from their sequence or
+	// their DEFAULT. A serial column wins, since SERIAL is itself shorthand for
+	// a default drawn from a sequence.
 	for i, col := range t.Columns {
-		if col.Type.Serial && !slices.Contains(targets, i) {
-			ins.Serials = append(ins.Serials, i)
+		if slices.Contains(targets, i) {
+			continue
 		}
+		switch {
+		case col.Type.Serial:
+			ins.Serials = append(ins.Serials, i)
+		case col.Default != nil:
+			d, err := b.bindDefault(col.Default, col.Type.Kind)
+			if err != nil {
+				return nil, err
+			}
+			if ins.Defaults == nil {
+				ins.Defaults = make(map[int]plan.Expr)
+			}
+			ins.Defaults[i] = d
+		}
+	}
+
+	if ins.Checks, err = b.bindChecks(t); err != nil {
+		return nil, err
 	}
 
 	// RETURNING sees the row as stored, including generated serial values —
@@ -376,6 +499,9 @@ func (b *Binder) bindUpdate(s *ast.UpdateStmt) (plan.Stmt, error) {
 	}
 
 	if up.Where, err = b.bindPredicate(s.Where, sc, "WHERE"); err != nil {
+		return nil, err
+	}
+	if up.Checks, err = b.bindChecks(t); err != nil {
 		return nil, err
 	}
 	if up.Returning, err = b.bindReturning(s.Returning, sc); err != nil {

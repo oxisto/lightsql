@@ -193,8 +193,23 @@ type Insert struct {
 	// Serials lists ordinals of serial columns that the statement omitted and
 	// which must therefore be filled from the column's sequence.
 	Serials []int
+	// Defaults holds the bound DEFAULT expression for each omitted column that
+	// has one, keyed by ordinal.
+	Defaults map[int]Expr
+	// Checks are the table's CHECK constraints, bound for this statement.
+	Checks []Check
 	// Returning is nil unless the statement had a RETURNING clause.
 	Returning *Returning
+}
+
+// Check is a bound CHECK constraint.
+//
+// A check passes when its predicate is true OR unknown, and fails only on
+// false. That is the opposite of a WHERE clause, which keeps only true, and it
+// is why a NULL column does not trip a check written about it.
+type Check struct {
+	Name string
+	Pred Expr
 }
 
 // Assignment sets one column of a row being updated.
@@ -214,6 +229,7 @@ type Update struct {
 	Table       *catalog.Table
 	Where       Expr // nil means every row
 	Assignments []Assignment
+	Checks      []Check
 	Returning   *Returning
 }
 

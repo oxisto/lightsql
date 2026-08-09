@@ -398,6 +398,48 @@ type Result struct {
 	Rows []Row
 }
 
+// compiledCheck is a CHECK constraint ready to evaluate against a row.
+type compiledCheck struct {
+	name string
+	pred Eval
+}
+
+func compileChecks(checks []plan.Check) ([]compiledCheck, error) {
+	if len(checks) == 0 {
+		return nil, nil
+	}
+	out := make([]compiledCheck, len(checks))
+	for i, c := range checks {
+		pred, err := Compile(c.Pred)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = compiledCheck{name: c.Name, pred: pred}
+	}
+	return out, nil
+}
+
+// runChecks evaluates every CHECK against a row.
+//
+// A check is satisfied when its predicate is true *or* unknown, and violated
+// only by false. That is deliberately the opposite of a WHERE clause, which
+// keeps only true — and it is why `CHECK (n >= 0)` does not reject a row whose
+// n is NULL. Reusing the filter rule here would silently make every CHECK an
+// implicit NOT NULL.
+func runChecks(checks []compiledCheck, args []types.Value, row Row, table string) error {
+	for _, c := range checks {
+		v, err := c.pred(args, row)
+		if err != nil {
+			return err
+		}
+		if v.Truth() == types.False {
+			return pgerr.Newf(pgerr.CheckViolation,
+				"new row for relation %q violates check constraint %q", table, c.name)
+		}
+	}
+	return nil
+}
+
 // returningEval compiles a RETURNING list once, ahead of the row loop.
 type returningEval struct {
 	evals []Eval
@@ -441,6 +483,10 @@ func ExecUpdate(ctx context.Context, up *plan.Update, args []types.Value) (Resul
 	if err != nil {
 		return Result{}, err
 	}
+	checks, err := compileChecks(up.Checks)
+	if err != nil {
+		return Result{}, err
+	}
 	assign := make([]Eval, len(up.Assignments))
 	for i, a := range up.Assignments {
 		if assign[i], err = Compile(a.Value); err != nil {
@@ -473,6 +519,10 @@ func ExecUpdate(ctx context.Context, up *plan.Update, args []types.Value) (Resul
 				return nil, err
 			}
 			next[a.Ordinal] = v
+		}
+
+		if err := runChecks(checks, args, next, up.Table.Name); err != nil {
+			return nil, err
 		}
 
 		res.Affected++
@@ -559,6 +609,16 @@ func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (Resu
 	if err != nil {
 		return Result{}, err
 	}
+	checks, err := compileChecks(ins.Checks)
+	if err != nil {
+		return Result{}, err
+	}
+	defaults := make(map[int]Eval, len(ins.Defaults))
+	for ord, e := range ins.Defaults {
+		if defaults[ord], err = Compile(e); err != nil {
+			return Result{}, err
+		}
+	}
 
 	var res Result
 	for _, exprs := range ins.Rows {
@@ -586,7 +646,20 @@ func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (Resu
 		for _, ord := range ins.Serials {
 			row[ord] = types.Int(ins.Table.NextSerial(ord))
 		}
+		// A DEFAULT is evaluated once per row rather than hoisted out of the
+		// loop. Every default is a constant expression today, so this makes no
+		// difference yet — but a sequence-backed default such as nextval must
+		// yield a distinct value per row, and hoisting would quietly give a
+		// multi-row INSERT the same one throughout.
+		for ord, eval := range defaults {
+			if row[ord], err = eval(args, nil); err != nil {
+				return res, err
+			}
+		}
 
+		if err := runChecks(checks, args, row, ins.Table.Name); err != nil {
+			return res, err
+		}
 		if err := ins.Table.Insert(row); err != nil {
 			return res, err
 		}
