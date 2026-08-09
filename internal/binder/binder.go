@@ -17,6 +17,7 @@ import (
 	"errors"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/oxisto/lightsql/internal/ast"
 	"github.com/oxisto/lightsql/internal/catalog"
@@ -116,6 +117,9 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 		Schema: s.Table.Schema.Name,
 		Name:   s.Table.Name.Name,
 	}
+	// Constraints are collected while walking, then applied once every column
+	// ordinal is known: a table-level key may name a column declared later.
+	var keys []keySpec
 
 	for _, cd := range s.Columns {
 		typ, err := catalog.ResolveType(cd.Type.Name, cd.Type.Mods)
@@ -125,6 +129,9 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 		}
 		col := catalog.Column{Name: cd.Name.Name, Type: typ}
 
+		// A column-level constraint covers exactly that column, so its ordinal
+		// is the one about to be appended.
+		ordinal := len(t.Columns)
 		for _, c := range cd.Constraints {
 			switch c.Kind {
 			case ast.ConstraintNotNull:
@@ -133,8 +140,15 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 				// PRIMARY KEY implies NOT NULL, as in PostgreSQL.
 				col.PrimaryKey = true
 				col.NotNull = true
+				keys = append(keys, keySpec{
+					name: c.Name.Name, kind: catalog.PrimaryKeyConstraint,
+					cols: []int{ordinal}, pos: c.Pos(),
+				})
 			case ast.ConstraintUnique:
-				col.Unique = true
+				keys = append(keys, keySpec{
+					name: c.Name.Name, kind: catalog.UniqueConstraint,
+					cols: []int{ordinal}, pos: c.Pos(),
+				})
 			case ast.ConstraintNull:
 				// Explicit NULL is the default and carries no information.
 			default:
@@ -146,22 +160,92 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 	}
 
 	for _, tc := range s.Constraints {
-		if tc.Kind != ast.ConstraintPrimaryKey {
+		var kind catalog.ConstraintKind
+		switch tc.Kind {
+		case ast.ConstraintPrimaryKey:
+			kind = catalog.PrimaryKeyConstraint
+		case ast.ConstraintUnique:
+			kind = catalog.UniqueConstraint
+		default:
 			return nil, pgerr.Newf(pgerr.FeatureNotSupported,
 				"table-level %s constraints are not supported yet", tc.Kind).At(tc.Pos())
 		}
+
+		cols := make([]int, 0, len(tc.Columns))
 		for _, name := range tc.Columns {
 			i := indexOfColumn(t.Columns, name.Name)
 			if i < 0 {
 				return nil, pgerr.Newf(pgerr.UndefinedColumn,
 					"column %q named in key does not exist", name.Name).At(name.Pos())
 			}
-			t.Columns[i].PrimaryKey = true
-			t.Columns[i].NotNull = true
+			if slices.Contains(cols, i) {
+				return nil, pgerr.Newf(pgerr.DuplicateColumn,
+					"column %q appears twice in key", name.Name).At(name.Pos())
+			}
+			cols = append(cols, i)
 		}
+		keys = append(keys, keySpec{name: tc.Name.Name, kind: kind, cols: cols, pos: tc.Pos()})
 	}
 
+	if err := applyKeys(t, keys); err != nil {
+		return nil, err
+	}
 	return &plan.CreateTable{Table: t, IfNotExists: s.IfNotExists}, nil
+}
+
+// keySpec is a uniqueness constraint collected while walking the statement,
+// before the column ordinals it names are all known.
+type keySpec struct {
+	name string
+	kind catalog.ConstraintKind
+	cols []int
+	pos  token.Pos
+}
+
+// applyKeys turns the collected constraints into catalog entries, rejecting a
+// second primary key and naming any that were written without one.
+func applyKeys(t *catalog.Table, keys []keySpec) error {
+	seenPK := false
+	for _, k := range keys {
+		if k.kind == catalog.PrimaryKeyConstraint {
+			if seenPK {
+				return pgerr.Newf(pgerr.SyntaxError,
+					"multiple primary keys for table %q are not allowed", t.Name).At(k.pos)
+			}
+			seenPK = true
+			// A primary key's columns are NOT NULL whether or not that was
+			// written, which is what makes the NULL rule below moot for them.
+			for _, ord := range k.cols {
+				t.Columns[ord].PrimaryKey = true
+				t.Columns[ord].NotNull = true
+			}
+		}
+
+		name := k.name
+		if name == "" {
+			name = derivedKeyName(t, k)
+		}
+		t.Constraints = append(t.Constraints, catalog.Constraint{
+			Name: name, Kind: k.kind, Columns: k.cols,
+		})
+	}
+	return nil
+}
+
+// derivedKeyName names an unnamed constraint the way PostgreSQL does, so that
+// the name in a violation message is the one a user would recognise:
+// users_pkey for a primary key, users_email_key for a unique constraint.
+func derivedKeyName(t *catalog.Table, k keySpec) string {
+	if k.kind == catalog.PrimaryKeyConstraint {
+		return t.Name + "_pkey"
+	}
+	parts := make([]string, 0, len(k.cols)+2)
+	parts = append(parts, t.Name)
+	for _, ord := range k.cols {
+		parts = append(parts, t.Columns[ord].Name)
+	}
+	parts = append(parts, "key")
+	return strings.Join(parts, "_")
 }
 
 func indexOfColumn(cols []catalog.Column, name string) int {
