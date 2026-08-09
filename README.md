@@ -166,7 +166,8 @@ the two.
 | ⬜ | CAST | ✅ | ⬜ | both CAST(x AS t) and x::t |
 | ⬜ | Scalar functions | ✅ | ⬜ | parsed generically; the function library is pending |
 | ❌ | Arrays | ❌ | ❌ | out of scope for v1 |
-| ❌ | JSON / JSONB | ❌ | ❌ | out of scope for v1 |
+| ⬜ | JSONB | ⬜ | ⬜ | planned: the jsonb type, the -> ->> and @> operators, and round-tripping through database/sql |
+| ⬜ | JSON | ⬜ | ⬜ | planned alongside JSONB; stored as given rather than normalised |
 | | **Types** | | | |
 | ✅ | Integer types | ✅ | ✅ | SMALLINT, INT, BIGINT stored as int64 |
 | ✅ | Floating point | ✅ | ✅ | REAL and DOUBLE PRECISION stored as float64 |
