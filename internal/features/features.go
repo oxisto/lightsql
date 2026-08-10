@@ -257,7 +257,13 @@ var Groups = []Group{
 				Setup: probeTable,
 				SQL:   "SELECT coalesce(a, b, 0) FROM t"},
 			{Name: "Arrays", Parse: No, Exec: No, Note: "out of scope for v1"},
-			{Name: "JSON / JSONB", Parse: No, Exec: No, Note: "out of scope for v1"},
+			// JSONB is in scope: it is one of the types the target applications
+			// actually store, so a test suite that cannot round-trip a JSONB
+			// column cannot use lightsql at all.
+			{Name: "JSONB", Parse: Planned, Exec: Planned,
+				Note: "planned: the jsonb type, the -> ->> and @> operators, and round-tripping through database/sql"},
+			{Name: "JSON", Parse: Planned, Exec: Planned,
+				Note: "planned alongside JSONB; stored as given rather than normalised"},
 		},
 	},
 	{
