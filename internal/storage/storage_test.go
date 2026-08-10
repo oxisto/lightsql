@@ -244,8 +244,7 @@ func TestVacuum(t *testing.T) {
 	h.Insert(rolled, row(3))
 	m.Abort(rolled)
 
-	horizon := TxID(m.next.Load())
-	if removed := h.Vacuum(horizon); removed != 2 {
+	if removed := h.Vacuum(m.Horizon()); removed != 2 {
 		t.Errorf("Vacuum removed %d versions, want 2", removed)
 	}
 	reader := m.Begin()
@@ -279,6 +278,100 @@ func TestVacuumKeepsVersionsAnOldSnapshotNeeds(t *testing.T) {
 	h.Vacuum(reader)
 	if got := h.Scan(snap, reader); !equal(vals(got), []int64{1}) {
 		t.Errorf("the old snapshot lost its row: saw %v, want [1]", vals(got))
+	}
+}
+
+// TestSnapshotAnswersDoNotChange is the regression test for allocating a
+// transaction id outside the manager's lock.
+//
+// A snapshot must give the same answer about a transaction forever. If the id
+// counter advances before the transaction is registered as active, a snapshot
+// can be taken whose XMax is already past it while it is missing from the
+// exclusion set — so it reads as finished-but-not-excluded, and becomes visible
+// the moment it commits. The race detector does not catch this: every
+// individual access is properly synchronised, and only the combination is wrong.
+//
+// The check is therefore behavioural: record what a snapshot says while writers
+// are running, then ask it again once everything has committed.
+func TestSnapshotAnswersDoNotChange(t *testing.T) {
+	const rounds = 200
+
+	for range rounds {
+		m := NewTxManager()
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+
+		// Writers begin transactions concurrently with the snapshot below.
+		ids := make([]TxID, 4)
+		for i := range ids {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				ids[i] = m.Begin()
+			}(i)
+		}
+
+		var snap *Snapshot
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			snap = m.Take()
+		}()
+
+		close(start)
+		wg.Wait()
+
+		// What the snapshot says now, while nothing has committed.
+		before := make([]bool, len(ids))
+		for i, id := range ids {
+			before[i] = snap.committed(id)
+		}
+		// None of them can be visible: they were either not yet issued when the
+		// snapshot was taken, or in progress.
+		for i, seen := range before {
+			if seen {
+				t.Fatalf("snapshot saw transaction %d before it committed", ids[i])
+			}
+		}
+
+		for _, id := range ids {
+			m.Commit(id)
+		}
+
+		// The same snapshot must still say the same thing.
+		for i, id := range ids {
+			if snap.committed(id) != before[i] {
+				t.Fatalf("snapshot changed its answer about transaction %d after it "+
+					"committed: the id was allocated outside the manager's lock", id)
+			}
+		}
+	}
+}
+
+// TestFinishIgnoresUnissuedIDs pins that a transaction id nobody handed out
+// cannot be conjured into existence by committing it. Recording a status for an
+// unknown id would contradict Status reporting unknown ids as aborted, and could
+// make rows referring to that id visible.
+func TestFinishIgnoresUnissuedIDs(t *testing.T) {
+	m := NewTxManager()
+
+	m.Commit(TxID(42))
+	if got := m.Status(TxID(42)); got != Aborted {
+		t.Errorf("after committing an unissued id, Status = %s, want aborted", got)
+	}
+	m.Abort(TxID(43))
+	if got := m.Status(TxID(43)); got != Aborted {
+		t.Errorf("after aborting an unissued id, Status = %s, want aborted", got)
+	}
+
+	// A row created by an unissued transaction stays invisible.
+	reader := m.Begin()
+	v := &Version{XMin: TxID(42)}
+	if v.Visible(m.Take(), reader) {
+		t.Error("a row created by an unissued transaction is visible")
 	}
 }
 

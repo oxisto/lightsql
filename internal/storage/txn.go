@@ -17,7 +17,6 @@ package storage
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"github.com/oxisto/lightsql/internal/pgerr"
 )
@@ -54,11 +53,16 @@ func (s Status) String() string {
 
 // TxManager hands out transaction ids and remembers their outcome.
 type TxManager struct {
-	// next is the id the following transaction will receive. It is atomic so
-	// that starting a transaction does not need the mutex below.
-	next atomic.Uint64
-
-	mu     sync.RWMutex
+	// mu guards all three fields together. They are one piece of state, not
+	// three: a snapshot reads next as its XMax and active as its exclusion set,
+	// so allocating an id outside this lock lets a snapshot exist whose XMax is
+	// already past a transaction that is not yet in active. That transaction
+	// then reads as finished-and-not-excluded, and becomes visible to the
+	// snapshot the moment it commits — which silently breaks the stability that
+	// REPEATABLE READ is.
+	mu sync.RWMutex
+	// next is the id the following transaction will receive.
+	next   TxID
 	status map[TxID]Status
 	// active is the set of transactions that have not yet finished. It is kept
 	// separately from status because taking a snapshot needs exactly this set
@@ -68,20 +72,20 @@ type TxManager struct {
 
 // NewTxManager returns a manager whose first transaction will be id 1.
 func NewTxManager() *TxManager {
-	m := &TxManager{
+	return &TxManager{
+		next:   1,
 		status: make(map[TxID]Status),
 		active: make(map[TxID]bool),
 	}
-	m.next.Store(1)
-	return m
 }
 
 // Begin starts a transaction and returns its id.
 func (m *TxManager) Begin() TxID {
-	id := TxID(m.next.Add(1) - 1)
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	id := m.next
+	m.next++
 	m.status[id] = InProgress
 	m.active[id] = true
 	return id
@@ -100,7 +104,15 @@ func (m *TxManager) Abort(id TxID) { m.finish(id, Aborted) }
 func (m *TxManager) finish(id TxID, s Status) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.status[id] != InProgress {
+
+	// An id that was never issued must stay unknown, which Status reports as
+	// aborted. Writing a status for it here would invent a transaction and
+	// could make rows referring to that id visible.
+	current, ok := m.status[id]
+	if !ok {
+		return
+	}
+	if current != InProgress {
 		// Committing or aborting twice is a no-op rather than an error, so that
 		// a deferred Rollback after a Commit is harmless — which is the usual
 		// shape of correct caller code.
@@ -120,6 +132,25 @@ func (m *TxManager) Status(id TxID) Status {
 		return Aborted
 	}
 	return s
+}
+
+// Horizon returns the id below which every transaction has finished.
+//
+// This is what Vacuum may safely reclaim up to. Using the next id instead would
+// be too aggressive: a transaction still running holds a snapshot that can see
+// versions younger than itself, and discarding those would make its rows vanish
+// mid-scan.
+func (m *TxManager) Horizon() TxID {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	oldest := m.next
+	for id := range m.active {
+		if id < oldest {
+			oldest = id
+		}
+	}
+	return oldest
 }
 
 // Snapshot is a consistent view of which transactions had finished at the moment
@@ -145,7 +176,7 @@ func (m *TxManager) Take() *Snapshot {
 	defer m.mu.RUnlock()
 
 	s := &Snapshot{
-		XMax:   TxID(m.next.Load()),
+		XMax:   m.next,
 		active: make(map[TxID]bool, len(m.active)),
 		mgr:    m,
 	}
