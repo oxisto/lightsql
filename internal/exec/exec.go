@@ -8,6 +8,7 @@ import (
 	"github.com/oxisto/lightsql/internal/catalog"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/plan"
+	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
 )
 
@@ -26,13 +27,18 @@ type Operator interface {
 }
 
 // Build compiles a plan node into an operator tree.
-func Build(n plan.Node, args []types.Value) (Operator, error) {
+//
+// The transaction is threaded through rather than read from a global, because a
+// scan must read through the snapshot of the statement that asked for it: two
+// statements running concurrently on pooled connections legitimately see
+// different data.
+func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 	switch n := n.(type) {
 	case *plan.Scan:
-		return &scanOp{rows: n.Table.Rows()}, nil
+		return &scanOp{rows: n.Table.Rows(tx)}, nil
 
 	case *plan.Filter:
-		input, err := Build(n.Input, args)
+		input, err := Build(n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -46,7 +52,7 @@ func Build(n plan.Node, args []types.Value) (Operator, error) {
 		return &singleRowOp{}, nil
 
 	case *plan.Project:
-		input, err := Build(n.Input, args)
+		input, err := Build(n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -59,7 +65,7 @@ func Build(n plan.Node, args []types.Value) (Operator, error) {
 		return &projectOp{input: input, evals: evals, args: args, out: make(Row, len(evals))}, nil
 
 	case *plan.Sort:
-		input, err := Build(n.Input, args)
+		input, err := Build(n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -74,7 +80,7 @@ func Build(n plan.Node, args []types.Value) (Operator, error) {
 		return &sortOp{input: input, keys: keys, args: args}, nil
 
 	case *plan.Limit:
-		input, err := Build(n.Input, args)
+		input, err := Build(n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -474,7 +480,7 @@ func (r *returningEval) row(args []types.Value, in Row) (Row, error) {
 }
 
 // ExecUpdate applies an UPDATE.
-func ExecUpdate(ctx context.Context, up *plan.Update, args []types.Value) (Result, error) {
+func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []types.Value) (Result, error) {
 	pred, err := compilePredicate(up.Where)
 	if err != nil {
 		return Result{}, err
@@ -495,34 +501,36 @@ func ExecUpdate(ctx context.Context, up *plan.Update, args []types.Value) (Resul
 	}
 
 	var res Result
-	err = up.Table.Mutate(func(row []types.Value) ([]types.Value, error) {
+	for _, v := range up.Table.Scan(tx) {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return Result{}, err
 		}
-		match, err := pred(args, row)
+		match, err := pred(args, v.Vals)
 		if err != nil {
-			return nil, err
+			return Result{}, err
 		}
 		if !match {
-			return row, nil
+			continue
 		}
 
-		// The replacement is a copy, so a concurrent reader holding the old row
-		// never observes a partially applied update. Every assignment also
-		// evaluates against the original row, which is what makes
-		// `SET a = b, b = a` a swap rather than two copies of b.
-		next := make([]types.Value, len(row))
-		copy(next, row)
+		// The replacement is a fresh slice, and every assignment evaluates
+		// against the original row: that is what makes `SET a = b, b = a` a
+		// swap rather than two copies of b.
+		next := make([]types.Value, len(v.Vals))
+		copy(next, v.Vals)
 		for i, a := range up.Assignments {
-			v, err := assign[i](args, row)
+			val, err := assign[i](args, v.Vals)
 			if err != nil {
-				return nil, err
+				return Result{}, err
 			}
-			next[a.Ordinal] = v
+			next[a.Ordinal] = val
 		}
 
 		if err := runChecks(checks, args, next, up.Table.Name); err != nil {
-			return nil, err
+			return Result{}, err
+		}
+		if err := up.Table.Update(tx, v, next); err != nil {
+			return Result{}, err
 		}
 
 		res.Affected++
@@ -530,20 +538,22 @@ func ExecUpdate(ctx context.Context, up *plan.Update, args []types.Value) (Resul
 			// RETURNING on an UPDATE reports the new values.
 			out, err := ret.row(args, next)
 			if err != nil {
-				return nil, err
+				return Result{}, err
 			}
 			res.Rows = append(res.Rows, out)
 		}
-		return next, nil
-	})
-	if err != nil {
+	}
+
+	// Uniqueness is checked once the statement has finished writing, so a row
+	// keeping its own value does not conflict with itself.
+	if err := up.Table.CheckConstraints(tx); err != nil {
 		return Result{}, err
 	}
 	return res, nil
 }
 
 // ExecDelete applies a DELETE.
-func ExecDelete(ctx context.Context, del *plan.Delete, args []types.Value) (Result, error) {
+func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []types.Value) (Result, error) {
 	pred, err := compilePredicate(del.Where)
 	if err != nil {
 		return Result{}, err
@@ -554,30 +564,29 @@ func ExecDelete(ctx context.Context, del *plan.Delete, args []types.Value) (Resu
 	}
 
 	var res Result
-	err = del.Table.Mutate(func(row []types.Value) ([]types.Value, error) {
+	for _, v := range del.Table.Scan(tx) {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return Result{}, err
 		}
-		match, err := pred(args, row)
+		match, err := pred(args, v.Vals)
 		if err != nil {
-			return nil, err
+			return Result{}, err
 		}
 		if !match {
-			return row, nil
+			continue
 		}
-		res.Affected++
 		if ret != nil {
 			// RETURNING on a DELETE reports the row as it was before removal.
-			out, err := ret.row(args, row)
+			out, err := ret.row(args, v.Vals)
 			if err != nil {
-				return nil, err
+				return Result{}, err
 			}
 			res.Rows = append(res.Rows, out)
 		}
-		return nil, nil // delete
-	})
-	if err != nil {
-		return Result{}, err
+		if err := del.Table.Delete(tx, v); err != nil {
+			return Result{}, err
+		}
+		res.Affected++
 	}
 	return res, nil
 }
@@ -603,7 +612,7 @@ func compilePredicate(e plan.Expr) (func(args []types.Value, row Row) (bool, err
 }
 
 // ExecInsert runs an INSERT.
-func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (Result, error) {
+func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []types.Value) (Result, error) {
 	width := len(ins.Table.Columns)
 	ret, err := compileReturning(ins.Returning)
 	if err != nil {
@@ -660,7 +669,7 @@ func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (Resu
 		if err := runChecks(checks, args, row, ins.Table.Name); err != nil {
 			return res, err
 		}
-		if err := ins.Table.Insert(row); err != nil {
+		if err := ins.Table.Insert(tx, row); err != nil {
 			return res, err
 		}
 		res.Affected++
@@ -674,6 +683,12 @@ func ExecInsert(ctx context.Context, ins *plan.Insert, args []types.Value) (Resu
 			}
 			res.Rows = append(res.Rows, out)
 		}
+	}
+
+	// Checked once the statement has written every row, so a multi-row INSERT
+	// is validated against its own rows as well as the existing ones.
+	if err := ins.Table.CheckConstraints(tx); err != nil {
+		return res, err
 	}
 	return res, nil
 }

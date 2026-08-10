@@ -3,6 +3,7 @@ package driver_test
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"strings"
 	"testing"
@@ -410,7 +411,11 @@ func TestUpdate(t *testing.T) {
 	if n, _ := res.RowsAffected(); n != 1 {
 		t.Errorf("RowsAffected = %d, want 1", n)
 	}
-	if got := queryInts(t, db, `SELECT a FROM t`); !equalInts(got, []int{10, 99, 30}) {
+	// Ordered explicitly: an update rewrites the row as a new version, so the
+	// updated row moves to the end of an unordered scan. SQL promises no order
+	// without ORDER BY, and now that lightsql has it there is no reason for a
+	// test to depend on the physical one.
+	if got := queryInts(t, db, `SELECT a FROM t ORDER BY id`); !equalInts(got, []int{10, 99, 30}) {
 		t.Errorf("after update, a = %v, want [10 99 30]", got)
 	}
 
@@ -418,7 +423,7 @@ func TestUpdate(t *testing.T) {
 	if _, err := db.Exec(`UPDATE t SET a = a + 1`); err != nil {
 		t.Fatalf("UPDATE with self-reference: %v", err)
 	}
-	if got := queryInts(t, db, `SELECT a FROM t`); !equalInts(got, []int{11, 100, 31}) {
+	if got := queryInts(t, db, `SELECT a FROM t ORDER BY id`); !equalInts(got, []int{11, 100, 31}) {
 		t.Errorf("after increment, a = %v, want [11 100 31]", got)
 	}
 
@@ -1242,6 +1247,311 @@ func TestConstraintsRejectedAtCreate(t *testing.T) {
 				t.Errorf("SQLSTATE = %q, want %q (error: %v)", got, tt.want, err)
 			}
 		})
+	}
+}
+
+// TestTransactionCommitAndRollback is the reason M2 exists: the standard
+// test-isolation idiom is Begin then a deferred Rollback, and it has to actually
+// undo the work rather than merely be accepted.
+func TestTransactionCommitAndRollback(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`CREATE TABLE t (id INT PRIMARY KEY, n INT)`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// Committed work sticks.
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO t (id, n) VALUES (1, 10)`); err != nil {
+		t.Fatalf("INSERT in tx: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT n FROM t`); !equalInts(got, []int{10}) {
+		t.Errorf("after commit, n = %v, want [10]", got)
+	}
+
+	// Rolled back work does not — including updates and deletes, which is
+	// exactly what ramsql's undo log silently fails to reverse.
+	tx, err = db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	for _, q := range []string{
+		`INSERT INTO t (id, n) VALUES (2, 20)`,
+		`UPDATE t SET n = 999 WHERE id = 1`,
+		`DELETE FROM t WHERE id = 1`,
+	} {
+		if _, err := tx.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT n FROM t ORDER BY id`); !equalInts(got, []int{10}) {
+		t.Errorf("after rollback, n = %v, want [10] unchanged", got)
+	}
+}
+
+// TestTransactionSeesItsOwnWrites checks that a transaction reads its own
+// uncommitted changes while nobody else can.
+func TestTransactionSeesItsOwnWrites(t *testing.T) {
+	db := open(t)
+	db.SetMaxOpenConns(4)
+	if _, err := db.Exec(`CREATE TABLE t (id INT PRIMARY KEY, n INT)`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`INSERT INTO t (id, n) VALUES (1, 10)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	var n int
+	if err := tx.QueryRow(`SELECT n FROM t WHERE id = 1`).Scan(&n); err != nil {
+		t.Fatalf("a transaction cannot see its own insert: %v", err)
+	}
+	if n != 10 {
+		t.Errorf("n = %d, want 10", n)
+	}
+
+	// Outside the transaction, on another connection, the row does not exist.
+	if got := queryInts(t, db, `SELECT n FROM t`); len(got) != 0 {
+		t.Errorf("uncommitted row visible outside the transaction: %v", got)
+	}
+}
+
+// TestRepeatableReadKeepsItsSnapshot pins the difference between the two
+// isolation levels, which is the thing sql.TxOptions asks for and which ramsql
+// accepts and discards.
+func TestRepeatableReadKeepsItsSnapshot(t *testing.T) {
+	db := open(t)
+	db.SetMaxOpenConns(4)
+	if _, err := db.Exec(`
+		CREATE TABLE t (id INT PRIMARY KEY, n INT);
+		INSERT INTO t (id, n) VALUES (1, 10);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	ctx := context.Background()
+
+	for _, tt := range []struct {
+		name     string
+		level    sql.IsolationLevel
+		wantSame bool
+	}{
+		// One snapshot for the whole transaction, so the second read matches
+		// the first even though the row changed in between.
+		{"repeatable read", sql.LevelRepeatableRead, true},
+		// A fresh snapshot per statement, so the second read sees the change.
+		{"read committed", sql.LevelReadCommitted, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := db.Exec(`UPDATE t SET n = 10 WHERE id = 1`); err != nil {
+				t.Fatalf("reset: %v", err)
+			}
+
+			tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: tt.level})
+			if err != nil {
+				t.Fatalf("BeginTx: %v", err)
+			}
+			defer tx.Rollback()
+
+			var first int
+			if err := tx.QueryRow(`SELECT n FROM t WHERE id = 1`).Scan(&first); err != nil {
+				t.Fatalf("first read: %v", err)
+			}
+
+			// Someone else commits a change while the transaction is open.
+			if _, err := db.Exec(`UPDATE t SET n = 20 WHERE id = 1`); err != nil {
+				t.Fatalf("concurrent update: %v", err)
+			}
+
+			var second int
+			if err := tx.QueryRow(`SELECT n FROM t WHERE id = 1`).Scan(&second); err != nil {
+				t.Fatalf("second read: %v", err)
+			}
+
+			if same := first == second; same != tt.wantSame {
+				t.Errorf("%s: reads were %d then %d; same=%v, want same=%v",
+					tt.name, first, second, same, tt.wantSame)
+			}
+		})
+	}
+}
+
+// TestReadOnlyTransactionRefusesWrites checks that sql.TxOptions.ReadOnly is
+// honoured rather than accepted and ignored.
+func TestReadOnlyTransactionRefusesWrites(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE t (id INT PRIMARY KEY, n INT);
+		INSERT INTO t (id, n) VALUES (1, 10);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+
+	// Reading is fine.
+	var n int
+	if err := tx.QueryRow(`SELECT n FROM t`).Scan(&n); err != nil {
+		t.Fatalf("read in a read-only transaction: %v", err)
+	}
+	// Writing is not.
+	_, err = tx.Exec(`INSERT INTO t (id, n) VALUES (2, 20)`)
+	if got := sqlstate(err); got != "25006" {
+		t.Errorf("write in a read-only transaction gave %v (SQLSTATE %q), want 25006", err, got)
+	}
+}
+
+// TestFailedStatementPoisonsTransaction pins PostgreSQL's rule that a statement
+// error aborts the transaction: later commands are refused until the caller
+// rolls back, rather than being allowed to build on a broken state.
+func TestFailedStatementPoisonsTransaction(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`CREATE TABLE t (id INT PRIMARY KEY)`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`INSERT INTO t (id) VALUES (1)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	// A duplicate key fails the statement.
+	if _, err := tx.Exec(`INSERT INTO t (id) VALUES (1)`); sqlstate(err) != "23505" {
+		t.Fatalf("duplicate insert gave %v, want a unique violation", err)
+	}
+	// Everything after it is refused until the transaction ends.
+	if _, err := tx.Exec(`INSERT INTO t (id) VALUES (2)`); sqlstate(err) != "25P02" {
+		t.Errorf("a statement after a failure gave %v, want 25P02", err)
+	}
+	// Committing a failed transaction rolls it back rather than keeping part.
+	if err := tx.Commit(); err == nil {
+		t.Error("committing a failed transaction succeeded")
+	}
+	if got := queryInts(t, db, `SELECT id FROM t`); len(got) != 0 {
+		t.Errorf("a failed transaction left %v behind", got)
+	}
+}
+
+// TestConnectionIsReusableAfterRollback checks that a connection returned to the
+// pool after a rollback carries nothing over: the changes are gone and the
+// connection still works.
+//
+// It deliberately does not test the abandoned-transaction path. database/sql
+// will not return a connection to the pool while its Tx is live, so a test
+// cannot reach ResetSession with a transaction still open through the public
+// API; TestResetSessionRollsBackAnOpenTransaction drives the driver directly
+// for that.
+func TestConnectionIsReusableAfterRollback(t *testing.T) {
+	db := open(t)
+	db.SetMaxOpenConns(1) // force the same connection to be reused
+	if _, err := db.Exec(`CREATE TABLE t (id INT PRIMARY KEY)`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO t (id) VALUES (1)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	if got := queryInts(t, db, `SELECT id FROM t`); len(got) != 0 {
+		t.Errorf("the rolled back transaction left %v behind", got)
+	}
+	// The connection is still usable afterwards.
+	if _, err := db.Exec(`INSERT INTO t (id) VALUES (2)`); err != nil {
+		t.Errorf("the connection was not reusable: %v", err)
+	}
+}
+
+// TestResetSessionRollsBackAnOpenTransaction drives the driver directly, because
+// database/sql will not return a connection to the pool while its Tx is live —
+// so the leak this guards against is unreachable through the public API.
+//
+// It is still worth guarding: the pool calls ResetSession before handing a
+// connection on, and a transaction surviving that would give the next caller
+// someone else's snapshot.
+func TestResetSessionRollsBackAnOpenTransaction(t *testing.T) {
+	ctx := context.Background()
+	connector, err := lightsqldriver.NewConnector(t.Name())
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	t.Cleanup(func() { lightsqldriver.Drop(t.Name()) })
+
+	conn, err := connector.Connect(ctx)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	execer := conn.(driver.ExecerContext)
+	if _, err := execer.ExecContext(ctx, `CREATE TABLE t (id INT PRIMARY KEY)`, nil); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+
+	// Open a transaction, write, and then abandon it without committing.
+	if _, err := conn.(driver.ConnBeginTx).BeginTx(ctx, driver.TxOptions{}); err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	if _, err := execer.ExecContext(ctx, `INSERT INTO t (id) VALUES (1)`, nil); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	// The pool does this before handing the connection to the next caller.
+	if err := conn.(driver.SessionResetter).ResetSession(ctx); err != nil {
+		t.Fatalf("ResetSession: %v", err)
+	}
+
+	// The abandoned write is gone, and the connection is in autocommit again.
+	rows, err := conn.(driver.QueryerContext).QueryContext(ctx, `SELECT id FROM t`, nil)
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	defer rows.Close()
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err == nil {
+		t.Errorf("the abandoned transaction left row %v behind", dest[0])
+	}
+}
+
+// TestReadOnlyRefusesDDL pins that a read-only transaction cannot reshape the
+// catalog either. DDL is a write, and leaving it out of the check would let
+// CREATE TABLE through while INSERT was refused.
+func TestReadOnlyRefusesDDL(t *testing.T) {
+	db := open(t)
+
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`CREATE TABLE t (a INT)`); sqlstate(err) != "25006" {
+		t.Errorf("CREATE TABLE in a read-only transaction gave %v, want SQLSTATE 25006", err)
 	}
 }
 
