@@ -3,6 +3,7 @@ package driver_test
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"strings"
 	"testing"
@@ -1452,9 +1453,16 @@ func TestFailedStatementPoisonsTransaction(t *testing.T) {
 	}
 }
 
-// TestLeakedTransactionIsRolledBack checks that a connection returned to the
-// pool with a transaction still open does not hand it to the next user.
-func TestLeakedTransactionIsRolledBack(t *testing.T) {
+// TestConnectionIsReusableAfterRollback checks that a connection returned to the
+// pool after a rollback carries nothing over: the changes are gone and the
+// connection still works.
+//
+// It deliberately does not test the abandoned-transaction path. database/sql
+// will not return a connection to the pool while its Tx is live, so a test
+// cannot reach ResetSession with a transaction still open through the public
+// API; TestResetSessionRollsBackAnOpenTransaction drives the driver directly
+// for that.
+func TestConnectionIsReusableAfterRollback(t *testing.T) {
 	db := open(t)
 	db.SetMaxOpenConns(1) // force the same connection to be reused
 	if _, err := db.Exec(`CREATE TABLE t (id INT PRIMARY KEY)`); err != nil {
@@ -1468,17 +1476,82 @@ func TestLeakedTransactionIsRolledBack(t *testing.T) {
 	if _, err := tx.Exec(`INSERT INTO t (id) VALUES (1)`); err != nil {
 		t.Fatalf("INSERT: %v", err)
 	}
-	// Abandon it without committing, as a test that forgets its defer would.
 	if err := tx.Rollback(); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
 
 	if got := queryInts(t, db, `SELECT id FROM t`); len(got) != 0 {
-		t.Errorf("the abandoned transaction left %v behind", got)
+		t.Errorf("the rolled back transaction left %v behind", got)
 	}
 	// The connection is still usable afterwards.
 	if _, err := db.Exec(`INSERT INTO t (id) VALUES (2)`); err != nil {
 		t.Errorf("the connection was not reusable: %v", err)
+	}
+}
+
+// TestResetSessionRollsBackAnOpenTransaction drives the driver directly, because
+// database/sql will not return a connection to the pool while its Tx is live —
+// so the leak this guards against is unreachable through the public API.
+//
+// It is still worth guarding: the pool calls ResetSession before handing a
+// connection on, and a transaction surviving that would give the next caller
+// someone else's snapshot.
+func TestResetSessionRollsBackAnOpenTransaction(t *testing.T) {
+	ctx := context.Background()
+	connector, err := lightsqldriver.NewConnector(t.Name())
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	t.Cleanup(func() { lightsqldriver.Drop(t.Name()) })
+
+	conn, err := connector.Connect(ctx)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	execer := conn.(driver.ExecerContext)
+	if _, err := execer.ExecContext(ctx, `CREATE TABLE t (id INT PRIMARY KEY)`, nil); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+
+	// Open a transaction, write, and then abandon it without committing.
+	if _, err := conn.(driver.ConnBeginTx).BeginTx(ctx, driver.TxOptions{}); err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	if _, err := execer.ExecContext(ctx, `INSERT INTO t (id) VALUES (1)`, nil); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	// The pool does this before handing the connection to the next caller.
+	if err := conn.(driver.SessionResetter).ResetSession(ctx); err != nil {
+		t.Fatalf("ResetSession: %v", err)
+	}
+
+	// The abandoned write is gone, and the connection is in autocommit again.
+	rows, err := conn.(driver.QueryerContext).QueryContext(ctx, `SELECT id FROM t`, nil)
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	defer rows.Close()
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err == nil {
+		t.Errorf("the abandoned transaction left row %v behind", dest[0])
+	}
+}
+
+// TestReadOnlyRefusesDDL pins that a read-only transaction cannot reshape the
+// catalog either. DDL is a write, and leaving it out of the check would let
+// CREATE TABLE through while INSERT was refused.
+func TestReadOnlyRefusesDDL(t *testing.T) {
+	db := open(t)
+
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`CREATE TABLE t (a INT)`); sqlstate(err) != "25006" {
+		t.Errorf("CREATE TABLE in a read-only transaction gave %v, want SQLSTATE 25006", err)
 	}
 }
 

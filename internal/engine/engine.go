@@ -175,6 +175,11 @@ func (p *Prepared) run(ctx context.Context, tx *storage.Tx, args []types.Value) 
 	err := p.eng.withTx(tx, func(t *storage.Tx) error {
 		switch s := p.stmt.(type) {
 		case *plan.CreateTable:
+			// DDL is a write too. Leaving it out let a read-only transaction
+			// reshape the catalog, which contradicts what ReadOnly promises.
+			if err := t.CheckWritable(); err != nil {
+				return err
+			}
 			return exec.ExecCreateTable(p.eng.cat, s)
 		case *plan.Insert:
 			if err := t.CheckWritable(); err != nil {
