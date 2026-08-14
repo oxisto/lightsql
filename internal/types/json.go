@@ -3,6 +3,8 @@ package types
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 )
 
@@ -67,9 +69,15 @@ func canonicalJSON(text string) (string, error) {
 	if err := dec.Decode(&v); err != nil {
 		return "", &ErrJSON{Text: text, Detail: err.Error()}
 	}
-	// A second value after the first is trailing garbage, not a second
+	// Anything after the first value is trailing garbage, not a second
 	// document: `{"a":1} {"b":2}` is not valid input.
-	if dec.More() {
+	//
+	// This asks for the next token and requires EOF, rather than asking More().
+	// More() reports whether another element follows in the current array or
+	// object, so it answers false for a stray closing brace — which let
+	// `{"a":1}}` through and silently truncated it to `{"a":1}`. Requiring EOF
+	// has no such blind spot.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return "", &ErrJSON{Text: text, Detail: "unexpected trailing data"}
 	}
 

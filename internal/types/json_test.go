@@ -57,6 +57,13 @@ func TestParseJSONBRejectsMalformed(t *testing.T) {
 		// silently store only {"a":1}.
 		{"trailing document", `{"a":1} {"b":2}`},
 		{"trailing garbage", `{"a":1} xyz`},
+		// A stray closing brace is the case Decoder.More cannot see, because it
+		// answers "is there another element in the current array or object",
+		// and a brace is how those end. It was accepted and silently truncated.
+		{"trailing close brace", `{"a":1}}`},
+		{"trailing close brace after a space", `{"a":1} }`},
+		{"trailing close bracket", `[1] ]`},
+		{"trailing brace after a scalar", `1 }`},
 	}
 
 	for _, tt := range tests {
