@@ -163,9 +163,18 @@ type Table struct {
 	Checks []Check
 	// ForeignKeys are the references this table makes to others.
 	ForeignKeys []ForeignKey
-	// ReferencedBy are the references other tables make to this one, so a
+	// referencedBy are the references other tables make to this one, so a
 	// delete or key update can find them without scanning the catalog.
-	ReferencedBy []Referencing
+	//
+	// It is unexported and reached only through the methods below, because the
+	// binder appends to it while CREATE TABLE runs and the executor reads it
+	// while a concurrent DELETE runs. A shared engine behind a connection pool
+	// makes that a real data race, so the slice must never escape the lock.
+	referencedBy []Referencing
+	// refsMu guards referencedBy. It is separate from mu, which the per-insert
+	// serial path takes, so a foreign-key read does not queue behind sequence
+	// allocation.
+	refsMu sync.RWMutex
 	// defaultEval evaluates a DEFAULT expression; see SetDefaultEvaluator.
 	defaultEval DefaultEvaluator
 	// byName resolves a column name to its ordinal. Every reference below the
@@ -353,8 +362,11 @@ func matchesKey(a []types.Value, aCols []int, b []types.Value, bCols []int) bool
 // ChildrenOf returns the rows of referencing tables that point at the given
 // parent row, grouped by the reference that found them.
 func (t *Table) ChildrenOf(tx *storage.Tx, parent []types.Value) []ChildRows {
+	t.refsMu.RLock()
+	defer t.refsMu.RUnlock()
+
 	var out []ChildRows
-	for _, ref := range t.ReferencedBy {
+	for _, ref := range t.referencedBy {
 		var rows []*storage.Version
 		for _, v := range ref.Child.Scan(tx) {
 			if anyNull(v.Vals, ref.FK.Columns) {
@@ -369,6 +381,23 @@ func (t *Table) ChildrenOf(tx *storage.Tx, parent []types.Value) []ChildRows {
 		}
 	}
 	return out
+}
+
+// AddReferencing records an incoming foreign key. The binder calls it while
+// binding the child's CREATE TABLE, which can run concurrently with a statement
+// on the parent.
+func (t *Table) AddReferencing(r Referencing) {
+	t.refsMu.Lock()
+	defer t.refsMu.Unlock()
+	t.referencedBy = append(t.referencedBy, r)
+}
+
+// IsReferenced reports whether any table points at this one, so a delete can
+// skip the referential-action machinery entirely.
+func (t *Table) IsReferenced() bool {
+	t.refsMu.RLock()
+	defer t.refsMu.RUnlock()
+	return len(t.referencedBy) > 0
 }
 
 // ChildRows are the referencing rows found for one incoming foreign key.
@@ -543,6 +572,17 @@ func (c *Catalog) CreateTable(t *Table, ifNotExists bool) (created bool, err err
 		return false, pgerr.Newf(pgerr.DuplicateTable, "relation %q already exists", t.Name)
 	}
 	c.tables[k] = t
+
+	// Register the incoming references only now, with the table complete and in
+	// the catalog. Doing it during binding published a half-built table — one
+	// whose heap was not yet assigned — to any statement already walking the
+	// parent's children. Taking the address of the slice element rather than of
+	// a local also means the parent and the child share one foreign key, so a
+	// later change to it cannot be seen by only one of them.
+	for i := range t.ForeignKeys {
+		fk := &t.ForeignKeys[i]
+		fk.Parent.AddReferencing(Referencing{Child: t, FK: fk})
+	}
 	return true, nil
 }
 

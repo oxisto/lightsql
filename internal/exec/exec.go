@@ -501,6 +501,7 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 	}
 
 	var res Result
+	wrote := touched{}
 	for _, v := range up.Table.Scan(tx) {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
@@ -531,7 +532,7 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		}
 		// A key the children point at is changing, so they have to be dealt
 		// with before the parent row moves out from under them.
-		if err := applyRefActions(tx, up.Table, v.Vals, next, onUpdate); err != nil {
+		if err := applyRefActions(tx, up.Table, v.Vals, next, onUpdate, wrote); err != nil {
 			return Result{}, err
 		}
 		if err := up.Table.Update(tx, v, next); err != nil {
@@ -557,6 +558,9 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 	if err := up.Table.CheckForeignKeys(tx); err != nil {
 		return Result{}, err
 	}
+	if err := wrote.check(tx, up.Table); err != nil {
+		return Result{}, err
+	}
 	return res, nil
 }
 
@@ -572,6 +576,7 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 	}
 
 	var res Result
+	wrote := touched{}
 	for _, v := range del.Table.Scan(tx) {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
@@ -591,7 +596,7 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 			}
 			res.Rows = append(res.Rows, out)
 		}
-		if err := applyRefActions(tx, del.Table, v.Vals, nil, onDelete); err != nil {
+		if err := applyRefActions(tx, del.Table, v.Vals, nil, onDelete, wrote); err != nil {
 			return Result{}, err
 		}
 		if err := del.Table.Delete(tx, v); err != nil {
@@ -599,7 +604,39 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 		}
 		res.Affected++
 	}
+
+	// A DELETE had no statement-end check at all, so a cascade could leave a
+	// child in a state nothing revalidated.
+	if err := wrote.check(tx, del.Table); err != nil {
+		return Result{}, err
+	}
 	return res, nil
+}
+
+// touched collects the tables a statement wrote to through referential actions.
+//
+// Their constraints cannot be checked as each row is written, for the same
+// reason the directly targeted table's cannot: a set of changes is only
+// consistent once all of it has been applied.
+type touched map[*catalog.Table]struct{}
+
+func (t touched) add(tbl *catalog.Table) { t[tbl] = struct{}{} }
+
+// check revalidates every table a cascade wrote to, skipping the statement's
+// own target, which the caller checks separately.
+func (t touched) check(tx *storage.Tx, except *catalog.Table) error {
+	for tbl := range t {
+		if tbl == except {
+			continue
+		}
+		if err := tbl.CheckConstraints(tx); err != nil {
+			return err
+		}
+		if err := tbl.CheckForeignKeys(tx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // refEvent distinguishes which of a foreign key's two actions applies.
@@ -617,8 +654,10 @@ const (
 // whose key columns are unchanged is not a referential event at all, which is
 // why the comparison happens here rather than at the call site: `UPDATE parent
 // SET name = ...` must not cascade.
-func applyRefActions(tx *storage.Tx, parent *catalog.Table, old, next []types.Value, ev refEvent) error {
-	if len(parent.ReferencedBy) == 0 {
+func applyRefActions(tx *storage.Tx, parent *catalog.Table, old, next []types.Value,
+	ev refEvent, wrote touched) error {
+
+	if !parent.IsReferenced() {
 		return nil
 	}
 
@@ -637,6 +676,11 @@ func applyRefActions(tx *storage.Tx, parent *catalog.Table, old, next []types.Va
 			if err := applyRefAction(tx, group.Ref.Child, fk, child, next, action); err != nil {
 				return err
 			}
+			// A cascade writes to the child, so the child's own constraints
+			// have to be revalidated once the statement finishes. Without this
+			// SET DEFAULT can leave a row that both violates a CHECK and points
+			// at no parent — the foreign-key machinery breaking a foreign key.
+			wrote.add(group.Ref.Child)
 		}
 	}
 	return nil

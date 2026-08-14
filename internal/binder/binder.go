@@ -442,9 +442,11 @@ func (b *Binder) resolveForeignKey(t *catalog.Table, r refSpec) (catalog.Foreign
 		OnDelete: refActionOf(r.ref.OnDelete),
 		OnUpdate: refActionOf(r.ref.OnUpdate),
 	}
-	// Registered on the parent as well, so a delete finds its children without
-	// scanning every table in the catalog.
-	parent.ReferencedBy = append(parent.ReferencedBy, catalog.Referencing{Child: t, FK: &fk})
+	// The reverse registration on the parent is deliberately not done here.
+	// The binder runs before the table exists, so publishing the child to its
+	// parent now would expose a table with no heap to a concurrent statement,
+	// and would leave a dangling registration behind if CREATE TABLE went on to
+	// fail. CreateTable does it once the table is complete.
 	return fk, nil
 }
 

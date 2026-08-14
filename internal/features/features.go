@@ -397,7 +397,7 @@ func Badges(module, repo, goVersion string) string {
 }
 
 // escapeBadge encodes the characters shields.io treats specially in a path
-// segment: a dash must be doubled, an underscore or a space becomes an
+// segment: a dash and an underscore are each doubled, and a space becomes an
 // underscore.
 func escapeBadge(s string) string {
 	s = strings.ReplaceAll(s, "-", "--")
