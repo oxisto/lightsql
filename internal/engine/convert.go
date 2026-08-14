@@ -54,7 +54,10 @@ func ToDriver(v types.Value) driver.Value {
 		return v.AsFloat()
 	case types.KindText:
 		return v.AsString()
-	case types.KindBytea:
+	case types.KindBytea, types.KindJSON, types.KindJSONB:
+		// json comes back as bytes, as lib/pq and pgx return it, so that
+		// json.Unmarshal can consume a scan destination directly. Scanning
+		// into a string still works, since database/sql converts bytes to it.
 		return v.AsBytes()
 	default:
 		// Date, time and timestamp kinds all reconstruct to a time.Time.
@@ -81,7 +84,7 @@ func ScanType(t catalog.Type, nullable bool) reflect.Type {
 		return reflect.TypeFor[float64]()
 	case types.KindText:
 		return reflect.TypeFor[string]()
-	case types.KindBytea:
+	case types.KindBytea, types.KindJSON, types.KindJSONB:
 		return reflect.TypeFor[[]byte]()
 	case types.KindDate, types.KindTime, types.KindTimestamp, types.KindTimestamptz:
 		return reflect.TypeFor[time.Time]()

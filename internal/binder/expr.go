@@ -179,6 +179,36 @@ func bindBinary(e *ast.BinaryExpr, sc *scope) (plan.Expr, error) {
 		}
 		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: types.KindBool}, nil
 
+	case e.Op == ast.OpJSONField, e.Op == ast.OpJSONText:
+		if !isJSON(l.Type()) && l.Type() != types.KindNull {
+			return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+				"operator %s requires json or jsonb on the left, not %s", e.Op, l.Type()).At(e.OpPos)
+		}
+		// The right side selects either an object member by name or an array
+		// element by position, so both text and integer are legal and the
+		// choice is made per row rather than at bind time.
+		if r.Type() != types.KindText && r.Type() != types.KindInt && r.Type() != types.KindNull {
+			return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+				"operator %s requires text or integer on the right, not %s", e.Op, r.Type()).At(e.OpPos)
+		}
+		// -> keeps the document's own kind so that chained access stays JSON;
+		// ->> unwraps to text, which is the whole difference between them.
+		kind := l.Type()
+		if e.Op == ast.OpJSONText {
+			kind = types.KindText
+		}
+		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: kind}, nil
+
+	case e.Op == ast.OpJSONContains:
+		if !isJSON(l.Type()) && l.Type() != types.KindNull {
+			return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+				"operator %s requires json or jsonb, not %s", e.Op, l.Type()).At(e.OpPos)
+		}
+		if r, err = coerce(r, l.Type(), e.Y.Pos()); err != nil {
+			return nil, err
+		}
+		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: types.KindBool}, nil
+
 	case e.Op == ast.OpLike || e.Op == ast.OpNotLike:
 		if l, err = coerce(l, types.KindText, e.X.Pos()); err != nil {
 			return nil, err
@@ -203,6 +233,8 @@ func bindBinary(e *ast.BinaryExpr, sc *scope) (plan.Expr, error) {
 		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: kind}, nil
 	}
 }
+
+func isJSON(k types.Kind) bool { return k == types.KindJSON || k == types.KindJSONB }
 
 // unify brings two operands to a common type so the executor can compare or
 // combine them without inspecting types per row.
@@ -230,6 +262,30 @@ func unify(l, r plan.Expr, e *ast.BinaryExpr) (left, right plan.Expr, err error)
 		// needed; the value model handles it.
 		return l, r, nil
 	}
+
+	// A string literal compared against a document resolves to that document
+	// type. PostgreSQL gives a quoted literal the "unknown" type and lets the
+	// other operand decide; lightsql commits it to text in the binder, so
+	// without this doc = '{"a":1}' would be a type error and a string literal —
+	// the only way to write a document — could not be compared at all. The rule
+	// is kept to json and jsonb rather than applied to every pair, because
+	// resolving text against, say, an integer would silently accept comparisons
+	// PostgreSQL rejects.
+	if c, ok := l.(*plan.Const); ok && lt == types.KindText && isJSON(rt) {
+		v, err := types.Cast(c.Val, rt)
+		if err != nil {
+			return nil, nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.X.Pos())
+		}
+		return &plan.Const{Val: v}, r, nil
+	}
+	if c, ok := r.(*plan.Const); ok && rt == types.KindText && isJSON(lt) {
+		v, err := types.Cast(c.Val, lt)
+		if err != nil {
+			return nil, nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.Y.Pos())
+		}
+		return l, &plan.Const{Val: v}, nil
+	}
+
 	return nil, nil, pgerr.Newf(pgerr.DatatypeMismatch,
 		"operator %s cannot be applied to types %s and %s", e.Op, lt, rt).At(e.OpPos)
 }

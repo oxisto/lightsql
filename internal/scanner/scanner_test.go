@@ -185,6 +185,18 @@ func TestScan(t *testing.T) {
 			},
 		},
 		{
+			// ->> shares a prefix with ->, so scanning it as -> followed by a
+			// stray > would still parse in some positions and give the wrong
+			// answer in all of them.
+			name: "json operators, longest match first",
+			src:  `->> -> @> ->>->`,
+			want: []tok{
+				{kind: token.LongArrow}, {kind: token.Arrow},
+				{kind: token.Contains},
+				{kind: token.LongArrow}, {kind: token.Arrow},
+			},
+		},
+		{
 			name: "cast operator is not two colons",
 			src:  `x::int`,
 			want: []tok{

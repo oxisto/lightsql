@@ -215,6 +215,30 @@ func compileBinary(e *plan.Binary) (Eval, error) {
 		}, nil
 	}
 
+	switch e.Op {
+	case ast.OpJSONField, ast.OpJSONText, ast.OpJSONContains:
+		op := e.Op
+		return func(args []types.Value, row Row) (types.Value, error) {
+			lv, rv, err := evalPair(l, r, args, row)
+			if err != nil {
+				return types.Value{}, err
+			}
+			// A NULL operand gives NULL, as every JSON operator does in
+			// PostgreSQL: there is no document to look in.
+			if lv.IsNull() || rv.IsNull() {
+				return types.Null(), nil
+			}
+			switch op {
+			case ast.OpJSONField:
+				return types.JSONField(lv, rv), nil
+			case ast.OpJSONText:
+				return types.JSONText(lv, rv), nil
+			default:
+				return types.JSONContains(lv, rv).Value(), nil
+			}
+		}, nil
+	}
+
 	if e.Op == ast.OpConcat {
 		return func(args []types.Value, row Row) (types.Value, error) {
 			lv, rv, err := evalPair(l, r, args, row)

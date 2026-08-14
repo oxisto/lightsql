@@ -28,6 +28,10 @@ const (
 	KindTime  // microseconds since midnight
 	KindTimestamp
 	KindTimestamptz
+	// KindJSON keeps the document text exactly as written; KindJSONB keeps it
+	// canonicalised. Both live in the string payload, so neither grows Value.
+	KindJSON
+	KindJSONB
 )
 
 // kindNames are the canonical SQL spellings, so that both error messages and
@@ -43,6 +47,8 @@ var kindNames = [...]string{
 	KindTime:        "time without time zone",
 	KindTimestamp:   "timestamp without time zone",
 	KindTimestamptz: "timestamp with time zone",
+	KindJSON:        "json",
+	KindJSONB:       "jsonb",
 }
 
 func (k Kind) String() string {
@@ -169,7 +175,7 @@ func (v Value) String() string {
 		return strconv.FormatInt(v.AsInt(), 10)
 	case KindFloat:
 		return strconv.FormatFloat(v.AsFloat(), 'g', -1, 64)
-	case KindText, KindBytea:
+	case KindText, KindBytea, KindJSON, KindJSONB:
 		return v.s
 	case KindDate:
 		return v.AsTime().Format("2006-01-02")
@@ -211,7 +217,10 @@ func Compare(a, b Value) int {
 		return cmp.Compare(a.n, b.n)
 	case KindFloat:
 		return cmpFloat(a.AsFloat(), b.AsFloat())
-	case KindText, KindBytea:
+	case KindText, KindBytea, KindJSON, KindJSONB:
+		// jsonb is canonicalised on input, so comparing the text is comparing
+		// the document. This is deterministic but not PostgreSQL's jsonb
+		// ordering, which ranks by type before value; the matrix says so.
 		return cmp.Compare(a.s, b.s)
 	default:
 		// KindInt and the date/time kinds are all signed integer counts.
@@ -280,7 +289,7 @@ func (v Value) Hash(h *maphash.Hash) {
 	h.WriteByte(v.k.hashClass())
 	switch v.k {
 	case KindNull:
-	case KindText, KindBytea:
+	case KindText, KindBytea, KindJSON, KindJSONB:
 		h.WriteString(v.s)
 	case KindInt:
 		writeUint64(h, v.n)

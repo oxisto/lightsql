@@ -94,6 +94,13 @@ var probeTable = []string{
 	`CREATE TABLE t (a INT, b INT, c INT, s TEXT, flag BOOLEAN)`,
 }
 
+// jsonTable carries a row, because a JSON probe that returns no rows would
+// never evaluate the operator it is meant to prove works.
+var jsonTable = []string{
+	`CREATE TABLE j (doc JSONB, raw JSON)`,
+	`INSERT INTO j VALUES ('{"a":1}', '{"a":1}')`,
+}
+
 // probeJoin adds a second table, for probes that need two.
 var probeJoin = []string{
 	`CREATE TABLE t (a INT, b INT, id INT, s TEXT)`,
@@ -265,10 +272,14 @@ var Groups = []Group{
 			// JSONB is in scope: it is one of the types the target applications
 			// actually store, so a test suite that cannot round-trip a JSONB
 			// column cannot use lightsql at all.
-			{Name: "JSONB", Parse: Planned, Exec: Planned,
-				Note: "planned: the jsonb type, the -> ->> and @> operators, and round-tripping through database/sql"},
-			{Name: "JSON", Parse: Planned, Exec: Planned,
-				Note: "planned alongside JSONB; stored as given rather than normalised"},
+			{Name: "JSONB", Parse: Yes, Exec: Yes,
+				Note:  "canonicalised on store; scans as []byte",
+				Setup: jsonTable,
+				SQL:   `SELECT doc -> 'a', doc ->> 'a' FROM j WHERE doc @> '{"a":1}'`},
+			{Name: "JSON", Parse: Yes, Exec: Yes,
+				Note:  "kept exactly as written, unlike jsonb",
+				Setup: jsonTable,
+				SQL:   `SELECT raw ->> 'a' FROM j`},
 		},
 	},
 	{

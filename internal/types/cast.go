@@ -110,6 +110,28 @@ func Cast(v Value, want Kind) (Value, error) {
 			return Date(days), nil
 		}
 
+	case KindJSON:
+		// json keeps what it was given, but still refuses malformed input:
+		// storing text that cannot be read back is not a favour to anyone.
+		switch v.Kind() {
+		case KindText, KindBytea, KindJSONB:
+			if err := ValidateJSON(v.AsString()); err != nil {
+				return Value{}, &ErrCast{From: v.Kind(), To: want, Val: v.String()}
+			}
+			return JSON(v.AsString()), nil
+		}
+
+	case KindJSONB:
+		switch v.Kind() {
+		case KindText, KindBytea, KindJSON:
+			// []byte arrives here whenever a caller passes json.RawMessage or
+			// the output of json.Marshal as a query argument.
+			out, err := ParseJSONB(v.AsString())
+			if err != nil {
+				return Value{}, &ErrCast{From: v.Kind(), To: want, Val: v.String()}
+			}
+			return out, nil
+		}
 	}
 
 	return Value{}, &ErrCast{From: v.Kind(), To: want, Val: v.String()}
