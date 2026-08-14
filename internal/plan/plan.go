@@ -68,13 +68,23 @@ type IsNull struct {
 	Negate bool
 }
 
+// Cast is an explicit conversion, from CAST(x AS t) or x::t. Only conversions
+// that cannot be folded at bind time survive to here; a cast of a constant is
+// performed by the binder so the cost is not paid per row.
+type Cast struct {
+	X    Expr
+	Kind types.Kind
+}
+
 func (e *Column) Type() types.Kind { return e.Kind }
 func (e *Const) Type() types.Kind  { return e.Val.Kind() }
 func (e *Param) Type() types.Kind  { return e.Kind }
 func (e *Binary) Type() types.Kind { return e.Kind }
 func (e *Unary) Type() types.Kind  { return e.Kind }
 func (e *IsNull) Type() types.Kind { return types.KindBool }
+func (e *Cast) Type() types.Kind   { return e.Kind }
 
+func (*Cast) exprNode()   {}
 func (*Column) exprNode() {}
 func (*Const) exprNode()  {}
 func (*Param) exprNode()  {}

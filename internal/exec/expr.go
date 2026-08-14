@@ -74,6 +74,24 @@ func Compile(e plan.Expr) (Eval, error) {
 			return types.Bool(v.IsNull() != negate), nil
 		}, nil
 
+	case *plan.Cast:
+		x, err := Compile(e.X)
+		if err != nil {
+			return nil, err
+		}
+		want := e.Kind
+		return func(args []types.Value, row Row) (types.Value, error) {
+			v, err := x(args, row)
+			if err != nil {
+				return types.Value{}, err
+			}
+			out, err := types.Cast(v, want)
+			if err != nil {
+				return types.Value{}, pgerr.New(pgerr.InvalidTextForType, err.Error())
+			}
+			return out, nil
+		}, nil
+
 	case *plan.Unary:
 		return compileUnary(e)
 

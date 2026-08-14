@@ -253,7 +253,7 @@ var Groups = []Group{
 				Note:  "simple and searched forms",
 				Setup: probeTable,
 				SQL:   "SELECT CASE WHEN a > 1 THEN 1 ELSE 2 END FROM t"},
-			{Name: "CAST", Parse: Yes, Exec: Planned,
+			{Name: "CAST", Parse: Yes, Exec: Yes,
 				Note:  "both CAST(x AS t) and x::t",
 				Setup: probeTable,
 				SQL:   "SELECT CAST(a AS TEXT) FROM t"},
