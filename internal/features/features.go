@@ -109,12 +109,12 @@ var Groups = []Group{
 				SQL: "CREATE TABLE t (id INT, name TEXT)"},
 			{Name: "CREATE TABLE IF NOT EXISTS", Parse: Yes, Exec: Yes,
 				SQL: "CREATE TABLE IF NOT EXISTS t (id INT)"},
-			{Name: "Column constraints", Parse: Yes, Exec: Partial,
-				Note:  "NOT NULL, PRIMARY KEY, UNIQUE, DEFAULT and CHECK are enforced; REFERENCES is rejected until foreign keys land",
+			{Name: "Column constraints", Parse: Yes, Exec: Yes,
+				Note:  "NOT NULL, PRIMARY KEY, UNIQUE, DEFAULT, CHECK and REFERENCES are all enforced",
 				Setup: []string{"CREATE TABLE t (id INT PRIMARY KEY, e TEXT UNIQUE, n INT NOT NULL, d INT DEFAULT 7, c INT CHECK (c > 0))"},
 				SQL:   "INSERT INTO t (id, e, n, c) VALUES (1, 'a', 0, 1)"},
-			{Name: "Table constraints", Parse: Yes, Exec: Partial,
-				Note:  "PRIMARY KEY, UNIQUE and CHECK, with keys over several columns requiring the combination to be unique; FOREIGN KEY is rejected until foreign keys land",
+			{Name: "Table constraints", Parse: Yes, Exec: Yes,
+				Note:  "PRIMARY KEY, UNIQUE, CHECK and FOREIGN KEY, with keys over several columns requiring the combination to be unique",
 				Setup: []string{"CREATE TABLE t (a INT, b INT, c INT, PRIMARY KEY (a, b), UNIQUE (c), CHECK (c > 0))"},
 				SQL:   "INSERT INTO t (a, b, c) VALUES (1, 1, 1)"},
 			{Name: "DEFAULT values", Parse: Yes, Exec: Yes,
@@ -125,9 +125,14 @@ var Groups = []Group{
 				Note:  "column and table level, enforced on insert and update; satisfied by true or unknown, so a NULL does not violate one",
 				Setup: []string{"CREATE TABLE t (n INT CHECK (n >= 0))"},
 				SQL:   "INSERT INTO t (n) VALUES (1)"},
-			{Name: "Referential actions", Parse: Yes, Exec: Planned,
-				Note: "ON DELETE / ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT",
-				SQL:  "CREATE TABLE t (a INT REFERENCES u (id) ON DELETE CASCADE)"},
+			{Name: "Foreign keys", Parse: Yes, Exec: Yes,
+				Note:  "column and table level, single and multi-column; a NULL in the key is unconstrained, as MATCH SIMPLE requires",
+				Setup: []string{"CREATE TABLE u (id INT PRIMARY KEY)"},
+				SQL:   "CREATE TABLE t (a INT REFERENCES u (id))"},
+			{Name: "Referential actions", Parse: Yes, Exec: Yes,
+				Note:  "ON DELETE and ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL and SET DEFAULT; cascades are part of the transaction",
+				Setup: []string{"CREATE TABLE u (id INT PRIMARY KEY)"},
+				SQL:   "CREATE TABLE t (a INT REFERENCES u (id) ON DELETE CASCADE ON UPDATE SET NULL)"},
 			{Name: "DROP TABLE", Parse: Planned, Exec: Planned, SQL: "DROP TABLE t"},
 			{Name: "ALTER TABLE", Parse: Planned, Exec: Planned, SQL: "ALTER TABLE t ADD COLUMN c INT"},
 			{Name: "CREATE INDEX", Parse: Planned, Exec: Planned, SQL: "CREATE INDEX i ON t (a)"},
@@ -361,6 +366,43 @@ var Groups = []Group{
 				Note: "every error carries a byte offset into the statement"},
 		},
 	},
+}
+
+// Badges renders the shields.io badge row for the README.
+//
+// The feature count comes from Summary rather than being written by hand, so it
+// cannot drift from the registry the way a hard-coded number would — and the
+// README test regenerates it along with the table.
+func Badges(module, repo, goVersion string) string {
+	yes, partial, _, _ := Summary()
+
+	badge := func(label, message, colour, link string) string {
+		img := fmt.Sprintf("https://img.shields.io/badge/%s-%s-%s?style=flat-square",
+			escapeBadge(label), escapeBadge(message), colour)
+		if link == "" {
+			return fmt.Sprintf("![%s](%s)", label, img)
+		}
+		return fmt.Sprintf("[![%s](%s)](%s)", label, img, link)
+	}
+
+	return strings.Join([]string{
+		fmt.Sprintf("[![Go Reference](https://pkg.go.dev/badge/%s.svg)](https://pkg.go.dev/%s)", module, module),
+		fmt.Sprintf("[![CI](https://github.com/%s/actions/workflows/ci.yml/badge.svg)](https://github.com/%s/actions/workflows/ci.yml)", repo, repo),
+		fmt.Sprintf("[![Go Report Card](https://goreportcard.com/badge/%s?style=flat-square)](https://goreportcard.com/report/%s)", module, module),
+		badge("go", goVersion+"+", "00ADD8", ""),
+		badge("license", "Apache--2.0", "blue", "LICENSE"),
+		badge("SQL features", fmt.Sprintf("%d supported", yes+partial), "success", "#compatibility"),
+		badge("dependencies", "0", "success", ""),
+	}, "\n") + "\n"
+}
+
+// escapeBadge encodes the characters shields.io treats specially in a path
+// segment: a dash must be doubled, an underscore or a space becomes an
+// underscore.
+func escapeBadge(s string) string {
+	s = strings.ReplaceAll(s, "-", "--")
+	s = strings.ReplaceAll(s, "_", "__")
+	return strings.ReplaceAll(s, " ", "_")
 }
 
 // Markdown renders the whole matrix.

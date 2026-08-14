@@ -121,6 +121,7 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 	// ordinal is known: a table-level key may name a column declared later.
 	var keys []keySpec
 	var checks []catalog.Check
+	var refs []refSpec
 
 	for _, cd := range s.Columns {
 		typ, err := catalog.ResolveType(cd.Type.Name, cd.Type.Mods)
@@ -159,6 +160,10 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 				col.Default = c.Expr
 			case ast.ConstraintCheck:
 				checks = append(checks, catalog.Check{Name: c.Name.Name, Expr: c.Expr})
+			case ast.ConstraintReferences:
+				refs = append(refs, refSpec{
+					name: c.Name.Name, cols: []int{ordinal}, ref: c.Ref, pos: c.Pos(),
+				})
 			case ast.ConstraintNull:
 				// Explicit NULL is the default and carries no information.
 			default:
@@ -179,23 +184,21 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 		case ast.ConstraintCheck:
 			checks = append(checks, catalog.Check{Name: tc.Name.Name, Expr: tc.Expr})
 			continue
+		case ast.ConstraintReferences:
+			cols, err := columnOrdinals(t, tc.Columns)
+			if err != nil {
+				return nil, err
+			}
+			refs = append(refs, refSpec{name: tc.Name.Name, cols: cols, ref: tc.Ref, pos: tc.Pos()})
+			continue
 		default:
 			return nil, pgerr.Newf(pgerr.FeatureNotSupported,
 				"table-level %s constraints are not supported yet", tc.Kind).At(tc.Pos())
 		}
 
-		cols := make([]int, 0, len(tc.Columns))
-		for _, name := range tc.Columns {
-			i := indexOfColumn(t.Columns, name.Name)
-			if i < 0 {
-				return nil, pgerr.Newf(pgerr.UndefinedColumn,
-					"column %q named in key does not exist", name.Name).At(name.Pos())
-			}
-			if slices.Contains(cols, i) {
-				return nil, pgerr.Newf(pgerr.DuplicateColumn,
-					"column %q appears twice in key", name.Name).At(name.Pos())
-			}
-			cols = append(cols, i)
+		cols, err := columnOrdinals(t, tc.Columns)
+		if err != nil {
+			return nil, err
 		}
 		keys = append(keys, keySpec{name: tc.Name.Name, kind: kind, cols: cols, pos: tc.Pos()})
 	}
@@ -231,6 +234,16 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 	}
 	t.Checks = checks
 
+	// References resolve last: the referenced table must already exist, and
+	// this table's own columns must already be known.
+	for _, r := range refs {
+		fk, err := b.resolveForeignKey(t, r)
+		if err != nil {
+			return nil, err
+		}
+		t.ForeignKeys = append(t.ForeignKeys, fk)
+	}
+
 	return &plan.CreateTable{Table: t, IfNotExists: s.IfNotExists}, nil
 }
 
@@ -263,6 +276,24 @@ func (b *Binder) bindDefault(e ast.Expr, want types.Kind) (plan.Expr, error) {
 		return nil, err
 	}
 	return coerce(bound, want, e.Pos())
+}
+
+// EvalConstDefault binds a DEFAULT expression and evaluates it.
+//
+// Defaults are constant expressions bound in an empty scope, so this needs no
+// row and no arguments. It exists for referential SET DEFAULT, which has no
+// statement of its own to bind against.
+func (b *Binder) EvalConstDefault(e ast.Expr, want types.Kind) (types.Value, error) {
+	bound, err := b.bindDefault(e, want)
+	if err != nil {
+		return types.Value{}, err
+	}
+	c, ok := bound.(*plan.Const)
+	if !ok {
+		return types.Value{}, pgerr.Newf(pgerr.FeatureNotSupported,
+			"only a constant DEFAULT can be applied by a referential action")
+	}
+	return c.Val, nil
 }
 
 // bindCheck binds a CHECK predicate against the table's own columns.
@@ -350,6 +381,166 @@ func derivedKeyName(t *catalog.Table, k keySpec) string {
 	}
 	parts = append(parts, "key")
 	return strings.Join(parts, "_")
+}
+
+// refSpec is a foreign key collected while walking a CREATE TABLE, before the
+// referenced table has been looked up.
+type refSpec struct {
+	name string
+	cols []int
+	ref  *ast.ForeignKeyRef
+	pos  token.Pos
+}
+
+// resolveForeignKey turns a written REFERENCES clause into a catalog entry,
+// and registers it on the referenced table so a later delete can find it.
+func (b *Binder) resolveForeignKey(t *catalog.Table, r refSpec) (catalog.ForeignKey, error) {
+	parent, err := b.referencedTable(t, r)
+	if err != nil {
+		return catalog.ForeignKey{}, err
+	}
+
+	parentCols, err := b.referencedColumns(parent, r)
+	if err != nil {
+		return catalog.ForeignKey{}, err
+	}
+	if len(parentCols) != len(r.cols) {
+		return catalog.ForeignKey{}, pgerr.Newf(pgerr.SyntaxError,
+			"number of referencing and referenced columns for foreign key disagree").At(r.pos)
+	}
+
+	// The referenced columns must be unique. Without that a child row could
+	// match several parents, and CASCADE would have no single row to follow —
+	// so PostgreSQL requires it, and so does this.
+	if !hasUniqueKeyOver(parent, parentCols) {
+		names := make([]string, len(parentCols))
+		for i, ord := range parentCols {
+			names[i] = parent.Columns[ord].Name
+		}
+		return catalog.ForeignKey{}, pgerr.Newf(pgerr.UndefinedObject,
+			"there is no unique constraint matching given keys for referenced table %q",
+			parent.Name).WithDetail("Columns (%s) must carry a primary key or unique constraint.",
+			strings.Join(names, ", ")).At(r.pos)
+	}
+
+	// The types must match, or a comparison between them would be meaningless.
+	for i, ord := range r.cols {
+		if got, want := t.Columns[ord].Type.Kind, parent.Columns[parentCols[i]].Type.Kind; got != want {
+			return catalog.ForeignKey{}, pgerr.Newf(pgerr.DatatypeMismatch,
+				"foreign key constraint cannot be implemented: column %q is %s and referenced column %q is %s",
+				t.Columns[ord].Name, got, parent.Columns[parentCols[i]].Name, want).At(r.pos)
+		}
+	}
+
+	name := r.name
+	if name == "" {
+		name = t.Name + "_" + t.Columns[r.cols[0]].Name + "_fkey"
+	}
+	fk := catalog.ForeignKey{
+		Name: name, Columns: r.cols,
+		Parent: parent, ParentCols: parentCols,
+		OnDelete: refActionOf(r.ref.OnDelete),
+		OnUpdate: refActionOf(r.ref.OnUpdate),
+	}
+	// Registered on the parent as well, so a delete finds its children without
+	// scanning every table in the catalog.
+	parent.ReferencedBy = append(parent.ReferencedBy, catalog.Referencing{Child: t, FK: &fk})
+	return fk, nil
+}
+
+// referencedTable resolves the target, allowing a table to reference itself
+// even though it is not in the catalog yet.
+func (b *Binder) referencedTable(t *catalog.Table, r refSpec) (*catalog.Table, error) {
+	name := r.ref.Table
+	schema := name.Schema.Name
+	if schema == "" {
+		schema = catalog.DefaultSchema
+	}
+	self := t.Schema
+	if self == "" {
+		self = catalog.DefaultSchema
+	}
+	// A self-reference is legal and common — a tree stored as parent_id — and
+	// the table is still being built, so it cannot be looked up.
+	if schema == self && name.Name.Name == t.Name {
+		return t, nil
+	}
+
+	parent, err := b.cat.Lookup(schema, name.Name.Name)
+	if err != nil {
+		return nil, at(err, name.Pos())
+	}
+	return parent, nil
+}
+
+// referencedColumns resolves the target columns, defaulting to the referenced
+// table's primary key when the clause names none.
+func (b *Binder) referencedColumns(parent *catalog.Table, r refSpec) ([]int, error) {
+	if len(r.ref.Columns) > 0 {
+		return columnOrdinals(parent, r.ref.Columns)
+	}
+	for _, c := range parent.Constraints {
+		if c.Kind == catalog.PrimaryKeyConstraint {
+			return c.Columns, nil
+		}
+	}
+	return nil, pgerr.Newf(pgerr.UndefinedObject,
+		"there is no primary key for referenced table %q", parent.Name).At(r.pos)
+}
+
+// hasUniqueKeyOver reports whether a constraint covers exactly the given
+// columns, in any order.
+func hasUniqueKeyOver(t *catalog.Table, cols []int) bool {
+	for _, c := range t.Constraints {
+		if len(c.Columns) != len(cols) {
+			continue
+		}
+		match := true
+		for _, ord := range cols {
+			if !slices.Contains(c.Columns, ord) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func refActionOf(a ast.RefAction) catalog.RefAction {
+	switch a {
+	case ast.Cascade:
+		return catalog.Cascade
+	case ast.SetNull:
+		return catalog.SetNull
+	case ast.SetDefault:
+		return catalog.SetDefault
+	case ast.Restrict:
+		return catalog.Restrict
+	default:
+		return catalog.NoAction
+	}
+}
+
+// columnOrdinals resolves a list of column names against a table under
+// construction, rejecting unknown and repeated names.
+func columnOrdinals(t *catalog.Table, names []ast.Name) ([]int, error) {
+	cols := make([]int, 0, len(names))
+	for _, name := range names {
+		i := indexOfColumn(t.Columns, name.Name)
+		if i < 0 {
+			return nil, pgerr.Newf(pgerr.UndefinedColumn,
+				"column %q named in key does not exist", name.Name).At(name.Pos())
+		}
+		if slices.Contains(cols, i) {
+			return nil, pgerr.Newf(pgerr.DuplicateColumn,
+				"column %q appears twice in key", name.Name).At(name.Pos())
+		}
+		cols = append(cols, i)
+	}
+	return cols, nil
 }
 
 func indexOfColumn(cols []catalog.Column, name string) int {

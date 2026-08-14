@@ -529,6 +529,11 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		if err := runChecks(checks, args, next, up.Table.Name); err != nil {
 			return Result{}, err
 		}
+		// A key the children point at is changing, so they have to be dealt
+		// with before the parent row moves out from under them.
+		if err := applyRefActions(tx, up.Table, v.Vals, next, onUpdate); err != nil {
+			return Result{}, err
+		}
 		if err := up.Table.Update(tx, v, next); err != nil {
 			return Result{}, err
 		}
@@ -547,6 +552,9 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 	// Uniqueness is checked once the statement has finished writing, so a row
 	// keeping its own value does not conflict with itself.
 	if err := up.Table.CheckConstraints(tx); err != nil {
+		return Result{}, err
+	}
+	if err := up.Table.CheckForeignKeys(tx); err != nil {
 		return Result{}, err
 	}
 	return res, nil
@@ -583,12 +591,115 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 			}
 			res.Rows = append(res.Rows, out)
 		}
+		if err := applyRefActions(tx, del.Table, v.Vals, nil, onDelete); err != nil {
+			return Result{}, err
+		}
 		if err := del.Table.Delete(tx, v); err != nil {
 			return Result{}, err
 		}
 		res.Affected++
 	}
 	return res, nil
+}
+
+// refEvent distinguishes which of a foreign key's two actions applies.
+type refEvent int
+
+const (
+	onDelete refEvent = iota
+	onUpdate
+)
+
+// applyRefActions deals with the rows referencing a parent row that is about to
+// be deleted or have its key changed.
+//
+// next is the replacement row for an update, or nil for a delete. An update
+// whose key columns are unchanged is not a referential event at all, which is
+// why the comparison happens here rather than at the call site: `UPDATE parent
+// SET name = ...` must not cascade.
+func applyRefActions(tx *storage.Tx, parent *catalog.Table, old, next []types.Value, ev refEvent) error {
+	if len(parent.ReferencedBy) == 0 {
+		return nil
+	}
+
+	for _, group := range parent.ChildrenOf(tx, old) {
+		fk := group.Ref.FK
+		action := fk.OnDelete
+		if ev == onUpdate {
+			action = fk.OnUpdate
+			// Only a change to the referenced columns matters.
+			if next != nil && matchesParentKey(old, next, fk.ParentCols) {
+				continue
+			}
+		}
+
+		for _, child := range group.Rows {
+			if err := applyRefAction(tx, group.Ref.Child, fk, child, next, action); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func matchesParentKey(old, next []types.Value, cols []int) bool {
+	for _, ord := range cols {
+		if !types.Equal(old[ord], next[ord]) {
+			return false
+		}
+	}
+	return true
+}
+
+func applyRefAction(tx *storage.Tx, childTable *catalog.Table, fk *catalog.ForeignKey,
+	child *storage.Version, next []types.Value, action catalog.RefAction) error {
+
+	switch action {
+	case catalog.Cascade:
+		if next == nil {
+			return childTable.Delete(tx, child)
+		}
+		// The parent's key moved, so the child follows it.
+		updated := make([]types.Value, len(child.Vals))
+		copy(updated, child.Vals)
+		for i, ord := range fk.Columns {
+			updated[ord] = next[fk.ParentCols[i]]
+		}
+		return childTable.Update(tx, child, updated)
+
+	case catalog.SetNull, catalog.SetDefault:
+		updated := make([]types.Value, len(child.Vals))
+		copy(updated, child.Vals)
+		for _, ord := range fk.Columns {
+			v, err := refReplacement(childTable, ord, action)
+			if err != nil {
+				return err
+			}
+			updated[ord] = v
+		}
+		return childTable.Update(tx, child, updated)
+
+	default: // NoAction, Restrict
+		return pgerr.Newf(pgerr.ForeignKeyViolation,
+			"update or delete on table %q violates foreign key constraint %q on table %q",
+			fk.Parent.Name, fk.Name, childTable.Name).
+			WithDetail("Key is still referenced from table %q.", childTable.Name)
+	}
+}
+
+// refReplacement produces the value SET NULL or SET DEFAULT puts in a
+// referencing column.
+func refReplacement(t *catalog.Table, ordinal int, action catalog.RefAction) (types.Value, error) {
+	if action == catalog.SetNull {
+		return types.Null(), nil
+	}
+	// SET DEFAULT without a DEFAULT on the column means NULL, which then has to
+	// satisfy NOT NULL like any other value rather than being waved through.
+	col := t.Columns[ordinal]
+	if col.Default == nil {
+		return types.Null(), nil
+	}
+	return t.EvalDefault(ordinal)
 }
 
 // compilePredicate turns an optional WHERE into a row test. A missing clause
@@ -688,6 +799,9 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 	// Checked once the statement has written every row, so a multi-row INSERT
 	// is validated against its own rows as well as the existing ones.
 	if err := ins.Table.CheckConstraints(tx); err != nil {
+		return res, err
+	}
+	if err := ins.Table.CheckForeignKeys(tx); err != nil {
 		return res, err
 	}
 	return res, nil
