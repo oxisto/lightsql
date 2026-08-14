@@ -19,6 +19,15 @@ const (
 	readmePath = "../../README.md"
 	beginMark  = "<!-- BEGIN GENERATED COMPATIBILITY -->"
 	endMark    = "<!-- END GENERATED COMPATIBILITY -->"
+	badgeBegin = "<!-- BEGIN GENERATED BADGES -->"
+	badgeEnd   = "<!-- END GENERATED BADGES -->"
+
+	// module and goVersion feed the badges. They are constants here rather than
+	// read from go.mod because a badge pointing at the wrong module is worse
+	// than one that fails this test when the module is renamed.
+	module    = "github.com/oxisto/lightsql"
+	repo      = "oxisto/lightsql"
+	goVersion = "1.26"
 )
 
 // TestProbesMatchStatus is what keeps the matrix honest. Every feature claiming
@@ -169,7 +178,11 @@ func TestREADMEIsGenerated(t *testing.T) {
 		t.Fatalf("reading README: %v", err)
 	}
 
-	want, err := replaceSection(string(current), Markdown())
+	want, err := replaceSection(string(current), beginMark, endMark, "\n\n"+Markdown()+"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err = replaceSection(want, badgeBegin, badgeEnd, "\n"+Badges(module, repo, goVersion))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,16 +204,16 @@ func TestREADMEIsGenerated(t *testing.T) {
 // replaceSection swaps the content between the generated-section markers,
 // leaving the rest of the file alone so the README stays hand-written apart
 // from the matrix.
-func replaceSection(doc, section string) (string, error) {
-	start := strings.Index(doc, beginMark)
-	if start < 0 {
-		return "", errMissingMarker(beginMark)
+func replaceSection(doc, begin, end, section string) (string, error) {
+	i := strings.Index(doc, begin)
+	if i < 0 {
+		return "", errMissingMarker(begin)
 	}
-	end := strings.Index(doc, endMark)
-	if end < 0 || end < start {
-		return "", errMissingMarker(endMark)
+	j := strings.Index(doc, end)
+	if j < 0 || j < i {
+		return "", errMissingMarker(end)
 	}
-	return doc[:start+len(beginMark)] + "\n\n" + section + "\n" + doc[end:], nil
+	return doc[:i+len(begin)] + section + doc[j:], nil
 }
 
 type errMissingMarker string

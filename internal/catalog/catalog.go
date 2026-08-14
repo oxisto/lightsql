@@ -79,6 +79,61 @@ type Constraint struct {
 	Columns []int
 }
 
+// RefAction is what happens to a referencing row when the row it points at is
+// deleted or has its key updated.
+type RefAction uint8
+
+const (
+	// NoAction and Restrict both refuse the change while references remain.
+	// PostgreSQL distinguishes them by when the check runs — NO ACTION can be
+	// deferred to end of transaction — but lightsql has no deferred
+	// constraints, so the two behave identically and the pair is kept only so
+	// that a schema reads back as it was written.
+	NoAction RefAction = iota
+	Restrict
+	// Cascade applies the change to the referencing rows too.
+	Cascade
+	// SetNull clears the referencing columns.
+	SetNull
+	// SetDefault puts the referencing columns back to their DEFAULT.
+	SetDefault
+)
+
+var refActionNames = [...]string{
+	NoAction: "NO ACTION", Restrict: "RESTRICT", Cascade: "CASCADE",
+	SetNull: "SET NULL", SetDefault: "SET DEFAULT",
+}
+
+func (a RefAction) String() string { return refActionNames[a] }
+
+// ForeignKey requires that this table's Columns match a row of Parent.
+//
+// Both sides are ordinals, resolved once when the table is created, so
+// enforcement never looks a name up again.
+type ForeignKey struct {
+	Name    string
+	Columns []int
+	// Parent is the referenced table, and ParentCols the columns matched
+	// against. They must carry a primary key or unique constraint, or a
+	// reference could match several rows and the actions below would be
+	// ambiguous.
+	Parent     *Table
+	ParentCols []int
+	OnDelete   RefAction
+	OnUpdate   RefAction
+}
+
+// Referencing is a foreign key pointing *at* a table, held by the table it
+// points at.
+//
+// A delete or key update has to find every table that references the one being
+// changed, and searching the whole catalog per statement would make the cost of
+// a delete depend on how many unrelated tables exist.
+type Referencing struct {
+	Child *Table
+	FK    *ForeignKey
+}
+
 // Check is a CHECK constraint: a predicate over a single row.
 //
 // It is kept apart from Constraint because the two are enforced by different
@@ -106,6 +161,22 @@ type Table struct {
 	Constraints []Constraint
 	// Checks are the table's CHECK constraints, evaluated per row.
 	Checks []Check
+	// ForeignKeys are the references this table makes to others.
+	ForeignKeys []ForeignKey
+	// referencedBy are the references other tables make to this one, so a
+	// delete or key update can find them without scanning the catalog.
+	//
+	// It is unexported and reached only through the methods below, because the
+	// binder appends to it while CREATE TABLE runs and the executor reads it
+	// while a concurrent DELETE runs. A shared engine behind a connection pool
+	// makes that a real data race, so the slice must never escape the lock.
+	referencedBy []Referencing
+	// refsMu guards referencedBy. It is separate from mu, which the per-insert
+	// serial path takes, so a foreign-key read does not queue behind sequence
+	// allocation.
+	refsMu sync.RWMutex
+	// defaultEval evaluates a DEFAULT expression; see SetDefaultEvaluator.
+	defaultEval DefaultEvaluator
 	// byName resolves a column name to its ordinal. Every reference below the
 	// binder is an ordinal; this map is consulted during binding only.
 	byName map[string]int
@@ -188,6 +259,151 @@ func (t *Table) Update(tx *storage.Tx, old *storage.Version, vals []types.Value)
 // Delete removes a row version.
 func (t *Table) Delete(tx *storage.Tx, v *storage.Version) error {
 	return t.heap.Delete(tx.ID, v)
+}
+
+// EvalDefault produces a column's DEFAULT value.
+//
+// This is for SET DEFAULT, which needs the value outside the binder's usual
+// path: a referential action has no statement of its own to bind against. The
+// expression is bound and evaluated here in an empty scope, exactly as an
+// omitted column in an INSERT would be.
+func (t *Table) EvalDefault(ordinal int) (types.Value, error) {
+	col := t.Columns[ordinal]
+	if col.Default == nil {
+		return types.Null(), nil
+	}
+	if t.defaultEval == nil {
+		return types.Null(), pgerr.Newf(pgerr.InternalError,
+			"no default evaluator installed for %q", t.Name)
+	}
+	return t.defaultEval(col.Default, col.Type.Kind)
+}
+
+// SetDefaultEvaluator installs the function that turns a written DEFAULT
+// expression into a value.
+//
+// The catalog stores defaults as syntax and cannot evaluate them itself — the
+// binder and executor both sit above it. Rather than invert that dependency,
+// the engine hands the catalog a closure at startup.
+func (c *Catalog) SetDefaultEvaluator(fn DefaultEvaluator) { c.defaultEval = fn }
+
+// DefaultEvaluator binds and evaluates a DEFAULT expression for a column type.
+type DefaultEvaluator func(expr ast.Expr, want types.Kind) (types.Value, error)
+
+// CheckForeignKeys verifies that every row this transaction can see satisfies
+// the table's outgoing references.
+//
+// It runs once at the end of a statement, like the uniqueness check, so a
+// statement that temporarily points at a row it is about to insert is judged on
+// where it ends up rather than on the order its rows happened to be written.
+func (t *Table) CheckForeignKeys(tx *storage.Tx) error {
+	if len(t.ForeignKeys) == 0 {
+		return nil
+	}
+	for _, row := range t.Rows(tx) {
+		for i := range t.ForeignKeys {
+			if err := t.checkReference(tx, &t.ForeignKeys[i], row); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkReference verifies one row against one foreign key.
+func (t *Table) checkReference(tx *storage.Tx, fk *ForeignKey, row []types.Value) error {
+	// A NULL anywhere in the key satisfies the constraint. This is SQL's MATCH
+	// SIMPLE, the default: a reference that is not fully specified does not
+	// point anywhere, so there is nothing for it to fail to match.
+	if anyNull(row, fk.Columns) {
+		return nil
+	}
+	if parentHasKey(tx, fk, row) {
+		return nil
+	}
+
+	names := make([]string, len(fk.Columns))
+	vals := make([]string, len(fk.Columns))
+	for i, ord := range fk.Columns {
+		names[i] = t.Columns[ord].Name
+		vals[i] = row[ord].String()
+	}
+	return pgerr.Newf(pgerr.ForeignKeyViolation,
+		"insert or update on table %q violates foreign key constraint %q", t.Name, fk.Name).
+		WithDetail("Key (%s)=(%s) is not present in table %q.",
+			strings.Join(names, ", "), strings.Join(vals, ", "), fk.Parent.Name)
+}
+
+// parentHasKey reports whether the referenced table holds a row matching the
+// child's key, as seen by this transaction.
+//
+// It is a scan of the parent per row checked. There are no indexes yet, so the
+// cost of an insert is proportional to the parent table; an index on the
+// referenced columns is the first thing that would fix it.
+func parentHasKey(tx *storage.Tx, fk *ForeignKey, child []types.Value) bool {
+	for _, prow := range fk.Parent.Rows(tx) {
+		if matchesKey(child, fk.Columns, prow, fk.ParentCols) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesKey reports whether two rows agree across a pair of column lists.
+func matchesKey(a []types.Value, aCols []int, b []types.Value, bCols []int) bool {
+	for i, ord := range aCols {
+		if !types.Equal(a[ord], b[bCols[i]]) {
+			return false
+		}
+	}
+	return true
+}
+
+// ChildrenOf returns the rows of referencing tables that point at the given
+// parent row, grouped by the reference that found them.
+func (t *Table) ChildrenOf(tx *storage.Tx, parent []types.Value) []ChildRows {
+	t.refsMu.RLock()
+	defer t.refsMu.RUnlock()
+
+	var out []ChildRows
+	for _, ref := range t.referencedBy {
+		var rows []*storage.Version
+		for _, v := range ref.Child.Scan(tx) {
+			if anyNull(v.Vals, ref.FK.Columns) {
+				continue // an unspecified reference points at nothing
+			}
+			if matchesKey(v.Vals, ref.FK.Columns, parent, ref.FK.ParentCols) {
+				rows = append(rows, v)
+			}
+		}
+		if len(rows) > 0 {
+			out = append(out, ChildRows{Ref: ref, Rows: rows})
+		}
+	}
+	return out
+}
+
+// AddReferencing records an incoming foreign key. The binder calls it while
+// binding the child's CREATE TABLE, which can run concurrently with a statement
+// on the parent.
+func (t *Table) AddReferencing(r Referencing) {
+	t.refsMu.Lock()
+	defer t.refsMu.Unlock()
+	t.referencedBy = append(t.referencedBy, r)
+}
+
+// IsReferenced reports whether any table points at this one, so a delete can
+// skip the referential-action machinery entirely.
+func (t *Table) IsReferenced() bool {
+	t.refsMu.RLock()
+	defer t.refsMu.RUnlock()
+	return len(t.referencedBy) > 0
+}
+
+// ChildRows are the referencing rows found for one incoming foreign key.
+type ChildRows struct {
+	Ref  Referencing
+	Rows []*storage.Version
 }
 
 // CheckConstraints validates the table's uniqueness constraints over the rows
@@ -318,6 +534,8 @@ type Catalog struct {
 	// mgr is handed to each table's heap so that visibility is judged
 	// consistently across the whole instance.
 	mgr *storage.TxManager
+	// defaultEval is handed to each table so SET DEFAULT can produce a value.
+	defaultEval DefaultEvaluator
 
 	mu     sync.RWMutex
 	tables map[string]*Table
@@ -341,6 +559,7 @@ func (c *Catalog) CreateTable(t *Table, ifNotExists bool) (created bool, err err
 		return false, err
 	}
 	t.heap = storage.NewHeap(c.mgr)
+	t.defaultEval = c.defaultEval
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -353,6 +572,17 @@ func (c *Catalog) CreateTable(t *Table, ifNotExists bool) (created bool, err err
 		return false, pgerr.Newf(pgerr.DuplicateTable, "relation %q already exists", t.Name)
 	}
 	c.tables[k] = t
+
+	// Register the incoming references only now, with the table complete and in
+	// the catalog. Doing it during binding published a half-built table — one
+	// whose heap was not yet assigned — to any statement already walking the
+	// parent's children. Taking the address of the slice element rather than of
+	// a local also means the parent and the child share one foreign key, so a
+	// later change to it cannot be seen by only one of them.
+	for i := range t.ForeignKeys {
+		fk := &t.ForeignKeys[i]
+		fk.Parent.AddReferencing(Referencing{Child: t, FK: fk})
+	}
 	return true, nil
 }
 

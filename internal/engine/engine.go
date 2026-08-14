@@ -30,7 +30,12 @@ type Engine struct {
 func New() *Engine {
 	mgr := storage.NewTxManager()
 	cat := catalog.New(mgr)
-	return &Engine{mgr: mgr, cat: cat, bnd: binder.New(cat)}
+	bnd := binder.New(cat)
+	// The catalog stores DEFAULT expressions as syntax and cannot evaluate them
+	// itself, so it is handed a closure rather than the dependency being
+	// inverted. SET DEFAULT on a foreign key is the only caller.
+	cat.SetDefaultEvaluator(bnd.EvalConstDefault)
+	return &Engine{mgr: mgr, cat: cat, bnd: bnd}
 }
 
 // BeginTx starts an explicit transaction.

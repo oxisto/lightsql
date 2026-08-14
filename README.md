@@ -1,5 +1,15 @@
 # lightsql
 
+<!-- BEGIN GENERATED BADGES -->
+[![Go Reference](https://pkg.go.dev/badge/github.com/oxisto/lightsql.svg)](https://pkg.go.dev/github.com/oxisto/lightsql)
+[![CI](https://github.com/oxisto/lightsql/actions/workflows/ci.yml/badge.svg)](https://github.com/oxisto/lightsql/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
+![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
+[![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
+[![SQL features](https://img.shields.io/badge/SQL_features-48_supported-success?style=flat-square)](#compatibility)
+![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
+<!-- END GENERATED BADGES -->
+
 A small, embeddable SQL engine for Go that speaks the PostgreSQL dialect and plugs
 straight into `database/sql`. Run it entirely in memory for tests, or point it at a
 directory for a small file-backed deployment.
@@ -7,9 +17,10 @@ directory for a small file-backed deployment.
 > **Status: the core engine works.** `CREATE TABLE`, `INSERT`, `SELECT ... WHERE
 > ... ORDER BY ... LIMIT`, `UPDATE`, `DELETE` and `RETURNING` all run end to end
 > through `database/sql`, with `NOT NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT` and
-> `CHECK` enforced, and real transactions on MVCC — `Begin`, `Commit` and
-> `Rollback` work, and `sql.TxOptions` isolation levels are honoured rather than
-> ignored. Joins, aggregates and file-backed storage are not implemented yet.
+> `CHECK` and foreign keys enforced, and real transactions on MVCC — `Begin`,
+> `Commit` and `Rollback` work, and `sql.TxOptions` isolation levels are honoured
+> rather than ignored. Joins, aggregates and file-backed storage are not
+> implemented yet.
 > The compatibility matrix below is generated from the code, and every row is backed by
 > a probe that is actually run — see [Compatibility](#compatibility).
 
@@ -122,11 +133,12 @@ the two.
 | | **Data definition** | | | |
 | ✅ | CREATE TABLE | ✅ | ✅ |  |
 | ✅ | CREATE TABLE IF NOT EXISTS | ✅ | ✅ |  |
-| 🟡 | Column constraints | ✅ | 🟡 | NOT NULL, PRIMARY KEY, UNIQUE, DEFAULT and CHECK are enforced; REFERENCES is rejected until foreign keys land |
-| 🟡 | Table constraints | ✅ | 🟡 | PRIMARY KEY, UNIQUE and CHECK, with keys over several columns requiring the combination to be unique; FOREIGN KEY is rejected until foreign keys land |
+| ✅ | Column constraints | ✅ | ✅ | NOT NULL, PRIMARY KEY, UNIQUE, DEFAULT, CHECK and REFERENCES are all enforced |
+| ✅ | Table constraints | ✅ | ✅ | PRIMARY KEY, UNIQUE, CHECK and FOREIGN KEY, with keys over several columns requiring the combination to be unique |
 | ✅ | DEFAULT values | ✅ | ✅ | any constant expression; an omitted column takes it, an explicit NULL overrides it |
 | ✅ | CHECK constraints | ✅ | ✅ | column and table level, enforced on insert and update; satisfied by true or unknown, so a NULL does not violate one |
-| ⬜ | Referential actions | ✅ | ⬜ | ON DELETE / ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT |
+| ✅ | Foreign keys | ✅ | ✅ | column and table level, single and multi-column; a NULL in the key is unconstrained, as MATCH SIMPLE requires |
+| ✅ | Referential actions | ✅ | ✅ | ON DELETE and ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL and SET DEFAULT; cascades are part of the transaction |
 | ⬜ | DROP TABLE | ⬜ | ⬜ |  |
 | ⬜ | ALTER TABLE | ⬜ | ⬜ |  |
 | ⬜ | CREATE INDEX | ⬜ | ⬜ |  |

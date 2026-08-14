@@ -1555,6 +1555,208 @@ func TestReadOnlyRefusesDDL(t *testing.T) {
 	}
 }
 
+// fkFixture creates a parent and a child table whose reference uses the given
+// referential actions.
+func fkFixture(t *testing.T, db *sql.DB, actions string) {
+	t.Helper()
+	if _, err := db.Exec(`
+		CREATE TABLE parent (id INT PRIMARY KEY, label TEXT);
+		CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent (id) ` + actions + `);
+		INSERT INTO parent (id, label) VALUES (1, 'a'), (2, 'b');
+		INSERT INTO child (id, pid) VALUES (10, 1), (11, 1), (12, 2);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+}
+
+func TestForeignKeyRejectsMissingParent(t *testing.T) {
+	db := open(t)
+	fkFixture(t, db, "")
+
+	// A reference to a row that does not exist is refused.
+	_, err := db.Exec(`INSERT INTO child (id, pid) VALUES (99, 404)`)
+	if got := sqlstate(err); got != "23503" {
+		t.Errorf("insert with a missing parent gave %v (SQLSTATE %q), want 23503", err, got)
+	}
+	// So is an update that points a row at nothing.
+	_, err = db.Exec(`UPDATE child SET pid = 404 WHERE id = 10`)
+	if got := sqlstate(err); got != "23503" {
+		t.Errorf("update to a missing parent gave %v (SQLSTATE %q), want 23503", err, got)
+	}
+	// An existing parent is fine.
+	if _, err := db.Exec(`INSERT INTO child (id, pid) VALUES (13, 2)`); err != nil {
+		t.Errorf("insert with a valid parent was rejected: %v", err)
+	}
+}
+
+// TestForeignKeyNullIsUnconstrained pins SQL's MATCH SIMPLE default: a NULL in
+// the key means the reference is not specified, so there is nothing for it to
+// fail to match. Treating NULL as a value to look up would reject rows
+// PostgreSQL accepts.
+func TestForeignKeyNullIsUnconstrained(t *testing.T) {
+	db := open(t)
+	fkFixture(t, db, "")
+
+	if _, err := db.Exec(`INSERT INTO child (id, pid) VALUES (20, NULL)`); err != nil {
+		t.Errorf("a NULL reference was rejected: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE child SET pid = NULL WHERE id = 10`); err != nil {
+		t.Errorf("setting a reference to NULL was rejected: %v", err)
+	}
+}
+
+func TestForeignKeyReferentialActions(t *testing.T) {
+	tests := []struct {
+		name      string
+		actions   string
+		deleteErr string // SQLSTATE expected from deleting parent 1, "" if allowed
+		wantChild []int  // child ids remaining afterwards
+		wantPid   string // pid of child 10 afterwards, "" if the row is gone
+	}{
+		{
+			// The default refuses while references remain.
+			name: "no action", actions: "", deleteErr: "23503",
+			wantChild: []int{10, 11, 12}, wantPid: "1",
+		},
+		{
+			name: "restrict", actions: "ON DELETE RESTRICT", deleteErr: "23503",
+			wantChild: []int{10, 11, 12}, wantPid: "1",
+		},
+		{
+			// The children go with the parent.
+			name: "cascade", actions: "ON DELETE CASCADE",
+			wantChild: []int{12},
+		},
+		{
+			// The children stay, pointing at nothing.
+			name: "set null", actions: "ON DELETE SET NULL",
+			wantChild: []int{10, 11, 12}, wantPid: "NULL",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := open(t)
+			fkFixture(t, db, tt.actions)
+
+			_, err := db.Exec(`DELETE FROM parent WHERE id = 1`)
+			if got := sqlstate(err); got != tt.deleteErr {
+				t.Fatalf("delete gave %v (SQLSTATE %q), want %q", err, got, tt.deleteErr)
+			}
+
+			if got := queryInts(t, db, `SELECT id FROM child ORDER BY id`); !equalInts(got, tt.wantChild) {
+				t.Errorf("remaining child ids = %v, want %v", got, tt.wantChild)
+			}
+			if tt.wantPid != "" {
+				got := queryStrings(t, db, `SELECT pid FROM child WHERE id = 10`)
+				if len(got) != 1 || got[0] != tt.wantPid {
+					t.Errorf("child 10 pid = %v, want [%s]", got, tt.wantPid)
+				}
+			}
+		})
+	}
+}
+
+// TestForeignKeyOnUpdateCascade checks the other half of the actions, and that
+// an update which does not touch the referenced key is not a referential event
+// at all.
+func TestForeignKeyOnUpdateCascade(t *testing.T) {
+	db := open(t)
+	fkFixture(t, db, "ON UPDATE CASCADE")
+
+	// Changing a column the children do not reference must not disturb them.
+	if _, err := db.Exec(`UPDATE parent SET label = 'renamed' WHERE id = 1`); err != nil {
+		t.Fatalf("UPDATE of a non-key column: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT pid FROM child WHERE id = 10`); !equalInts(got, []int{1}) {
+		t.Errorf("a non-key update disturbed the children: pid = %v, want [1]", got)
+	}
+
+	// Changing the key drags the children with it.
+	if _, err := db.Exec(`UPDATE parent SET id = 100 WHERE id = 1`); err != nil {
+		t.Fatalf("UPDATE of the key: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT pid FROM child ORDER BY id`); !equalInts(got, []int{100, 100, 2}) {
+		t.Errorf("after ON UPDATE CASCADE, pids = %v, want [100 100 2]", got)
+	}
+}
+
+// TestForeignKeyRollsBackWithTheTransaction checks that a cascade is part of the
+// transaction rather than a side effect that outlives it.
+func TestForeignKeyRollsBackWithTheTransaction(t *testing.T) {
+	db := open(t)
+	fkFixture(t, db, "ON DELETE CASCADE")
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM parent WHERE id = 1`); err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	if got := queryInts(t, db, `SELECT id FROM child ORDER BY id`); !equalInts(got, []int{10, 11, 12}) {
+		t.Errorf("after rollback, child ids = %v, want [10 11 12]; the cascade outlived its transaction", got)
+	}
+	if got := queryInts(t, db, `SELECT id FROM parent ORDER BY id`); !equalInts(got, []int{1, 2}) {
+		t.Errorf("after rollback, parent ids = %v, want [1 2]", got)
+	}
+}
+
+// TestForeignKeySelfReference covers a table pointing at itself, which is how a
+// tree is usually stored and which the binder has to allow even though the table
+// is not in the catalog yet while it is being created.
+func TestForeignKeySelfReference(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`
+		CREATE TABLE node (id INT PRIMARY KEY, parent_id INT REFERENCES node (id) ON DELETE CASCADE);
+		INSERT INTO node (id, parent_id) VALUES (1, NULL), (2, 1), (3, 1);
+	`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO node (id, parent_id) VALUES (4, 99)`); sqlstate(err) != "23503" {
+		t.Errorf("a self-reference to a missing row gave %v, want 23503", err)
+	}
+	if _, err := db.Exec(`DELETE FROM node WHERE id = 1`); err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	if got := queryInts(t, db, `SELECT id FROM node`); len(got) != 0 {
+		t.Errorf("after deleting the root, nodes = %v, want none", got)
+	}
+}
+
+func TestForeignKeyDefinitionErrors(t *testing.T) {
+	db := open(t)
+	if _, err := db.Exec(`CREATE TABLE p (id INT PRIMARY KEY, plain INT)`); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{"unknown table", `CREATE TABLE a (x INT REFERENCES nope (id))`, "42P01"},
+		{"unknown column", `CREATE TABLE b (x INT REFERENCES p (nope))`, "42703"},
+		// A reference must point at something unique, or a cascade would have
+		// no single row to follow.
+		{"not unique", `CREATE TABLE c (x INT REFERENCES p (plain))`, "42704"},
+		{"type mismatch", `CREATE TABLE d (x TEXT REFERENCES p (id))`, "42804"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := db.Exec(tt.query)
+			if got := sqlstate(err); got != tt.want {
+				t.Errorf("%s gave %v (SQLSTATE %q), want %q", tt.query, err, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestErrorsCarrySQLState checks the contract application code relies on to tell
 // one failure from another, using the same interface pgx and lib/pq expose.
 func TestErrorsCarrySQLState(t *testing.T) {
