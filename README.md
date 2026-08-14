@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-48_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-51_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -176,11 +176,11 @@ the two.
 | ✅ | Parameter placeholders | ✅ | ✅ | $1 and ?, not mixed in one statement; the type is inferred from context |
 | ⬜ | BETWEEN / IN / LIKE | ✅ | ⬜ | including the negated forms |
 | ⬜ | CASE | ✅ | ⬜ | simple and searched forms |
-| ⬜ | CAST | ✅ | ⬜ | both CAST(x AS t) and x::t |
+| ✅ | CAST | ✅ | ✅ | both CAST(x AS t) and x::t |
 | ⬜ | Scalar functions | ✅ | ⬜ | parsed generically; the function library is pending |
 | ❌ | Arrays | ❌ | ❌ | out of scope for v1 |
-| ⬜ | JSONB | ⬜ | ⬜ | planned: the jsonb type, the -> ->> and @> operators, and round-tripping through database/sql |
-| ⬜ | JSON | ⬜ | ⬜ | planned alongside JSONB; stored as given rather than normalised |
+| ✅ | JSONB | ✅ | ✅ | canonicalised on store; scans as []byte |
+| ✅ | JSON | ✅ | ✅ | kept exactly as written, unlike jsonb |
 | | **Types** | | | |
 | ✅ | Integer types | ✅ | ✅ | SMALLINT, INT, BIGINT stored as int64 |
 | ✅ | Floating point | ✅ | ✅ | REAL and DOUBLE PRECISION stored as float64 |

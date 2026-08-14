@@ -4,6 +4,7 @@ import (
 	"strconv"
 
 	"github.com/oxisto/lightsql/internal/ast"
+	"github.com/oxisto/lightsql/internal/catalog"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/plan"
 	"github.com/oxisto/lightsql/internal/token"
@@ -40,6 +41,9 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 			return nil, err
 		}
 		return &plan.IsNull{X: x, Negate: e.Negate}, nil
+
+	case *ast.CastExpr:
+		return bindCast(e, sc)
 
 	case *ast.UnaryExpr:
 		return bindUnary(e, sc)
@@ -82,6 +86,40 @@ func bindLiteral(e *ast.Literal) (plan.Expr, error) {
 			"invalid numeric literal %q", e.Val).At(e.Pos())
 	}
 	return &plan.Const{Val: types.Float(f)}, nil
+}
+
+// bindCast resolves CAST(x AS t) and its x::t spelling.
+//
+// Unlike coerce, which applies only the conversions PostgreSQL performs
+// implicitly, an explicit cast is the user asking for the conversion, so it is
+// attempted even where an implicit one would be refused.
+func bindCast(e *ast.CastExpr, sc *scope) (plan.Expr, error) {
+	x, err := bindExpr(e.X, sc)
+	if err != nil {
+		return nil, err
+	}
+	t, err := catalog.ResolveType(e.Type.Name, e.Type.Mods)
+	if err != nil {
+		return nil, pgerr.New(pgerr.UndefinedObject, err.Error()).At(e.Type.Pos())
+	}
+
+	if x.Type() == t.Kind {
+		return x, nil
+	}
+	// A parameter takes the cast type outright: $1::jsonb tells the executor
+	// what to convert the argument to, which is the whole point of writing it.
+	if p, ok := x.(*plan.Param); ok {
+		p.Kind = t.Kind
+		return p, nil
+	}
+	if c, ok := x.(*plan.Const); ok {
+		v, err := types.Cast(c.Val, t.Kind)
+		if err != nil {
+			return nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.X.Pos())
+		}
+		return &plan.Const{Val: v}, nil
+	}
+	return &plan.Cast{X: x, Kind: t.Kind}, nil
 }
 
 func bindUnary(e *ast.UnaryExpr, sc *scope) (plan.Expr, error) {
@@ -141,6 +179,36 @@ func bindBinary(e *ast.BinaryExpr, sc *scope) (plan.Expr, error) {
 		}
 		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: types.KindBool}, nil
 
+	case e.Op == ast.OpJSONField, e.Op == ast.OpJSONText:
+		if !isJSON(l.Type()) && l.Type() != types.KindNull {
+			return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+				"operator %s requires json or jsonb on the left, not %s", e.Op, l.Type()).At(e.OpPos)
+		}
+		// The right side selects either an object member by name or an array
+		// element by position, so both text and integer are legal and the
+		// choice is made per row rather than at bind time.
+		if r.Type() != types.KindText && r.Type() != types.KindInt && r.Type() != types.KindNull {
+			return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+				"operator %s requires text or integer on the right, not %s", e.Op, r.Type()).At(e.OpPos)
+		}
+		// -> keeps the document's own kind so that chained access stays JSON;
+		// ->> unwraps to text, which is the whole difference between them.
+		kind := l.Type()
+		if e.Op == ast.OpJSONText {
+			kind = types.KindText
+		}
+		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: kind}, nil
+
+	case e.Op == ast.OpJSONContains:
+		if !isJSON(l.Type()) && l.Type() != types.KindNull {
+			return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+				"operator %s requires json or jsonb, not %s", e.Op, l.Type()).At(e.OpPos)
+		}
+		if r, err = coerce(r, l.Type(), e.Y.Pos()); err != nil {
+			return nil, err
+		}
+		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: types.KindBool}, nil
+
 	case e.Op == ast.OpLike || e.Op == ast.OpNotLike:
 		if l, err = coerce(l, types.KindText, e.X.Pos()); err != nil {
 			return nil, err
@@ -165,6 +233,8 @@ func bindBinary(e *ast.BinaryExpr, sc *scope) (plan.Expr, error) {
 		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: kind}, nil
 	}
 }
+
+func isJSON(k types.Kind) bool { return k == types.KindJSON || k == types.KindJSONB }
 
 // unify brings two operands to a common type so the executor can compare or
 // combine them without inspecting types per row.
@@ -192,6 +262,30 @@ func unify(l, r plan.Expr, e *ast.BinaryExpr) (left, right plan.Expr, err error)
 		// needed; the value model handles it.
 		return l, r, nil
 	}
+
+	// A string literal compared against a document resolves to that document
+	// type. PostgreSQL gives a quoted literal the "unknown" type and lets the
+	// other operand decide; lightsql commits it to text in the binder, so
+	// without this doc = '{"a":1}' would be a type error and a string literal —
+	// the only way to write a document — could not be compared at all. The rule
+	// is kept to json and jsonb rather than applied to every pair, because
+	// resolving text against, say, an integer would silently accept comparisons
+	// PostgreSQL rejects.
+	if c, ok := l.(*plan.Const); ok && lt == types.KindText && isJSON(rt) {
+		v, err := types.Cast(c.Val, rt)
+		if err != nil {
+			return nil, nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.X.Pos())
+		}
+		return &plan.Const{Val: v}, r, nil
+	}
+	if c, ok := r.(*plan.Const); ok && rt == types.KindText && isJSON(lt) {
+		v, err := types.Cast(c.Val, lt)
+		if err != nil {
+			return nil, nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.Y.Pos())
+		}
+		return l, &plan.Const{Val: v}, nil
+	}
+
 	return nil, nil, pgerr.Newf(pgerr.DatatypeMismatch,
 		"operator %s cannot be applied to types %s and %s", e.Op, lt, rt).At(e.OpPos)
 }
@@ -202,14 +296,21 @@ func unify(l, r plan.Expr, e *ast.BinaryExpr) (left, right plan.Expr, err error)
 // converted at bind time so the cost is not paid per row; a parameter simply
 // records the type it will be given.
 func coerce(e plan.Expr, want types.Kind, pos token.Pos) (plan.Expr, error) {
+	// A parameter is tested before the checks below, because an unresolved one
+	// reports KindNull and would otherwise be waved through as "compatible with
+	// anything" without ever recording the type it must be converted to. That
+	// left the executor with nothing to convert against, so an INSERT stored a
+	// caller's string verbatim into an integer column.
+	if p, ok := e.(*plan.Param); ok {
+		if p.Kind == types.KindNull {
+			p.Kind = want
+		}
+		return p, nil
+	}
+
 	got := e.Type()
 	if got == want || got == types.KindNull {
 		return e, nil
-	}
-
-	if p, ok := e.(*plan.Param); ok {
-		p.Kind = want
-		return p, nil
 	}
 
 	// A constant is converted now, so the cost is paid once per statement rather

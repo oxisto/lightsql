@@ -79,6 +79,10 @@ var typeAliases = map[string]struct {
 
 	"bytea": {types.KindBytea, "bytea", false},
 
+	// json keeps the document as written; jsonb canonicalises it.
+	"json":  {types.KindJSON, "json", false},
+	"jsonb": {types.KindJSONB, "jsonb", false},
+
 	"date":        {types.KindDate, "date", false},
 	"time":        {types.KindTime, "time without time zone", false},
 	"timestamp":   {types.KindTimestamp, "timestamp without time zone", false},

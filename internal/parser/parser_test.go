@@ -53,6 +53,20 @@ func TestExprPrecedence(t *testing.T) {
 		{"a / b / c", "(/ (/ (col a) (col b)) (col c))"},
 		{"a || b || c", "(|| (|| (col a) (col b)) (col c))"},
 
+		// The JSON operators are left associative, so a chained lookup walks
+		// into the document rather than trying to index the key.
+		{"a -> 'x' -> 'y'", `(-> (-> (col a) (lit "x")) (lit "y"))`},
+		{"a -> 'x' ->> 'y'", `(->> (-> (col a) (lit "x")) (lit "y"))`},
+
+		// They bind tighter than comparison, which is what makes the common
+		// predicate doc ->> 'k' = 'v' mean what it looks like. Written the
+		// other way round it would compare a document against a boolean.
+		{"a ->> 'k' = 'v'", `(= (->> (col a) (lit "k")) (lit "v"))`},
+		{"a @> b = c", "(= (@> (col a) (col b)) (col c))"},
+
+		// And tighter than concatenation, so the arrow wins over the pipes.
+		{"a ->> 'k' || 'x'", `(|| (->> (col a) (lit "k")) (lit "x"))`},
+
 		// A minus directly against an identifier must not be folded into a
 		// negative literal by the scanner.
 		{"a-1", "(- (col a) (lit 1))"},

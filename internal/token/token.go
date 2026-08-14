@@ -65,6 +65,11 @@ const (
 
 	// String and misc operators.
 	Concat // ||
+
+	// JSON operators.
+	Arrow     // ->  member or element, as JSON
+	LongArrow // ->> member or element, as text
+	Contains  // @>  containment
 	operatorEnd
 
 	keywordBegin
@@ -166,6 +171,9 @@ func buildKindNames() map[Kind]string {
 		Greater:     ">",
 		GreaterEq:   ">=",
 		Concat:      "||",
+		Arrow:       "->",
+		LongArrow:   "->>",
+		Contains:    "@>",
 	}
 	// A keyword's name is just its upper-cased source text, so derive it rather
 	// than maintaining a second table that can drift out of sync.

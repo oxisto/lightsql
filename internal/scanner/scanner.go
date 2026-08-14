@@ -357,6 +357,11 @@ var operators = []struct {
 	text string
 	kind token.Kind
 }{
+	// Longest first within a shared prefix: ->> must be tried before ->, or
+	// the third character would scan as a separate operator.
+	{"->>", token.LongArrow},
+	{"->", token.Arrow},
+	{"@>", token.Contains},
 	{"::", token.DoubleColon},
 	{"||", token.Concat},
 	{"<>", token.NotEq},

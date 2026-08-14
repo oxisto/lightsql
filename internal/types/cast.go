@@ -82,6 +82,56 @@ func Cast(v Value, want Kind) (Value, error) {
 		if v.Kind() == KindText {
 			return Value{k: KindBytea, s: v.AsString()}, nil
 		}
+
+	case KindTimestamp, KindTimestamptz:
+		// timestamp and timestamptz share a payload — microseconds since the
+		// epoch — and differ only in how they are rendered, so converting
+		// between them relabels rather than shifts. This is the conversion a
+		// time.Time argument needs, since the driver has no way to tell which
+		// of the two a caller meant.
+		switch v.Kind() {
+		case KindTimestamp, KindTimestamptz:
+			return Value{k: want, n: v.n}, nil
+		case KindDate:
+			return Value{k: want, n: uint64(v.AsInt() * 86400 * 1e6)}, nil
+		}
+
+	case KindDate:
+		switch v.Kind() {
+		case KindTimestamp, KindTimestamptz:
+			// Truncating to the day must floor, not divide toward zero, or
+			// dates before 1970 would land a day late.
+			micros := v.AsInt()
+			const perDay = 86400 * 1e6
+			days := micros / perDay
+			if micros < 0 && micros%perDay != 0 {
+				days--
+			}
+			return Date(days), nil
+		}
+
+	case KindJSON:
+		// json keeps what it was given, but still refuses malformed input:
+		// storing text that cannot be read back is not a favour to anyone.
+		switch v.Kind() {
+		case KindText, KindBytea, KindJSONB:
+			if err := ValidateJSON(v.AsString()); err != nil {
+				return Value{}, &ErrCast{From: v.Kind(), To: want, Val: v.String()}
+			}
+			return JSON(v.AsString()), nil
+		}
+
+	case KindJSONB:
+		switch v.Kind() {
+		case KindText, KindBytea, KindJSON:
+			// []byte arrives here whenever a caller passes json.RawMessage or
+			// the output of json.Marshal as a query argument.
+			out, err := ParseJSONB(v.AsString())
+			if err != nil {
+				return Value{}, &ErrCast{From: v.Kind(), To: want, Val: v.String()}
+			}
+			return out, nil
+		}
 	}
 
 	return Value{}, &ErrCast{From: v.Kind(), To: want, Val: v.String()}

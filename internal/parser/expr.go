@@ -28,6 +28,7 @@ const (
 	bpCompare
 	bpRange // BETWEEN, IN, LIKE
 	bpAdd
+	bpJSON // ->, ->>, @> bind tighter than arithmetic
 	bpMul
 	bpExp
 	bpUnary
@@ -55,6 +56,11 @@ var infixOps = map[token.Kind]struct {
 	token.Percent:   {ast.OpMod, bpMul},
 	token.Caret:     {ast.OpExp, bpExp},
 	token.Concat:    {ast.OpConcat, bpAdd},
+	// PostgreSQL gives -> and ->> the same precedence as any other unnamed
+	// operator, above addition, so doc -> 'a' = 'b' groups as (doc -> 'a') = 'b'.
+	token.Arrow:     {ast.OpJSONField, bpJSON},
+	token.LongArrow: {ast.OpJSONText, bpJSON},
+	token.Contains:  {ast.OpJSONContains, bpJSON},
 }
 
 // parseExpr parses an expression, consuming operators that bind at least as

@@ -156,6 +156,9 @@ const (
 	OpNotLike
 	OpIsDistinctFrom
 	OpIsNotDistinctFrom
+	OpJSONField
+	OpJSONText
+	OpJSONContains
 )
 
 var binaryOpNames = [...]string{
@@ -163,6 +166,7 @@ var binaryOpNames = [...]string{
 	OpConcat: "||", OpEq: "=", OpNe: "<>", OpLt: "<", OpLe: "<=", OpGt: ">",
 	OpGe: ">=", OpAnd: "AND", OpOr: "OR", OpLike: "LIKE", OpNotLike: "NOT LIKE",
 	OpIsDistinctFrom: "IS DISTINCT FROM", OpIsNotDistinctFrom: "IS NOT DISTINCT FROM",
+	OpJSONField: "->", OpJSONText: "->>", OpJSONContains: "@>",
 }
 
 func (o BinaryOp) String() string { return binaryOpNames[o] }

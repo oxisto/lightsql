@@ -74,6 +74,24 @@ func Compile(e plan.Expr) (Eval, error) {
 			return types.Bool(v.IsNull() != negate), nil
 		}, nil
 
+	case *plan.Cast:
+		x, err := Compile(e.X)
+		if err != nil {
+			return nil, err
+		}
+		want := e.Kind
+		return func(args []types.Value, row Row) (types.Value, error) {
+			v, err := x(args, row)
+			if err != nil {
+				return types.Value{}, err
+			}
+			out, err := types.Cast(v, want)
+			if err != nil {
+				return types.Value{}, pgerr.New(pgerr.InvalidTextForType, err.Error())
+			}
+			return out, nil
+		}, nil
+
 	case *plan.Unary:
 		return compileUnary(e)
 
@@ -194,6 +212,30 @@ func compileBinary(e *plan.Binary) (Eval, error) {
 				return types.Value{}, err
 			}
 			return cmp(lv, rv).Value(), nil
+		}, nil
+	}
+
+	switch e.Op {
+	case ast.OpJSONField, ast.OpJSONText, ast.OpJSONContains:
+		op := e.Op
+		return func(args []types.Value, row Row) (types.Value, error) {
+			lv, rv, err := evalPair(l, r, args, row)
+			if err != nil {
+				return types.Value{}, err
+			}
+			// A NULL operand gives NULL, as every JSON operator does in
+			// PostgreSQL: there is no document to look in.
+			if lv.IsNull() || rv.IsNull() {
+				return types.Null(), nil
+			}
+			switch op {
+			case ast.OpJSONField:
+				return types.JSONField(lv, rv), nil
+			case ast.OpJSONText:
+				return types.JSONText(lv, rv), nil
+			default:
+				return types.JSONContains(lv, rv).Value(), nil
+			}
 		}, nil
 	}
 
