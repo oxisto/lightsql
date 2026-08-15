@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/oxisto/lightsql/internal/ast"
 	"github.com/oxisto/lightsql/internal/catalog"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/plan"
@@ -47,6 +48,32 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 			return nil, err
 		}
 		return &filterOp{input: input, pred: pred, args: args}, nil
+
+	case *plan.Join:
+		left, err := Build(n.Left, tx, args)
+		if err != nil {
+			return nil, err
+		}
+		right, err := Build(n.Right, tx, args)
+		if err != nil {
+			return nil, err
+		}
+		op := &joinOp{
+			left: left, right: right, args: args,
+			leftWidth:  len(n.Left.Result()),
+			rightWidth: len(n.Right.Result()),
+			// Which side survives without a partner is the only thing that
+			// separates the four outer flavours, so it is decided once here
+			// rather than switched on per row.
+			keepLeft:  n.Type == ast.LeftJoin || n.Type == ast.FullJoin,
+			keepRight: n.Type == ast.RightJoin || n.Type == ast.FullJoin,
+		}
+		if n.Pred != nil {
+			if op.pred, err = Compile(n.Pred); err != nil {
+				return nil, err
+			}
+		}
+		return op, nil
 
 	case *plan.SingleRow:
 		return &singleRowOp{}, nil
@@ -854,5 +881,173 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 // ExecCreateTable runs a CREATE TABLE.
 func ExecCreateTable(cat *catalog.Catalog, ct *plan.CreateTable) error {
 	_, err := cat.CreateTable(ct.Table, ct.IfNotExists)
+	return err
+}
+
+// joinOp joins two inputs with a nested loop.
+//
+// The left side streams; the right side is read once into memory and rescanned
+// for each left row. An operator cannot be rewound, so the right side has to be
+// materialised somewhere, and doing it here keeps the cost to one copy of the
+// smaller relation rather than one per level of the plan. At the scale lightsql
+// targets that is the right trade; a hash build over the right side is the next
+// step if a join ever shows up in a profile.
+//
+// All five flavours share this one loop. An outer join differs only in whether
+// an unmatched row is emitted padded with NULLs, which is two booleans decided
+// at build time.
+type joinOp struct {
+	left, right Operator
+	pred        Eval
+	args        []types.Value
+
+	leftWidth, rightWidth int
+	keepLeft, keepRight   bool
+
+	// rightRows is the materialised right side, filled on the first Next.
+	rightRows []Row
+	built     bool
+	// matched marks, per right row, whether it ever found a partner. Only a
+	// RIGHT or FULL join needs it, but tracking it unconditionally costs one
+	// bool per row and removes a branch from the inner loop.
+	matched []bool
+
+	cur      Row  // current left row
+	haveCur  bool // whether cur holds a row
+	curFound bool // whether cur has matched anything yet
+	j        int  // position in rightRows for the current left row
+
+	// drain is the index into rightRows once the left side is exhausted and
+	// unmatched right rows are being emitted.
+	drain    int
+	draining bool
+
+	out Row
+}
+
+func (o *joinOp) build(ctx context.Context) error {
+	for {
+		row, ok, err := o.right.Next(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		// Next promises its row only until the following call, so a row that
+		// outlives that has to be copied.
+		cp := make(Row, len(row))
+		copy(cp, row)
+		o.rightRows = append(o.rightRows, cp)
+	}
+	o.matched = make([]bool, len(o.rightRows))
+	o.built = true
+	return nil
+}
+
+func (o *joinOp) Next(ctx context.Context) (Row, bool, error) {
+	if !o.built {
+		if err := o.build(ctx); err != nil {
+			return nil, false, err
+		}
+	}
+	if o.out == nil {
+		o.out = make(Row, o.leftWidth+o.rightWidth)
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+
+		if o.draining {
+			for o.drain < len(o.rightRows) {
+				i := o.drain
+				o.drain++
+				if !o.matched[i] {
+					return o.emit(nil, o.rightRows[i]), true, nil
+				}
+			}
+			return nil, false, nil
+		}
+
+		if !o.haveCur {
+			row, ok, err := o.left.Next(ctx)
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				// The left side is done. A RIGHT or FULL join still owes the
+				// right rows that never matched.
+				o.draining = o.keepRight
+				if !o.draining {
+					return nil, false, nil
+				}
+				continue
+			}
+			o.cur = row
+			o.haveCur, o.curFound, o.j = true, false, 0
+		}
+
+		if o.j < len(o.rightRows) {
+			i := o.j
+			o.j++
+			ok, err := o.match(o.cur, o.rightRows[i])
+			if err != nil {
+				return nil, false, err
+			}
+			if ok {
+				o.curFound = true
+				o.matched[i] = true
+				return o.emit(o.cur, o.rightRows[i]), true, nil
+			}
+			continue
+		}
+
+		// The current left row is exhausted against the right side.
+		o.haveCur = false
+		if o.keepLeft && !o.curFound {
+			return o.emit(o.cur, nil), true, nil
+		}
+	}
+}
+
+// match evaluates the join condition. A CROSS JOIN has none, so every pair
+// matches. Only true joins the rows: false and unknown are both rejected, which
+// is the same rule a WHERE clause follows.
+func (o *joinOp) match(l, r Row) (bool, error) {
+	if o.pred == nil {
+		return true, nil
+	}
+	copy(o.out, l)
+	copy(o.out[o.leftWidth:], r)
+	v, err := o.pred(o.args, o.out)
+	if err != nil {
+		return false, err
+	}
+	return v.Truth() == types.True, nil
+}
+
+// emit builds the output row. A nil side is padded with NULLs, which is what
+// makes an outer join's missing half readable as SQL NULL rather than as a
+// zero value.
+func (o *joinOp) emit(l, r Row) Row {
+	for i := range o.out {
+		o.out[i] = types.Null()
+	}
+	if l != nil {
+		copy(o.out, l)
+	}
+	if r != nil {
+		copy(o.out[o.leftWidth:], r)
+	}
+	return o.out
+}
+
+func (o *joinOp) Close() error {
+	err := o.left.Close()
+	if rerr := o.right.Close(); err == nil {
+		err = rerr
+	}
 	return err
 }
