@@ -819,9 +819,15 @@ func (b *Binder) bindFrom(te ast.TableExpr, sc *scope) (plan.Node, error) {
 	case *ast.JoinExpr:
 		return b.bindJoin(te, sc)
 
+	case *ast.SubqueryRef:
+		return nil, pgerr.New(pgerr.FeatureNotSupported,
+			"subqueries in FROM are not supported yet").At(te.Pos())
+
 	default:
-		return nil, pgerr.Newf(pgerr.FeatureNotSupported,
-			"%T is not supported in FROM yet", te).At(te.Pos())
+		// Naming the construct rather than printing the Go type keeps the
+		// message stable and meaningful to someone reading their own SQL.
+		return nil, pgerr.New(pgerr.FeatureNotSupported,
+			"this FROM item is not supported yet").At(te.Pos())
 	}
 }
 

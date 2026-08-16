@@ -312,8 +312,14 @@ func TestJoinHonoursCancellation(t *testing.T) {
 	db := open(t)
 	mustExecAll(t, db, `CREATE TABLE a (v INT)`, `CREATE TABLE b (v INT)`)
 	for i := range 200 {
-		db.Exec(`INSERT INTO a VALUES ($1)`, i)
-		db.Exec(`INSERT INTO b VALUES ($1)`, i)
+		// Checked, because a silently failing insert would leave the tables
+		// empty and quietly turn this into a test of nothing.
+		if _, err := db.Exec(`INSERT INTO a VALUES ($1)`, i); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO b VALUES ($1)`, i); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

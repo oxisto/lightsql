@@ -999,7 +999,10 @@ func (o *joinOp) Next(ctx context.Context) (Row, bool, error) {
 			if ok {
 				o.curFound = true
 				o.matched[i] = true
-				return o.emit(o.cur, o.rightRows[i]), true, nil
+				// match already built the joined row to evaluate the
+				// predicate against, and a matched pair fills it completely,
+				// so there is nothing left for emit to do.
+				return o.out, true, nil
 			}
 			continue
 		}
@@ -1012,15 +1015,18 @@ func (o *joinOp) Next(ctx context.Context) (Row, bool, error) {
 	}
 }
 
-// match evaluates the join condition. A CROSS JOIN has none, so every pair
-// matches. Only true joins the rows: false and unknown are both rejected, which
-// is the same rule a WHERE clause follows.
+// match builds the joined row and evaluates the join condition over it.
+//
+// The row is built whether or not there is a condition, so that a caller which
+// gets true can return o.out as it stands. A CROSS JOIN has no condition, so
+// every pair matches. Only true joins the rows: false and unknown are both
+// rejected, which is the same rule a WHERE clause follows.
 func (o *joinOp) match(l, r Row) (bool, error) {
+	copy(o.out, l)
+	copy(o.out[o.leftWidth:], r)
 	if o.pred == nil {
 		return true, nil
 	}
-	copy(o.out, l)
-	copy(o.out[o.leftWidth:], r)
 	v, err := o.pred(o.args, o.out)
 	if err != nil {
 		return false, err
@@ -1028,9 +1034,10 @@ func (o *joinOp) match(l, r Row) (bool, error) {
 	return v.Truth() == types.True, nil
 }
 
-// emit builds the output row. A nil side is padded with NULLs, which is what
-// makes an outer join's missing half readable as SQL NULL rather than as a
-// zero value.
+// emit builds an output row for an unmatched left or right row. The absent
+// side is padded with NULLs, which is what makes an outer join's missing half
+// readable as SQL NULL rather than as a zero value. A matched pair does not
+// come through here, since match has already built that row.
 func (o *joinOp) emit(l, r Row) Row {
 	for i := range o.out {
 		o.out[i] = types.Null()
