@@ -84,6 +84,22 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 			return nil, err
 		}
 		op := &aggregateOp{input: input, args: args, calls: n.Aggs}
+		// Resolved once, here, rather than per group. A name the binder
+		// accepted must exist, so a miss is a bug in the plan; reporting it is
+		// the only safe answer, because carrying on with some other aggregate
+		// would return a confidently wrong number.
+		for _, c := range n.Aggs {
+			if c.Arg == nil {
+				op.funcs = append(op.funcs, nil)
+				continue
+			}
+			agg, ok := builtin.LookupAggregate(c.Func)
+			if !ok {
+				return nil, pgerr.Newf(pgerr.InternalError,
+					"unknown aggregate %q in plan", c.Func)
+			}
+			op.funcs = append(op.funcs, agg)
+		}
 		for _, k := range n.Keys {
 			eval, err := Compile(k)
 			if err != nil {
@@ -1102,6 +1118,9 @@ type aggregateOp struct {
 	calls    []plan.AggCall
 	argEvals []Eval
 
+	// funcs mirrors calls, resolved at build time. A nil entry is count(*),
+	// which has no argument to fold.
+	funcs  []*builtin.Aggregate
 	groups []*aggGroup
 	// index maps a key hash to the groups carrying it. Collisions are resolved
 	// by comparing the key values, so two different keys that happen to hash
@@ -1122,21 +1141,13 @@ type aggGroup struct {
 func (o *aggregateOp) newGroup(key []types.Value) *aggGroup {
 	g := &aggGroup{key: key, accs: make([]builtin.Accumulator, len(o.calls))}
 	for i, c := range o.calls {
-		var acc builtin.Accumulator
-		if c.Arg == nil {
-			acc = builtin.CountStar()
-		} else {
-			agg, ok := builtin.LookupAggregate(c.Func)
-			if !ok {
-				// The binder resolved this name already, so a miss here is a
-				// bug rather than user input.
-				acc = builtin.CountStar()
-			} else {
-				acc = agg.New()
-			}
-			if c.Distinct {
-				acc = builtin.Distinct(acc)
-			}
+		if o.funcs[i] == nil {
+			g.accs[i] = builtin.CountStar()
+			continue
+		}
+		acc := o.funcs[i].New()
+		if c.Distinct {
+			acc = builtin.Distinct(acc)
 		}
 		g.accs[i] = acc
 	}

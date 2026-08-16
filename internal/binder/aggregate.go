@@ -80,6 +80,15 @@ func (c *aggContext) add(fc *ast.FuncCall, agg *builtin.Aggregate, sc *scope) (p
 		if err != nil {
 			return nil, err
 		}
+		// sum and avg read the numeric payload of a value. Value keeps that
+		// payload in the same field whatever the kind, so sum(text) would not
+		// fail at runtime — it would return 0, and sum(boolean) would return
+		// the number of true rows. Refusing here is what keeps a wrong answer
+		// from looking like a right one.
+		if agg.Numeric && !arg.Type().IsNumeric() && arg.Type() != types.KindNull {
+			return nil, pgerr.Newf(pgerr.UndefinedFunction,
+				"function %s(%s) does not exist", agg.Name, arg.Type()).At(fc.Pos())
+		}
 		call.Arg = arg
 		call.Kind = agg.Result(arg.Type())
 	}

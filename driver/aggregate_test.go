@@ -233,6 +233,20 @@ func TestAggregateErrors(t *testing.T) {
 			state: "42803",
 		},
 		{
+			// sum and avg read a value's numeric payload, which every kind
+			// keeps in the same field. Without a check these returned 0 for
+			// text and counted the true rows for a boolean, which is worse
+			// than an error because it looks like an answer.
+			name:  "sum of text",
+			query: `SELECT sum(region) FROM sales`,
+			state: "42883",
+		},
+		{
+			name:  "avg of text",
+			query: `SELECT avg(region) FROM sales`,
+			state: "42883",
+		},
+		{
 			name:  "unknown function",
 			query: `SELECT nosuchfunc(amount) FROM sales`,
 			state: "42883",
@@ -265,6 +279,27 @@ func TestAggregateErrors(t *testing.T) {
 // TestAggregateScansIntoNullable checks the driver side: an aggregate over no
 // rows is NULL, and a caller scanning into a plain int64 must get a usable
 // error rather than a zero.
+// TestOrderedAggregatesAcceptAnyKind is the other half of the numeric check:
+// min and max need only the total order, which is defined for every kind, and
+// count needs nothing at all. Rejecting those too would be over-correction.
+func TestOrderedAggregatesAcceptAnyKind(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db, aggFixture...)
+
+	got := rowsOf(t, db, `SELECT min(region), max(region), count(region) FROM sales`)
+	if want := []string{"east|west|4"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+
+	// A boolean orders too, and count(*) is indifferent to kind.
+	mustExecAll(t, db, `CREATE TABLE flags (f BOOLEAN)`,
+		`INSERT INTO flags VALUES (true), (false), (true)`)
+	got = rowsOf(t, db, `SELECT min(f), max(f), count(*) FROM flags`)
+	if want := []string{"false|true|3"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
 func TestAggregateScansIntoNullable(t *testing.T) {
 	db := open(t)
 	mustExecAll(t, db, `CREATE TABLE e (n INT)`)

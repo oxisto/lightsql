@@ -27,9 +27,12 @@ type Accumulator interface {
 // Aggregate describes one aggregate function.
 type Aggregate struct {
 	Name string
-	// NeedsArg is false only for count(*), which counts rows rather than
-	// values and so has nothing to evaluate per row.
-	NeedsArg bool
+	// Numeric marks an aggregate that arithmetic only makes sense for. sum and
+	// avg read the value's numeric payload, so handing one a text or boolean
+	// value would produce a confident wrong number rather than an error; the
+	// binder refuses those instead. count works on anything, and min and max
+	// need only the total order, which is defined for every kind.
+	Numeric bool
 	// Result reports the type the aggregate produces for a given argument
 	// type, so the binder can type the query without running it.
 	Result func(arg types.Kind) types.Kind
@@ -40,22 +43,21 @@ type Aggregate struct {
 // aggregates is the registry, keyed by lower-cased name.
 var aggregates = map[string]*Aggregate{
 	"count": {
-		Name:     "count",
-		NeedsArg: true,
+		Name: "count",
 		// count always answers with an integer, and it is the one aggregate
 		// that answers 0 rather than NULL for an empty input.
 		Result: func(types.Kind) types.Kind { return types.KindInt },
 		New:    func() Accumulator { return &countAgg{} },
 	},
 	"sum": {
-		Name:     "sum",
-		NeedsArg: true,
-		Result:   numericResult,
-		New:      func() Accumulator { return &sumAgg{} },
+		Name:    "sum",
+		Numeric: true,
+		Result:  numericResult,
+		New:     func() Accumulator { return &sumAgg{} },
 	},
 	"avg": {
-		Name:     "avg",
-		NeedsArg: true,
+		Name:    "avg",
+		Numeric: true,
 		// avg is float even over integers: the average of 1 and 2 is 1.5, and
 		// truncating it to 1 would be a silent wrong answer. PostgreSQL returns
 		// numeric here, which lightsql does not have.
@@ -63,16 +65,14 @@ var aggregates = map[string]*Aggregate{
 		New:    func() Accumulator { return &avgAgg{} },
 	},
 	"min": {
-		Name:     "min",
-		NeedsArg: true,
-		Result:   sameResult,
-		New:      func() Accumulator { return &extremeAgg{min: true} },
+		Name:   "min",
+		Result: sameResult,
+		New:    func() Accumulator { return &extremeAgg{min: true} },
 	},
 	"max": {
-		Name:     "max",
-		NeedsArg: true,
-		Result:   sameResult,
-		New:      func() Accumulator { return &extremeAgg{} },
+		Name:   "max",
+		Result: sameResult,
+		New:    func() Accumulator { return &extremeAgg{} },
 	},
 }
 
