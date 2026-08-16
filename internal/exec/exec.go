@@ -5,7 +5,10 @@ import (
 	"math"
 	"slices"
 
+	"hash/maphash"
+
 	"github.com/oxisto/lightsql/internal/ast"
+	"github.com/oxisto/lightsql/internal/builtin"
 	"github.com/oxisto/lightsql/internal/catalog"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/plan"
@@ -72,6 +75,32 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 			if op.pred, err = Compile(n.Pred); err != nil {
 				return nil, err
 			}
+		}
+		return op, nil
+
+	case *plan.Aggregate:
+		input, err := Build(n.Input, tx, args)
+		if err != nil {
+			return nil, err
+		}
+		op := &aggregateOp{input: input, args: args, calls: n.Aggs}
+		for _, k := range n.Keys {
+			eval, err := Compile(k)
+			if err != nil {
+				return nil, err
+			}
+			op.keys = append(op.keys, eval)
+		}
+		for _, c := range n.Aggs {
+			if c.Arg == nil {
+				op.argEvals = append(op.argEvals, nil)
+				continue
+			}
+			eval, err := Compile(c.Arg)
+			if err != nil {
+				return nil, err
+			}
+			op.argEvals = append(op.argEvals, eval)
 		}
 		return op, nil
 
@@ -1058,3 +1087,168 @@ func (o *joinOp) Close() error {
 	}
 	return err
 }
+
+// aggregateOp groups its input and folds each group to one row.
+//
+// Groups are found by hashing the key values, and a bucket keeps its rows in
+// arrival order so the output does not depend on Go's map iteration. SQL does
+// not promise an order for GROUP BY, but a result that reshuffles between runs
+// makes a test suite flaky for no reason, and input order is the one order that
+// costs nothing to preserve.
+type aggregateOp struct {
+	input    Operator
+	args     []types.Value
+	keys     []Eval
+	calls    []plan.AggCall
+	argEvals []Eval
+
+	groups []*aggGroup
+	// index maps a key hash to the groups carrying it. Collisions are resolved
+	// by comparing the key values, so two different keys that happen to hash
+	// alike stay separate.
+	index map[uint64][]*aggGroup
+	seed  maphash.Seed
+
+	built bool
+	i     int
+	out   Row
+}
+
+type aggGroup struct {
+	key  []types.Value
+	accs []builtin.Accumulator
+}
+
+func (o *aggregateOp) newGroup(key []types.Value) *aggGroup {
+	g := &aggGroup{key: key, accs: make([]builtin.Accumulator, len(o.calls))}
+	for i, c := range o.calls {
+		var acc builtin.Accumulator
+		if c.Arg == nil {
+			acc = builtin.CountStar()
+		} else {
+			agg, ok := builtin.LookupAggregate(c.Func)
+			if !ok {
+				// The binder resolved this name already, so a miss here is a
+				// bug rather than user input.
+				acc = builtin.CountStar()
+			} else {
+				acc = agg.New()
+			}
+			if c.Distinct {
+				acc = builtin.Distinct(acc)
+			}
+		}
+		g.accs[i] = acc
+	}
+	return g
+}
+
+func (o *aggregateOp) hash(key []types.Value) uint64 {
+	var h maphash.Hash
+	h.SetSeed(o.seed)
+	for _, v := range key {
+		v.Hash(&h)
+	}
+	return h.Sum64()
+}
+
+// find returns the group for a key, creating it on first sight.
+func (o *aggregateOp) find(key []types.Value) *aggGroup {
+	sum := o.hash(key)
+	for _, g := range o.index[sum] {
+		if sameKey(g.key, key) {
+			return g
+		}
+	}
+	g := o.newGroup(key)
+	o.index[sum] = append(o.index[sum], g)
+	o.groups = append(o.groups, g)
+	return g
+}
+
+// sameKey compares two group keys.
+//
+// It uses Compare, the total order, rather than Eq: grouping must put NULLs
+// together, and Eq would answer unknown for a pair of them, so every NULL key
+// would become its own group. PostgreSQL groups NULLs into one group, and this
+// is where that difference lives.
+func sameKey(a, b []types.Value) bool {
+	for i := range a {
+		if types.Compare(a[i], b[i]) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (o *aggregateOp) build(ctx context.Context) error {
+	o.index = make(map[uint64][]*aggGroup)
+	o.seed = maphash.MakeSeed()
+
+	for {
+		row, ok, err := o.input.Next(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+
+		key := make([]types.Value, len(o.keys))
+		for i, k := range o.keys {
+			if key[i], err = k(o.args, row); err != nil {
+				return err
+			}
+		}
+		g := o.find(key)
+
+		for i, eval := range o.argEvals {
+			if eval == nil {
+				// count(*) counts the row, so there is nothing to evaluate.
+				g.accs[i].Add(types.Null())
+				continue
+			}
+			v, err := eval(o.args, row)
+			if err != nil {
+				return err
+			}
+			g.accs[i].Add(v)
+		}
+	}
+
+	// An aggregate with no GROUP BY reports one row even over no input:
+	// SELECT count(*) FROM empty is 0, not no rows at all. With a GROUP BY
+	// there are no groups, so there are no rows, which is the other half of
+	// the same rule.
+	if len(o.groups) == 0 && len(o.keys) == 0 {
+		o.groups = append(o.groups, o.newGroup(nil))
+	}
+
+	o.built = true
+	return nil
+}
+
+func (o *aggregateOp) Next(ctx context.Context) (Row, bool, error) {
+	if !o.built {
+		if err := o.build(ctx); err != nil {
+			return nil, false, err
+		}
+		o.out = make(Row, len(o.keys)+len(o.calls))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if o.i >= len(o.groups) {
+		return nil, false, nil
+	}
+
+	g := o.groups[o.i]
+	o.i++
+	copy(o.out, g.key)
+	for i, acc := range g.accs {
+		o.out[len(o.keys)+i] = acc.Result()
+	}
+	return o.out, true, nil
+}
+
+func (o *aggregateOp) Close() error { return o.input.Close() }

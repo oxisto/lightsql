@@ -39,6 +39,12 @@ func New(cat *catalog.Catalog) *Binder { return &Binder{cat: cat} }
 // one lives in the row being processed.
 type scope struct {
 	cols []scopeColumn
+	// agg is set while binding the parts of a SELECT that see the grouped row
+	// rather than an input row. When it is nil, an aggregate call is an error.
+	agg *aggContext
+	// clause names the part of the statement being bound, for error messages
+	// that need to say where an aggregate was misplaced.
+	clause string
 }
 
 type scopeColumn struct {
@@ -941,8 +947,6 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		what string
 	}{
 		{s.Distinct, "DISTINCT"},
-		{len(s.GroupBy) > 0, "GROUP BY"},
-		{s.Having != nil, "HAVING"},
 	} {
 		if unsupported.cond {
 			return nil, pgerr.Newf(pgerr.FeatureNotSupported,
@@ -971,11 +975,25 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 	}
 
 	if s.Where != nil {
+		// WHERE runs below grouping, so it sees input rows and an aggregate in
+		// it has nothing to aggregate over. Naming the clause lets the error
+		// say so rather than reporting a missing function.
+		sc.clause = "WHERE"
 		pred, err := b.bindPredicate(s.Where, sc, "WHERE")
+		sc.clause = ""
 		if err != nil {
 			return nil, err
 		}
 		node = &plan.Filter{Input: node, Pred: pred}
+	}
+
+	// A query is grouped when it says GROUP BY, and also when it merely uses an
+	// aggregate: SELECT count(*) FROM t has one group covering every row.
+	grouped := len(s.GroupBy) > 0 || s.Having != nil || selectHasAggregate(s)
+	if grouped {
+		if err := b.beginGrouping(s, sc); err != nil {
+			return nil, err
+		}
 	}
 
 	// The select list is bound before ORDER BY so that a term naming an output
@@ -986,12 +1004,34 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		return nil, err
 	}
 
-	if len(s.OrderBy) > 0 {
-		keys, err := b.bindOrderBy(s.OrderBy, sc, proj)
-		if err != nil {
+	var having plan.Expr
+	if s.Having != nil {
+		sc.clause = "HAVING"
+		if having, err = b.bindPredicate(s.Having, sc, "HAVING"); err != nil {
 			return nil, err
 		}
-		node = &plan.Sort{Input: node, Keys: keys}
+		sc.clause = ""
+	}
+
+	var sortKeys []plan.SortKey
+	if len(s.OrderBy) > 0 {
+		if sortKeys, err = b.bindOrderBy(s.OrderBy, sc, proj); err != nil {
+			return nil, err
+		}
+	}
+
+	// Every expression above the grouping has now been bound, so the set of
+	// aggregate calls is complete and the node can be built. Doing it here
+	// rather than before binding is what lets ORDER BY count(*) contribute a
+	// call that the select list never mentioned.
+	if grouped {
+		node = b.groupingNode(node, sc)
+	}
+	if having != nil {
+		node = &plan.Filter{Input: node, Pred: having}
+	}
+	if sortKeys != nil {
+		node = &plan.Sort{Input: node, Keys: sortKeys}
 	}
 	proj.Input = node
 

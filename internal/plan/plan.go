@@ -138,6 +138,30 @@ type Join struct {
 	Cols        []ResultColumn
 }
 
+// AggCall is one aggregate in an Aggregate node.
+type AggCall struct {
+	// Func names the aggregate; the executor resolves it through builtin.
+	Func string
+	// Arg is nil for count(*), which counts rows rather than values.
+	Arg      Expr
+	Distinct bool
+	Kind     types.Kind
+}
+
+// Aggregate groups its input and folds each group down to one row.
+//
+// The output row is the group keys followed by the aggregate results, so an
+// expression above it addresses either by ordinal like any other column. The
+// binder rewrites the select list and HAVING against that layout, which is why
+// nothing here needs to know what the original expressions looked like.
+type Aggregate struct {
+	Input Node
+	// Keys are the GROUP BY expressions, evaluated against the input row.
+	Keys []Expr
+	Aggs []AggCall
+	Cols []ResultColumn
+}
+
 // Filter keeps the rows for which Pred evaluates to true. Rows for which the
 // predicate is false or unknown are both dropped, which is SQL's rule.
 type Filter struct {
@@ -186,6 +210,7 @@ func (n *SingleRow) Result() []ResultColumn { return nil }
 func (n *Scan) Result() []ResultColumn      { return n.Cols }
 func (n *Filter) Result() []ResultColumn    { return n.Input.Result() }
 func (n *Join) Result() []ResultColumn      { return n.Cols }
+func (n *Aggregate) Result() []ResultColumn { return n.Cols }
 func (n *Project) Result() []ResultColumn   { return n.Cols }
 func (n *Sort) Result() []ResultColumn      { return n.Input.Result() }
 func (n *Limit) Result() []ResultColumn     { return n.Input.Result() }
@@ -194,6 +219,7 @@ func (*SingleRow) planNode() {}
 func (*Scan) planNode()      {}
 func (*Filter) planNode()    {}
 func (*Join) planNode()      {}
+func (*Aggregate) planNode() {}
 func (*Project) planNode()   {}
 func (*Sort) planNode()      {}
 func (*Limit) planNode()     {}
