@@ -8,13 +8,26 @@ name: Copilot review
 # If that changes, this workflow should be deleted in favour of the rule, which
 # would also cover pull requests from forks.
 
+# synchronize fires on every push to an open pull request. Without it a review
+# covers only the commits present when the pull request was opened, and any
+# later push — including the one that addresses the review — merges unreviewed.
+# That is not hypothetical: #14 merged with its last two commits never looked at,
+# because a rebase moved the head after the single review had been submitted.
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
   contents: read
   pull-requests: write
+
+# Several pushes in quick succession would otherwise each ask for a review, and
+# the earlier ones would be for commits that no longer exist. Cancelling the
+# superseded runs means the request that survives is the one for the head that
+# is actually there.
+concurrency:
+  group: copilot-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   request:
