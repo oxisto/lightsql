@@ -120,6 +120,24 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 		}
 		return op, nil
 
+	case *plan.Distinct:
+		input, err := Build(n.Input, tx, args)
+		if err != nil {
+			return nil, err
+		}
+		op := &distinctOp{
+			input: input, args: args, width: n.Width,
+			seen: builtin.NewKeySet(),
+		}
+		for _, e := range n.On {
+			eval, err := Compile(e)
+			if err != nil {
+				return nil, err
+			}
+			op.on = append(op.on, eval)
+		}
+		return op, nil
+
 	case *plan.SingleRow:
 		return &singleRowOp{}, nil
 
@@ -1263,3 +1281,60 @@ func (o *aggregateOp) Next(ctx context.Context) (Row, bool, error) {
 }
 
 func (o *aggregateOp) Close() error { return o.input.Close() }
+
+// distinctOp drops rows whose key has been seen before.
+//
+// It streams: a row is emitted as soon as it is known to be new, rather than
+// the whole input being collected and deduplicated at the end, so a LIMIT above
+// it can stop early. An ORDER BY below still has to materialise, since sorting
+// cannot answer before it has seen everything; the streaming matters for the
+// unordered case and for keeping one copy of the keys rather than two of the
+// rows.
+//
+// The first row of each key wins, so the input order decides which one that is
+// and the output preserves it. Both are what DISTINCT ON relies on.
+type distinctOp struct {
+	input Operator
+	args  []types.Value
+	// on is empty for a plain DISTINCT, which keys on the whole output row.
+	on    []Eval
+	width int
+	seen  *builtin.KeySet
+	key   []types.Value
+}
+
+func (o *distinctOp) Next(ctx context.Context) (Row, bool, error) {
+	for {
+		row, ok, err := o.input.Next(ctx)
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+
+		if len(o.on) == 0 {
+			// A plain DISTINCT compares the row the query actually returns,
+			// not anything the projection appended.
+			if !o.seen.Add(row[:o.width]) {
+				continue
+			}
+			return row[:o.width], true, nil
+		}
+
+		if o.key == nil {
+			o.key = make([]types.Value, len(o.on))
+		}
+		for i, eval := range o.on {
+			if o.key[i], err = eval(o.args, row); err != nil {
+				return nil, false, err
+			}
+		}
+		if !o.seen.Add(o.key) {
+			continue
+		}
+		return row[:o.width], true, nil
+	}
+}
+
+func (o *distinctOp) Close() error { return o.input.Close() }

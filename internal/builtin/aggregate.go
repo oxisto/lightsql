@@ -9,6 +9,7 @@ package builtin
 
 import (
 	"hash/maphash"
+	"slices"
 	"strings"
 
 	"github.com/oxisto/lightsql/internal/types"
@@ -215,12 +216,13 @@ func (a *extremeAgg) Result() types.Value {
 // Distinct wraps an accumulator so that repeated values are folded in once,
 // implementing count(DISTINCT x) and friends.
 func Distinct(inner Accumulator) Accumulator {
-	return &distinctAgg{inner: inner, seen: newValueSet()}
+	return &distinctAgg{inner: inner, seen: NewKeySet()}
 }
 
 type distinctAgg struct {
 	inner Accumulator
-	seen  *valueSet
+	seen  *KeySet
+	one   [1]types.Value
 }
 
 func (a *distinctAgg) Add(v types.Value) {
@@ -229,40 +231,61 @@ func (a *distinctAgg) Add(v types.Value) {
 	if v.IsNull() {
 		return
 	}
-	if a.seen.add(v) {
+	a.one[0] = v
+	if a.seen.Add(a.one[:]) {
 		a.inner.Add(v)
 	}
 }
 
 func (a *distinctAgg) Result() types.Value { return a.inner.Result() }
 
-// valueSet is a set of values under SQL equality.
+// KeySet is a set of value tuples under SQL equality.
 //
 // It hashes with Value.Hash and settles ties with Compare, rather than using a
 // Go map keyed on Value directly. Value is a comparable struct, so a plain map
 // would compile — and would then treat the integer 1 and the float 1 as
 // different, contradicting the comparison the rest of the engine uses.
-type valueSet struct {
+//
+// Compare rather than Eq is also what makes a NULL key group with other NULLs
+// instead of forming a group of its own, which is what both GROUP BY and
+// DISTINCT require.
+type KeySet struct {
 	seed    maphash.Seed
-	buckets map[uint64][]types.Value
+	buckets map[uint64][][]types.Value
 }
 
-func newValueSet() *valueSet {
-	return &valueSet{seed: maphash.MakeSeed(), buckets: make(map[uint64][]types.Value)}
+// NewKeySet returns an empty set.
+func NewKeySet() *KeySet {
+	return &KeySet{seed: maphash.MakeSeed(), buckets: make(map[uint64][][]types.Value)}
 }
 
-// add records v and reports whether it was new.
-func (s *valueSet) add(v types.Value) bool {
+// Add records key and reports whether it was not already present. The key is
+// copied, so the caller may reuse the slice for the next row.
+func (s *KeySet) Add(key []types.Value) bool {
 	var h maphash.Hash
 	h.SetSeed(s.seed)
-	v.Hash(&h)
+	for _, v := range key {
+		v.Hash(&h)
+	}
 	sum := h.Sum64()
 
 	for _, got := range s.buckets[sum] {
-		if types.Compare(got, v) == 0 {
+		if sameKey(got, key) {
 			return false
 		}
 	}
-	s.buckets[sum] = append(s.buckets[sum], v)
+	s.buckets[sum] = append(s.buckets[sum], slices.Clone(key))
+	return true
+}
+
+func sameKey(a, b []types.Value) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if types.Compare(a[i], b[i]) != 0 {
+			return false
+		}
+	}
 	return true
 }
