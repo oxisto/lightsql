@@ -30,6 +30,12 @@ type aggContext struct {
 type aggKey struct {
 	text string
 	expr plan.Expr
+	// name and typ are how the key column is reported. Both are captured while
+	// the input scope is still in place, because that is the only point at
+	// which a bare column reference can still be resolved back to the type it
+	// was declared with.
+	name string
+	typ  catalog.Type
 }
 
 // column returns the reference to a group key matching e, if there is one.
@@ -42,10 +48,33 @@ func (c *aggContext) column(e ast.Expr) (plan.Expr, bool) {
 	text := ast.Sprint(e)
 	for i, k := range c.keys {
 		if k.text == text {
-			return &plan.Column{Ordinal: i, Kind: k.expr.Type()}, true
+			return &plan.Column{Ordinal: i, Kind: k.expr.Type(), Name: k.name}, true
 		}
 	}
 	return nil, false
+}
+
+// resultType reports how the column at a grouped-row ordinal is declared.
+//
+// The select list of a grouped query addresses the grouped row — the keys
+// followed by the aggregate results — so its ordinals do not index the input
+// scope. Looking them up there is not merely imprecise, it reads an unrelated
+// column: count(*) at grouped ordinal 1 took the declared type of whichever
+// input column happened to sit at ordinal 1, and reported an integer count as
+// text. Nothing consumed that type until a derived table did, at which point
+// it became a comparison against the wrong type rather than a bad label.
+func (c *aggContext) resultType(ord int) (catalog.Type, bool) {
+	switch {
+	case ord < 0:
+		return catalog.Type{}, false
+	case ord < len(c.keys):
+		return c.keys[ord].typ, true
+	}
+	if i := ord - len(c.keys); i < len(c.aggs) {
+		k := c.aggs[i].Kind
+		return catalog.Type{Kind: k, Name: k.String()}, true
+	}
+	return catalog.Type{}, false
 }
 
 // add registers an aggregate call and returns the reference to its result.
@@ -214,10 +243,30 @@ func (b *Binder) beginGrouping(s *ast.SelectStmt, sc *scope) error {
 		if err != nil {
 			return err
 		}
-		ctx.keys = append(ctx.keys, aggKey{text: ast.Sprint(g), expr: expr})
+		ctx.keys = append(ctx.keys, aggKey{
+			text: ast.Sprint(g),
+			expr: expr,
+			name: keyName(g, expr),
+			// Captured here, not in groupingNode, because the scope enters
+			// aggregate mode as soon as this loop ends.
+			typ: resultType(expr, sc),
+		})
 	}
 	sc.agg = ctx
 	return nil
+}
+
+// keyName is the label a GROUP BY key is reported under: the column's own name
+// for a bare reference, and PostgreSQL's fallback otherwise. It mirrors
+// outputName, which does the same job for a select item.
+func keyName(src ast.Expr, bound plan.Expr) string {
+	if ref, ok := src.(*ast.ColumnRef); ok {
+		return ref.Column.Name
+	}
+	if c, ok := bound.(*plan.Column); ok && c.Name != "" {
+		return c.Name
+	}
+	return "?column?"
 }
 
 // groupingNode builds the Aggregate from what binding collected.
@@ -227,9 +276,7 @@ func (b *Binder) groupingNode(input plan.Node, sc *scope) plan.Node {
 
 	for _, k := range ctx.keys {
 		agg.Keys = append(agg.Keys, k.expr)
-		agg.Cols = append(agg.Cols, plan.ResultColumn{
-			Name: "", Type: catalog.Type{Kind: k.expr.Type(), Name: k.expr.Type().String()},
-		})
+		agg.Cols = append(agg.Cols, plan.ResultColumn{Name: k.name, Type: k.typ})
 	}
 	for _, c := range ctx.Aggs() {
 		agg.Aggs = append(agg.Aggs, c)

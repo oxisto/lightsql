@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-56_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-57_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -165,7 +165,7 @@ the two.
 | 🟡 | Aggregate functions | ✅ | 🟡 | count, sum, avg, min and max, each with DISTINCT; count is 0 over no rows and the rest are NULL. Other aggregates are pending |
 | ✅ | ORDER BY | ✅ | ✅ | ASC/DESC, NULLS FIRST/LAST, output aliases, select-list positions, and expressions over unselected columns |
 | ✅ | DISTINCT / DISTINCT ON | ✅ | ✅ | compares the output row, and treats NULLs as equal; DISTINCT ON keeps the first row per key, so ORDER BY decides which. Unlike PostgreSQL, ORDER BY on an unselected column is accepted rather than rejected |
-| ⬜ | Subqueries | ✅ | ⬜ | scalar, IN, EXISTS, and derived tables |
+| 🟡 | Subqueries | ✅ | 🟡 | derived tables in FROM execute, and must have an alias; scalar, IN and EXISTS subqueries parse but are not executed yet. LATERAL is not supported, so a derived table cannot reference the tables beside it |
 | ⬜ | UNION / INTERSECT / EXCEPT | ⬜ | ⬜ |  |
 | ⬜ | Common table expressions | ⬜ | ⬜ | WITH, including RECURSIVE |
 | ❌ | Window functions | ❌ | ❌ | out of scope for v1 |

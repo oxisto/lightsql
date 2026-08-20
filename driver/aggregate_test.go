@@ -300,6 +300,48 @@ func TestOrderedAggregatesAcceptAnyKind(t *testing.T) {
 	}
 }
 
+// TestGroupedColumnTypes pins the name and declared type of every column of a
+// grouped row.
+//
+// A grouped query's select list addresses the grouped row — keys, then
+// aggregate results — so its ordinals do not index the input scope. Resolving
+// them there did not fail, it silently returned whichever input column shared
+// the ordinal, so count(*) reported itself as text and a key came back
+// unnamed. An ORM reads exactly these two things to decide what to scan into,
+// which is why they are asserted rather than left to a query that happens to
+// work anyway.
+func TestGroupedColumnTypes(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db, aggFixture...)
+
+	rows, err := db.Query(`SELECT region, count(*), sum(amount), avg(rate) FROM sales GROUP BY region`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	cts, err := rows.ColumnTypes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	names := make([]string, len(cts))
+	kinds := make([]string, len(cts))
+	for i, ct := range cts {
+		names[i] = ct.Name()
+		kinds[i] = ct.DatabaseTypeName()
+	}
+
+	if want := []string{"region", "count", "sum", "avg"}; !slices.Equal(names, want) {
+		t.Errorf("names = %v, want %v", names, want)
+	}
+	// region keeps the type it was declared with; each aggregate reports what
+	// it actually produces.
+	if want := []string{"text", "bigint", "bigint", "double precision"}; !slices.Equal(kinds, want) {
+		t.Errorf("types = %v, want %v", kinds, want)
+	}
+}
+
 func TestAggregateScansIntoNullable(t *testing.T) {
 	db := open(t)
 	mustExecAll(t, db, `CREATE TABLE e (n INT)`)
