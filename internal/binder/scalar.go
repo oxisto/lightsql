@@ -37,8 +37,13 @@ func bindScalarCall(fc *ast.FuncCall, sc *scope) (plan.Expr, bool, error) {
 		}
 		return &plan.Now{Kind: types.KindTimestamptz}, true, nil
 
-	case "coalesce":
-		e, err := bindCoalesce(fc, sc)
+	case "coalesce", "nullif":
+		// Both compare or choose between their arguments, so the arguments have
+		// to agree on a type first. Left to the registry they would not be
+		// checked at all, and nullif(1, 'a') would compare an integer against
+		// text -- never equal, so it would quietly return the 1 rather than
+		// saying the question makes no sense.
+		e, err := bindChoice(fc, sc)
 		return e, true, err
 	}
 
@@ -102,9 +107,14 @@ func argTypeError(name string, kinds []types.Kind, fc *ast.FuncCall) error {
 		"function %s(%s) does not exist", name, strings.Join(parts, ", ")).At(fc.Pos())
 }
 
-// bindCoalesce binds COALESCE, whose arguments must share a type because any
-// one of them may be the answer.
-func bindCoalesce(fc *ast.FuncCall, sc *scope) (plan.Expr, error) {
+// bindChoice binds COALESCE and NULLIF, whose arguments must share a type
+// because either the result is one of them or they are compared to each other.
+func bindChoice(fc *ast.FuncCall, sc *scope) (plan.Expr, error) {
+	name := lower(fc.Name.Name)
+	if name == "nullif" && len(fc.Args) != 2 {
+		return nil, pgerr.Newf(pgerr.UndefinedFunction,
+			"function nullif does not take %d arguments", len(fc.Args)).At(fc.Pos())
+	}
 	if len(fc.Args) == 0 {
 		return nil, pgerr.New(pgerr.UndefinedFunction,
 			"function coalesce requires at least one argument").At(fc.Pos())
@@ -122,7 +132,7 @@ func bindCoalesce(fc *ast.FuncCall, sc *scope) (plan.Expr, error) {
 	// The same rule a CASE uses, and for the same reason: whichever argument
 	// answers, the result column has one declared type, so they have to agree
 	// before the query runs rather than per row.
-	kind, err := commonKind(args, fc.Pos())
+	kind, err := commonKind(strings.ToUpper(name), args, fc.Pos())
 	if err != nil {
 		return nil, err
 	}
@@ -131,6 +141,10 @@ func bindCoalesce(fc *ast.FuncCall, sc *scope) (plan.Expr, error) {
 			return nil, err
 		}
 	}
+
+	if name == "nullif" {
+		return &plan.FuncCall{Func: "nullif", Args: args, Kind: kind}, nil
+	}
 	return &plan.Coalesce{Args: args, Kind: kind}, nil
 }
 
@@ -138,7 +152,7 @@ func bindCoalesce(fc *ast.FuncCall, sc *scope) (plan.Expr, error) {
 // argument-shape errors are reported for those too.
 func isSpecialForm(name string) bool {
 	switch lower(name) {
-	case "now", "coalesce":
+	case "now", "coalesce", "nullif":
 		return true
 	}
 	return false

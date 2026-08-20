@@ -211,7 +211,7 @@ func bindCase(e *ast.CaseExpr, sc *scope) (plan.Expr, error) {
 		values = append(values, els)
 	}
 
-	kind, err := commonKind(values, e.Pos())
+	kind, err := commonKind("CASE", values, e.Pos())
 	if err != nil {
 		return nil, err
 	}
@@ -251,14 +251,15 @@ func matchArm(operand, arm plan.Expr, pos token.Pos) (plan.Expr, error) {
 	return &plan.Binary{Op: ast.OpEq, L: operand, R: arm, Kind: types.KindBool}, nil
 }
 
-// commonKind settles the type a CASE evaluates to.
+// commonKind settles the type a construct with several branches evaluates to.
 //
 // A NULL branch carries no type and so does not constrain the others. Numeric
 // branches promote to float if any one of them is float, matching what an
 // arithmetic expression over the same values would produce. Anything else that
 // disagrees is a type error, reported here rather than becoming a result column
-// whose type depends on which row you look at.
-func commonKind(values []plan.Expr, pos token.Pos) (types.Kind, error) {
+// whose type depends on which row you look at. what names the construct in that
+// error, so a COALESCE is not reported as a CASE it was never written as.
+func commonKind(what string, values []plan.Expr, pos token.Pos) (types.Kind, error) {
 	kind := types.KindNull
 	numeric := true
 	for _, v := range values {
@@ -279,7 +280,7 @@ func commonKind(values []plan.Expr, pos token.Pos) (types.Kind, error) {
 			}
 		default:
 			return types.KindNull, pgerr.Newf(pgerr.DatatypeMismatch,
-				"CASE types %s and %s cannot be matched", kind, k).At(pos)
+				"%s types %s and %s cannot be matched", what, kind, k).At(pos)
 		}
 	}
 	return kind, nil

@@ -20,6 +20,13 @@ func TestTemporalLiterals(t *testing.T) {
 		want  string
 	}{
 		{"date", `SELECT '2024-01-02'::DATE`, "2024-01-02"},
+		// A timestamp-shaped string casts to date by truncation, as in
+		// PostgreSQL -- the date is the part of it that was asked for.
+		{"date truncates a timestamp", `SELECT '2024-01-02 12:30:00'::DATE`, "2024-01-02"},
+		{"date truncates a zoned timestamp", `SELECT '2024-01-02T12:30:00Z'::DATE`, "2024-01-02"},
+		// Before the epoch the instant is negative, so truncation has to floor
+		// rather than divide toward zero or the date lands a day late.
+		{"date before the epoch", `SELECT '1969-06-15 12:00:00'::DATE`, "1969-06-15"},
 		{"timestamp with a space", `SELECT '2024-01-02 12:30:00'::TIMESTAMP`, "2024-01-02 12:30:00"},
 		// Both separators are in the wild: SQL writes the space, RFC 3339 and
 		// JSON write the T, and one migration file routinely holds both.

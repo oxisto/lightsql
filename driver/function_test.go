@@ -89,6 +89,27 @@ func TestScalarArgumentTypes(t *testing.T) {
 		})
 	}
 
+	// coalesce and nullif choose between or compare their arguments, so those
+	// have to agree with each other even though neither declares a fixed type.
+	// Left unchecked, nullif(1, 'a') compares an integer against text -- never
+	// equal -- and quietly returns the 1.
+	for _, q := range []string{`SELECT nullif(1, 'a')`, `SELECT coalesce(1, 'x')`} {
+		t.Run(q, func(t *testing.T) {
+			err := queryErr(db, q)
+			if err == nil {
+				t.Fatalf("%s: expected a type error", q)
+			}
+			// The message must name the construct that was written, not the
+			// CASE that commonKind is shared with.
+			if !strings.Contains(err.Error(), "cannot be matched") {
+				t.Errorf("got %v", err)
+			}
+			if strings.Contains(err.Error(), "CASE") {
+				t.Errorf("got %v, which reports a CASE that was never written", err)
+			}
+		})
+	}
+
 	// The other direction: a function that legitimately takes anything must
 	// keep doing so, or this check would have gone too far.
 	for _, q := range []string{
@@ -112,6 +133,7 @@ func TestScalarArity(t *testing.T) {
 	for _, q := range []string{
 		`SELECT lower('a', 'b')`,
 		`SELECT nullif(1)`,
+		`SELECT nullif(1, 2, 3)`,
 		`SELECT now(1)`,
 		`SELECT nosuchfunction(1)`,
 	} {

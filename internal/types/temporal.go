@@ -64,11 +64,25 @@ func ParseTemporal(s string, want Kind) (Value, bool) {
 
 	switch want {
 	case KindDate:
+		// A timestamp-shaped string is accepted and truncated to its day, which
+		// is what PostgreSQL does: the date is the part of it that was asked
+		// for, and refusing would reject a literal the engine itself renders.
 		t, ok := tryLayouts(s, dateLayouts)
 		if !ok {
-			return Value{}, false
+			if t, ok = tryLayouts(s, stampLayouts); !ok {
+				if t, ok = tryLayouts(s, zonedLayouts); !ok {
+					return Value{}, false
+				}
+			}
 		}
-		return Date(t.UTC().Unix() / 86400), true
+		// Flooring, not dividing: a date before 1970 has a negative instant,
+		// and truncating toward zero would land it a day late.
+		sec := t.UTC().Unix()
+		days := sec / 86400
+		if sec < 0 && sec%86400 != 0 {
+			days--
+		}
+		return Date(days), true
 
 	case KindTime:
 		t, ok := tryLayouts(s, timeLayouts)
