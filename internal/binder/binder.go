@@ -48,18 +48,32 @@ type scopeColumn struct {
 	name    string
 	ordinal int
 	typ     catalog.Type
+	// hidden marks the right-hand copy of a column merged by JOIN ... USING.
+	// The pair is one column as far as the query is concerned, so the copy must
+	// not make an unqualified reference ambiguous and must not appear twice in
+	// SELECT *. It stays in the scope, rather than being removed, because it is
+	// still addressable as u.id and its ordinal still describes the joined row.
+	hidden bool
 }
 
 // addTable brings every column of a table into scope under the given qualifier.
 // The qualifier is the alias when one was written, and only the alias:
 // PostgreSQL hides the original name once a table is aliased.
+// The ordinal recorded is the column's position in the row the executor will
+// build, not its position within its own table. For a single table those are
+// the same; for a join the right side is offset by the width of the left, which
+// is exactly what appending to a shared scope produces.
 func (s *scope) addTable(t *catalog.Table, qualifier string) {
+	base := len(s.cols)
 	for i, c := range t.Columns {
 		s.cols = append(s.cols, scopeColumn{
-			table: qualifier, name: c.Name, ordinal: i, typ: c.Type,
+			table: qualifier, name: c.Name, ordinal: base + i, typ: c.Type,
 		})
 	}
 }
+
+// visible reports whether an unqualified reference may resolve to this column.
+func (c *scopeColumn) visible(qualified bool) bool { return qualified || !c.hidden }
 
 // resolve finds a column by an optionally qualified name. An unqualified name
 // that matches more than one table is ambiguous, which SQL rejects rather than
@@ -67,11 +81,15 @@ func (s *scope) addTable(t *catalog.Table, qualifier string) {
 func (s *scope) resolve(ref *ast.ColumnRef) (scopeColumn, error) {
 	var found scopeColumn
 	n := 0
+	qualified := !ref.Table.IsEmpty()
 	for _, c := range s.cols {
 		if c.name != ref.Column.Name {
 			continue
 		}
-		if !ref.Table.IsEmpty() && c.table != ref.Table.Name {
+		if qualified && c.table != ref.Table.Name {
+			continue
+		}
+		if !c.visible(qualified) {
 			continue
 		}
 		found = c
@@ -770,6 +788,153 @@ func (b *Binder) bindReturning(items []ast.SelectItem, sc *scope) (*plan.Returni
 // SELECT
 // ---------------------------------------------------------------------------
 
+// bindFrom resolves one FROM item, bringing its columns into sc and returning
+// the node that produces them.
+//
+// It recurses, because a join's operands are themselves table expressions:
+// `a JOIN b JOIN c` is a join whose left side is a join. Order matters — the
+// left side must be added to the scope before the right, since that is what
+// gives each column the ordinal it will have in the joined row.
+func (b *Binder) bindFrom(te ast.TableExpr, sc *scope) (plan.Node, error) {
+	switch te := te.(type) {
+	case *ast.TableRef:
+		t, err := b.cat.Lookup(te.Table.Schema.Name, te.Table.Name.Name)
+		if err != nil {
+			return nil, at(err, te.Pos())
+		}
+		// The qualifier is the alias when one was written, and only the alias:
+		// PostgreSQL hides the original name once a table is aliased.
+		qualifier := t.Name
+		if !te.Alias.IsEmpty() {
+			qualifier = te.Alias.Name
+		}
+		sc.addTable(t, qualifier)
+
+		cols := make([]plan.ResultColumn, len(t.Columns))
+		for i, c := range t.Columns {
+			cols[i] = plan.ResultColumn{Name: c.Name, Type: c.Type}
+		}
+		return &plan.Scan{Table: t, Cols: cols}, nil
+
+	case *ast.JoinExpr:
+		return b.bindJoin(te, sc)
+
+	case *ast.SubqueryRef:
+		return nil, pgerr.New(pgerr.FeatureNotSupported,
+			"subqueries in FROM are not supported yet").At(te.Pos())
+
+	default:
+		// Naming the construct rather than printing the Go type keeps the
+		// message stable and meaningful to someone reading their own SQL.
+		return nil, pgerr.New(pgerr.FeatureNotSupported,
+			"this FROM item is not supported yet").At(te.Pos())
+	}
+}
+
+func (b *Binder) bindJoin(j *ast.JoinExpr, sc *scope) (plan.Node, error) {
+	left, err := b.bindFrom(j.Left, sc)
+	if err != nil {
+		return nil, err
+	}
+	// Everything already in scope belongs to the left side. Recording the
+	// boundary here is what lets USING find the two copies of a name.
+	boundary := len(sc.cols)
+
+	right, err := b.bindFrom(j.Right, sc)
+	if err != nil {
+		return nil, err
+	}
+
+	node := &plan.Join{Left: left, Right: right, Type: j.Type}
+
+	switch {
+	case len(j.Using) > 0:
+		if node.Pred, err = b.bindUsing(j, sc, boundary); err != nil {
+			return nil, err
+		}
+	case j.On != nil:
+		// The condition sees both sides, which is the whole point of binding it
+		// after the right side has been added.
+		if node.Pred, err = b.bindPredicate(j.On, sc, "JOIN/ON"); err != nil {
+			return nil, err
+		}
+	case j.Type != ast.CrossJoin:
+		return nil, pgerr.Newf(pgerr.SyntaxError,
+			"%s JOIN requires ON or USING", j.Type).At(j.JoinPos)
+	}
+
+	// Cols describes the row the executor actually builds, so it keeps both
+	// copies of a USING column. Ordinals index that row, and a join can itself
+	// be the left side of another join, so narrowing this would put every
+	// ordinal above it out by one. Hiding is a scope concern, applied where
+	// names are resolved and where * is expanded.
+	node.Cols = joinCols(left, right)
+	return node, nil
+}
+
+// bindUsing turns USING (a, b) into the conjunction left.a = right.a AND
+// left.b = right.b, and merges each pair into a single visible column.
+func (b *Binder) bindUsing(j *ast.JoinExpr, sc *scope, boundary int) (plan.Expr, error) {
+	var pred plan.Expr
+	for _, name := range j.Using {
+		l, err := sc.only(name.Name, 0, boundary, name.NamePos)
+		if err != nil {
+			return nil, err
+		}
+		r, err := sc.only(name.Name, boundary, len(sc.cols), name.NamePos)
+		if err != nil {
+			return nil, err
+		}
+		// The right-hand copy stops being independently visible: USING says the
+		// two are one column, so an unqualified reference must not be ambiguous
+		// and SELECT * must not show it twice.
+		sc.cols[r].hidden = true
+
+		eq := &plan.Binary{
+			Op:   ast.OpEq,
+			L:    &plan.Column{Ordinal: sc.cols[l].ordinal, Kind: sc.cols[l].typ.Kind, Name: name.Name},
+			R:    &plan.Column{Ordinal: sc.cols[r].ordinal, Kind: sc.cols[r].typ.Kind, Name: name.Name},
+			Kind: types.KindBool,
+		}
+		if pred == nil {
+			pred = eq
+			continue
+		}
+		pred = &plan.Binary{Op: ast.OpAnd, L: pred, R: eq, Kind: types.KindBool}
+	}
+	return pred, nil
+}
+
+// only finds the single column named name in sc.cols[lo:hi], for USING, which
+// needs exactly one candidate on each side.
+func (s *scope) only(name string, lo, hi int, pos token.Pos) (int, error) {
+	found := -1
+	for i := lo; i < hi; i++ {
+		if s.cols[i].name != name || s.cols[i].hidden {
+			continue
+		}
+		if found >= 0 {
+			return 0, pgerr.Newf(pgerr.AmbiguousColumn,
+				"common column name %q appears more than once", name).At(pos)
+		}
+		found = i
+	}
+	if found < 0 {
+		return 0, pgerr.Newf(pgerr.UndefinedColumn,
+			"column %q specified in USING clause does not exist in one of the tables", name).At(pos)
+	}
+	return found, nil
+}
+
+// joinCols is the concatenation of the two inputs' columns, which is exactly
+// the row the join operator emits.
+func joinCols(left, right plan.Node) []plan.ResultColumn {
+	l, r := left.Result(), right.Result()
+	out := make([]plan.ResultColumn, 0, len(l)+len(r))
+	out = append(out, l...)
+	return append(out, r...)
+}
+
 func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 	for _, unsupported := range []struct {
 		cond bool
@@ -778,7 +943,6 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		{s.Distinct, "DISTINCT"},
 		{len(s.GroupBy) > 0, "GROUP BY"},
 		{s.Having != nil, "HAVING"},
-		{len(s.From) > 1, "multiple FROM items"},
 	} {
 		if unsupported.cond {
 			return nil, pgerr.Newf(pgerr.FeatureNotSupported,
@@ -791,28 +955,19 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 	// below always has an input and no consumer needs a nil special case.
 	var node plan.Node = &plan.SingleRow{}
 
-	if len(s.From) == 1 {
-		ref, ok := s.From[0].(*ast.TableRef)
-		if !ok {
-			return nil, pgerr.New(pgerr.FeatureNotSupported,
-				"only a simple table reference is supported in FROM yet").At(s.From[0].Pos())
-		}
-		t, err := b.cat.Lookup(ref.Table.Schema.Name, ref.Table.Name.Name)
+	for i, item := range s.From {
+		n, err := b.bindFrom(item, sc)
 		if err != nil {
-			return nil, at(err, ref.Pos())
+			return nil, err
 		}
-
-		qualifier := t.Name
-		if !ref.Alias.IsEmpty() {
-			qualifier = ref.Alias.Name
+		if i == 0 {
+			node = n
+			continue
 		}
-		sc.addTable(t, qualifier)
-
-		cols := make([]plan.ResultColumn, len(t.Columns))
-		for i, c := range t.Columns {
-			cols[i] = plan.ResultColumn{Name: c.Name, Type: c.Type}
-		}
-		node = &plan.Scan{Table: t, Cols: cols}
+		// A comma in FROM is an inner join with no condition, which is what
+		// CROSS JOIN means, so the two spellings produce the same plan rather
+		// than a second code path.
+		node = &plan.Join{Left: node, Right: n, Type: ast.CrossJoin, Cols: joinCols(node, n)}
 	}
 
 	if s.Where != nil {
@@ -940,6 +1095,11 @@ func (b *Binder) bindSelectItems(items []ast.SelectItem, sc *scope, input plan.N
 			matched := false
 			for _, c := range sc.cols {
 				if !star.Table.IsEmpty() && c.table != star.Table.Name {
+					continue
+				}
+				// A column merged by USING is one column, so * shows it once.
+				// It stays reachable as u.id, hence the qualified exception.
+				if !c.visible(!star.Table.IsEmpty()) {
 					continue
 				}
 				matched = true

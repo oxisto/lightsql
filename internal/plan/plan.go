@@ -124,6 +124,20 @@ type Scan struct {
 	Cols []ResultColumn
 }
 
+// Join combines two inputs. The output row is the left row followed by the
+// right one, so a column's ordinal in the joined row is its ordinal within its
+// own side plus the width of everything to the left of it — which is what the
+// binder assigns, so nothing here has to translate ordinals per row.
+//
+// Pred is nil for a CROSS JOIN. For an outer join the side that may go
+// unmatched is padded with NULLs rather than dropped.
+type Join struct {
+	Left, Right Node
+	Type        ast.JoinType
+	Pred        Expr
+	Cols        []ResultColumn
+}
+
 // Filter keeps the rows for which Pred evaluates to true. Rows for which the
 // predicate is false or unknown are both dropped, which is SQL's rule.
 type Filter struct {
@@ -171,6 +185,7 @@ type Limit struct {
 func (n *SingleRow) Result() []ResultColumn { return nil }
 func (n *Scan) Result() []ResultColumn      { return n.Cols }
 func (n *Filter) Result() []ResultColumn    { return n.Input.Result() }
+func (n *Join) Result() []ResultColumn      { return n.Cols }
 func (n *Project) Result() []ResultColumn   { return n.Cols }
 func (n *Sort) Result() []ResultColumn      { return n.Input.Result() }
 func (n *Limit) Result() []ResultColumn     { return n.Input.Result() }
@@ -178,6 +193,7 @@ func (n *Limit) Result() []ResultColumn     { return n.Input.Result() }
 func (*SingleRow) planNode() {}
 func (*Scan) planNode()      {}
 func (*Filter) planNode()    {}
+func (*Join) planNode()      {}
 func (*Project) planNode()   {}
 func (*Sort) planNode()      {}
 func (*Limit) planNode()     {}
