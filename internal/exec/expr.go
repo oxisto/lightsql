@@ -102,6 +102,9 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 			return out, nil
 		}, nil
 
+	case *plan.Case:
+		return compileCase(e, tx)
+
 	case *plan.ScalarSubquery:
 		return compileScalarSubquery(e, tx)
 
@@ -123,6 +126,57 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 	default:
 		return nil, pgerr.Newf(pgerr.InternalError, "cannot compile expression %T", e)
 	}
+}
+
+// compileCase runs the arms in order and stops at the first whose condition is
+// true.
+//
+// Only true fires an arm: false and unknown are both skipped, which is the same
+// rule a WHERE clause follows and the reason `CASE WHEN NULL THEN 1 ELSE 2 END`
+// is 2 rather than 1. A CASE that matches nothing with no ELSE is NULL, which
+// is why the zero Value is never returned from here.
+func compileCase(e *plan.Case, tx *storage.Tx) (Eval, error) {
+	type arm struct{ cond, value Eval }
+
+	arms := make([]arm, len(e.Whens))
+	for i, w := range e.Whens {
+		cond, err := Compile(w.Cond, tx)
+		if err != nil {
+			return nil, err
+		}
+		value, err := Compile(w.Value, tx)
+		if err != nil {
+			return nil, err
+		}
+		arms[i] = arm{cond: cond, value: value}
+	}
+
+	var els Eval
+	if e.Else != nil {
+		var err error
+		if els, err = Compile(e.Else, tx); err != nil {
+			return nil, err
+		}
+	}
+
+	return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+		for _, a := range arms {
+			v, err := a.cond(ctx, args, row)
+			if err != nil {
+				return types.Value{}, err
+			}
+			if v.Truth() != types.True {
+				continue
+			}
+			// Only the arm that fires is evaluated, so a later branch that
+			// would divide by zero costs nothing when an earlier one matches.
+			return a.value(ctx, args, row)
+		}
+		if els != nil {
+			return els(ctx, args, row)
+		}
+		return types.Null(), nil
+	}, nil
 }
 
 // Subqueries in expression position are uncorrelated: the binder gives one a
