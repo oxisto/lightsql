@@ -45,6 +45,12 @@ type scope struct {
 	// clause names the part of the statement being bound, for error messages
 	// that need to say where an aggregate was misplaced.
 	clause string
+	// b is the binder, needed only to resolve a subquery in expression
+	// position against the catalog. It is deliberately left nil in the scopes
+	// where SQL forbids a subquery -- a CHECK constraint and a DEFAULT
+	// expression -- so that rejecting one there is structural rather than an
+	// extra test somebody has to remember to write.
+	b *Binder
 }
 
 type scopeColumn struct {
@@ -641,7 +647,7 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 		for i, e := range row {
 			// Each value is bound in an empty scope: an inserted expression
 			// cannot refer to a column of the row being built.
-			be, err := bindExpr(e, &scope{})
+			be, err := bindExpr(e, &scope{b: b})
 			if err != nil {
 				return nil, err
 			}
@@ -681,7 +687,7 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 	// RETURNING sees the row as stored, including generated serial values —
 	// which is the whole point of `INSERT ... RETURNING id`.
 	if len(s.Returning) > 0 {
-		sc := &scope{}
+		sc := &scope{b: b}
 		sc.addTable(t, t.Name)
 		if ins.Returning, err = b.bindReturning(s.Returning, sc); err != nil {
 			return nil, err
@@ -769,7 +775,7 @@ func (b *Binder) bindTarget(name *ast.TableName, alias ast.Name) (*catalog.Table
 	if !alias.IsEmpty() {
 		qualifier = alias.Name
 	}
-	sc := &scope{}
+	sc := &scope{b: b}
 	sc.addTable(t, qualifier)
 	return t, sc, nil
 }
@@ -992,7 +998,7 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 // them through the same function is what keeps a subquery's clause handling
 // from drifting away from a top-level query's.
 func (b *Binder) bindSelectNode(s *ast.SelectStmt) (plan.Node, error) {
-	sc := &scope{}
+	sc := &scope{b: b}
 	// A SELECT without FROM is evaluated over one empty row, so every node
 	// below always has an input and no consumer needs a nil special case.
 	var node plan.Node = &plan.SingleRow{}

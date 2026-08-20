@@ -30,6 +30,7 @@ const (
 	InvalidTextForType      = "22P02"
 	NumericValueOutOfRange  = "22003"
 	DivisionByZero          = "22012"
+	CardinalityViolation    = "21000"
 	NotNullViolation        = "23502"
 	ForeignKeyViolation     = "23503"
 	UniqueViolation         = "23505"
