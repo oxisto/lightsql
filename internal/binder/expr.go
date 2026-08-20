@@ -14,6 +14,16 @@ import (
 // bindExpr resolves an expression against a scope, producing a typed plan
 // expression whose result kind is known statically.
 func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
+	// Above a grouping, an expression is evaluated over the grouped row. A term
+	// that names a GROUP BY expression becomes a reference to that key, whole,
+	// before its parts are looked at — which is what makes GROUP BY a + b work
+	// when a and b are not themselves grouped.
+	if sc.agg != nil {
+		if col, ok := sc.agg.column(e); ok {
+			return col, nil
+		}
+	}
+
 	switch e := e.(type) {
 	case *ast.ParenExpr:
 		// Grouping has done its job in the parser; it carries no meaning here.
@@ -33,6 +43,15 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Reaching here in a grouped query means the column is neither a group
+		// key nor inside an aggregate, so there is no single value to report
+		// for the group. The check sits after resolve so that a misspelled name
+		// is still reported as a missing column rather than as this.
+		if sc.agg != nil {
+			return nil, pgerr.Newf(pgerr.GroupingError,
+				"column %q must appear in the GROUP BY clause or be used in an aggregate function",
+				e.String()).At(e.Pos())
+		}
 		return &plan.Column{Ordinal: c.ordinal, Kind: c.typ.Kind, Name: c.name}, nil
 
 	case *ast.IsNullExpr:
@@ -50,6 +69,9 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 
 	case *ast.BinaryExpr:
 		return bindBinary(e, sc)
+
+	case *ast.FuncCall:
+		return bindFuncCall(e, sc)
 
 	case *ast.Star:
 		return nil, pgerr.New(pgerr.SyntaxError,

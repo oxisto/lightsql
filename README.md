@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-53_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-55_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -161,8 +161,8 @@ the two.
 | ✅ | Table aliases | ✅ | ✅ | an alias replaces the table name, as in PostgreSQL |
 | ✅ | Inner and outer joins | ✅ | ✅ | INNER, LEFT, RIGHT, FULL and CROSS, with ON or USING; a comma in FROM is a cross join; nested loop, so no index is used yet |
 | ✅ | JOIN ... USING | ✅ | ✅ | the pair is merged into one column, so it is unambiguous unqualified and appears once in SELECT * |
-| ⬜ | GROUP BY / HAVING | ✅ | ⬜ |  |
-| ⬜ | Aggregate functions | ✅ | ⬜ | parsed generically; the function library is pending |
+| ✅ | GROUP BY / HAVING | ✅ | ✅ | groups on columns or expressions; NULLs form one group; HAVING may use an aggregate the select list does not |
+| 🟡 | Aggregate functions | ✅ | 🟡 | count, sum, avg, min and max, each with DISTINCT; count is 0 over no rows and the rest are NULL. Other aggregates are pending |
 | ✅ | ORDER BY | ✅ | ✅ | ASC/DESC, NULLS FIRST/LAST, output aliases, select-list positions, and expressions over unselected columns |
 | ⬜ | DISTINCT / DISTINCT ON | ✅ | ⬜ |  |
 | ⬜ | Subqueries | ✅ | ⬜ | scalar, IN, EXISTS, and derived tables |

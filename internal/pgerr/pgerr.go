@@ -23,6 +23,7 @@ const (
 	UndefinedFunction       = "42883"
 	UndefinedObject         = "42704"
 	AmbiguousColumn         = "42702"
+	GroupingError           = "42803"
 	DuplicateTable          = "42P07"
 	DuplicateColumn         = "42701"
 	DatatypeMismatch        = "42804"
