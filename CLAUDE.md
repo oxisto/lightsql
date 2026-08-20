@@ -120,6 +120,51 @@ Full rules — package naming, `all:`, bodies, PR descriptions — are in
 [CONTRIBUTING.md](CONTRIBUTING.md#commit-messages). That file is the single source of
 truth; do not restate its rules here, or the two will drift.
 
+Branches are `oxisto/<description>` — not the `package: summary` form used for commits.
+
+## Stacked pull requests
+
+A feature that splits into several reviewable pieces goes out as a stack, one PR per
+piece. Use the `gh stack` extension rather than driving the branches by hand:
+
+```sh
+gh stack init <branch>...            # adopt existing branches into a stack, bottom first
+gh stack add <branch>                # add a new branch on top
+gh stack submit                      # push every branch and create or update its PR
+gh stack view                        # the chain, with PR numbers
+gh stack merge <stack> --squash      # land the whole stack, atomically
+```
+
+`init` adopts branches that already have PRs, so a stack can be assembled after the fact.
+
+**Land a stack with `gh stack merge`, not one PR at a time.** It uses GitHub's atomic
+stack merge: every PR up to your chosen one goes in as a single all-or-nothing
+operation, so there is no window where half the stack is merged and the rest needs
+rebasing. Pass the stack number when the current branch is not part of the stack —
+merging PR by PR is what creates the restacking problem below, rather than solving it.
+
+Three things that are not obvious:
+
+- **`submit` reporting "up to date" is not proof.** It has said that while the remote
+  was in fact behind. Check `git rev-parse` on each branch against its `origin/`
+  counterpart before believing the stack is pushed.
+- **`main` allows squash merges only**, so a merged PR's commits never appear on `main`
+  by SHA. This does not matter when the stack lands atomically, but it does the moment
+  part of a stack is merged on its own: rebasing what is left with a plain
+  `git rebase main` then replays patches that are already there. Use
+  `git rebase --onto main <old-base-head> <branch>` so only the commits above the merged
+  branch are replayed.
+- **The generated README conflicts on every restack** that touches `internal/features`,
+  and the merge often succeeds textually while leaving the matrix stale. Regenerate it
+  as part of the rebase:
+
+  ```sh
+  git rebase <base> --exec 'go test ./internal/features -update && git add -A && git commit --amend --no-edit'
+  ```
+
+Each commit in a stack must build and pass tests on its own, so a bisect never lands on
+a broken tree. Check it rather than assume it — a scratch worktree per commit is cheap.
+
 ## Conventions
 
 - Comments explain *why*, especially where the code deliberately differs from an obvious
