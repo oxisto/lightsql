@@ -145,3 +145,51 @@ func TestTemporalInStatements(t *testing.T) {
 		}
 	})
 }
+
+// TestTemporalCrossKind covers comparing and assigning across the temporal
+// kinds, which is what `expires_at <= now()` needs when the column has no time
+// zone.
+//
+// These need a real conversion rather than permission to compare: a date counts
+// days while a timestamp counts microseconds, so comparing the payloads
+// directly would answer confidently and wrongly.
+func TestTemporalCrossKind(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE s (id INT, at TIMESTAMP, d DATE, tz TIMESTAMPTZ)`,
+		`INSERT INTO s VALUES (1, '2024-06-01 12:00:00', '2024-06-01', '2024-06-01T12:00:00Z')`,
+	)
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"timestamp against timestamptz", `SELECT id FROM s WHERE at = tz`, []string{"1"}},
+		{"date against timestamp", `SELECT id FROM s WHERE d < at`, []string{"1"}},
+		// A date is midnight, so it is not the same instant as noon that day.
+		{"date is midnight", `SELECT id FROM s WHERE d = at`, nil},
+		{"timestamp against now()", `SELECT id FROM s WHERE at < now()`, []string{"1"}},
+		{"timestamptz against now()", `SELECT id FROM s WHERE tz < now()`, []string{"1"}},
+		{"date against now()", `SELECT id FROM s WHERE d < now()`, []string{"1"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rowsOf(t, db, tt.query); !slices.Equal(got, tt.want) {
+				t.Errorf("%s\n got: %v\nwant: %v", tt.query, got, tt.want)
+			}
+		})
+	}
+
+	// A timestamptz assigned into a column with no zone, which is what a
+	// DEFAULT now() on a TIMESTAMP column does.
+	t.Run("assignment across kinds", func(t *testing.T) {
+		mustExecAll(t, db,
+			`CREATE TABLE a (id INT, at TIMESTAMP DEFAULT now())`,
+			`INSERT INTO a (id) VALUES (1)`)
+		if got := rowsOf(t, db, `SELECT count(*) FROM a WHERE at IS NOT NULL`); !slices.Equal(got, []string{"1"}) {
+			t.Errorf("got %v, want [1]", got)
+		}
+	})
+}

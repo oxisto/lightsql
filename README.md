@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-60_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-61_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -178,7 +178,7 @@ the two.
 | ✅ | BETWEEN / IN / LIKE | ✅ | ✅ | including the negated forms. BETWEEN is inclusive and rewritten to a pair of comparisons; LIKE supports % and _ with backslash escaping, and is anchored, so it matches the whole string. IN follows SQL's three-valued rule: without a match, a NULL among the candidates makes the answer unknown rather than false, so NOT IN over a NULL returns no rows. ILIKE and an explicit ESCAPE clause are not supported |
 | ✅ | CASE | ✅ | ✅ | simple and searched forms; the simple form is rewritten to the searched one, so both take one path. Only a true condition fires an arm, no match without ELSE is NULL, and the branches must share a type so a result column cannot change type from row to row |
 | ✅ | CAST | ✅ | ✅ | both CAST(x AS t) and x::t |
-| ⬜ | Scalar functions | ✅ | ⬜ | parsed generically; the function library is pending |
+| 🟡 | Scalar functions | ✅ | 🟡 | coalesce, nullif, now, lower, upper, length, trim, abs and round. NULL propagates for all but coalesce and nullif, and coalesce stops at the first argument that answers. Argument types are checked at bind time, so lower(1) is rejected rather than reading an integer as text. The library is small and grows on demand |
 | ❌ | Arrays | ❌ | ❌ | out of scope for v1 |
 | ✅ | JSONB | ✅ | ✅ | canonicalised on store; scans as []byte |
 | ✅ | JSON | ✅ | ✅ | kept exactly as written, unlike jsonb |

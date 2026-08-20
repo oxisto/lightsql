@@ -1,6 +1,10 @@
 package storage
 
-import "github.com/oxisto/lightsql/internal/pgerr"
+import (
+	"time"
+
+	"github.com/oxisto/lightsql/internal/pgerr"
+)
 
 // Isolation is the isolation level a transaction runs at.
 //
@@ -54,14 +58,22 @@ type Tx struct {
 	// caller rolls back, rather than letting them build on a broken one.
 	failed bool
 	done   bool
+	// started is when the transaction began. now() reports it rather than the
+	// wall clock, so every statement in a transaction agrees about "now" --
+	// which is what PostgreSQL guarantees and what stops two rows inserted by
+	// one transaction from disagreeing about when they were written.
+	started time.Time
 }
 
 // Begin starts a transaction at the given isolation level.
 func (m *TxManager) BeginTx(iso Isolation, readOnly bool) *Tx {
-	tx := &Tx{ID: m.Begin(), mgr: m, iso: iso, readOnly: readOnly}
+	tx := &Tx{ID: m.Begin(), mgr: m, iso: iso, readOnly: readOnly, started: time.Now().UTC()}
 	tx.snap = m.Take()
 	return tx
 }
+
+// Started reports when the transaction began.
+func (t *Tx) Started() time.Time { return t.started }
 
 // Snapshot returns the view this transaction reads through.
 func (t *Tx) Snapshot() *Snapshot { return t.snap }

@@ -605,6 +605,24 @@ func unify(l, r plan.Expr, e *ast.BinaryExpr) (left, right plan.Expr, err error)
 		return l, r, nil
 	}
 
+	// Two temporal kinds compare after being brought to the same one, which is
+	// what lets `expires_at <= now()` work when the column has no time zone.
+	//
+	// Unlike the numeric kinds this needs a real cast, not just permission: a
+	// date counts days while a timestamp counts microseconds, so comparing the
+	// payloads directly would answer confidently and wrongly.
+	if isTemporal(lt) && isTemporal(rt) {
+		want := widestTemporal(lt, rt)
+		var err error
+		if l, err = coerce(l, want, e.X.Pos()); err != nil {
+			return nil, nil, err
+		}
+		if r, err = coerce(r, want, e.Y.Pos()); err != nil {
+			return nil, nil, err
+		}
+		return l, r, nil
+	}
+
 	// A string literal compared against a document or an instant resolves to
 	// that type. PostgreSQL gives a quoted literal the "unknown" type and lets
 	// the other operand decide; lightsql commits it to text in the binder, so
@@ -669,6 +687,43 @@ func coerce(e plan.Expr, want types.Kind, pos token.Pos) (plan.Expr, error) {
 	if got.IsNumeric() && want.IsNumeric() {
 		return e, nil
 	}
+
+	// The temporal kinds convert into one another: timestamp and timestamptz
+	// share a payload and differ only in how they render, and a date is a
+	// timestamp at midnight. PostgreSQL performs these on assignment, which is
+	// what makes `at TIMESTAMP DEFAULT now()` legal even though now() is a
+	// timestamptz. A cast node is needed rather than passing the expression
+	// through, because unlike the numeric kinds these do not compare across.
+	if isTemporal(got) && isTemporal(want) {
+		return &plan.Cast{X: e, Kind: want}, nil
+	}
+
 	return nil, pgerr.Newf(pgerr.DatatypeMismatch,
 		"expression of type %s cannot be used where %s is expected", got, want).At(pos)
+}
+
+// isTemporal reports whether a kind is a date or an instant, the group whose
+// members PostgreSQL converts between implicitly on assignment.
+func isTemporal(k types.Kind) bool {
+	switch k {
+	case types.KindDate, types.KindTimestamp, types.KindTimestamptz:
+		return true
+	}
+	return false
+}
+
+// widestTemporal picks the kind two temporal operands should meet in.
+//
+// A zoned instant is the widest, then an unzoned one, then a date: converting
+// the other way would discard the time of day and make a comparison answer
+// about the wrong instant.
+func widestTemporal(a, b types.Kind) types.Kind {
+	switch {
+	case a == types.KindTimestamptz || b == types.KindTimestamptz:
+		return types.KindTimestamptz
+	case a == types.KindTimestamp || b == types.KindTimestamp:
+		return types.KindTimestamp
+	default:
+		return types.KindDate
+	}
 }
