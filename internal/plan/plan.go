@@ -162,6 +162,23 @@ type Aggregate struct {
 	Cols []ResultColumn
 }
 
+// Distinct removes duplicate rows.
+//
+// On holds the expressions that decide uniqueness for DISTINCT ON; it is empty
+// for a plain DISTINCT, which compares the whole output row. Those expressions
+// need not appear in the select list, so the projection below may carry extra
+// trailing columns that exist only to evaluate them. Width is how many leading
+// columns to emit, which trims them off again without a second projection.
+//
+// The first row of each group wins, and the input order is preserved, so an
+// ORDER BY below decides which row that is — the same rule PostgreSQL follows.
+type Distinct struct {
+	Input Node
+	On    []Expr
+	Width int
+	Cols  []ResultColumn
+}
+
 // Filter keeps the rows for which Pred evaluates to true. Rows for which the
 // predicate is false or unknown are both dropped, which is SQL's rule.
 type Filter struct {
@@ -211,6 +228,7 @@ func (n *Scan) Result() []ResultColumn      { return n.Cols }
 func (n *Filter) Result() []ResultColumn    { return n.Input.Result() }
 func (n *Join) Result() []ResultColumn      { return n.Cols }
 func (n *Aggregate) Result() []ResultColumn { return n.Cols }
+func (n *Distinct) Result() []ResultColumn  { return n.Cols }
 func (n *Project) Result() []ResultColumn   { return n.Cols }
 func (n *Sort) Result() []ResultColumn      { return n.Input.Result() }
 func (n *Limit) Result() []ResultColumn     { return n.Input.Result() }
@@ -220,6 +238,7 @@ func (*Scan) planNode()      {}
 func (*Filter) planNode()    {}
 func (*Join) planNode()      {}
 func (*Aggregate) planNode() {}
+func (*Distinct) planNode()  {}
 func (*Project) planNode()   {}
 func (*Sort) planNode()      {}
 func (*Limit) planNode()     {}

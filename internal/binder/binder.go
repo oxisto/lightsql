@@ -942,18 +942,6 @@ func joinCols(left, right plan.Node) []plan.ResultColumn {
 }
 
 func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
-	for _, unsupported := range []struct {
-		cond bool
-		what string
-	}{
-		{s.Distinct, "DISTINCT"},
-	} {
-		if unsupported.cond {
-			return nil, pgerr.Newf(pgerr.FeatureNotSupported,
-				"%s is not supported yet", unsupported.what).At(s.Pos())
-		}
-	}
-
 	sc := &scope{}
 	// A SELECT without FROM is evaluated over one empty row, so every node
 	// below always has an input and no consumer needs a nil special case.
@@ -1020,6 +1008,18 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		}
 	}
 
+	// Bound here, with the other clauses above the input, because in a grouped
+	// query DISTINCT ON may name an aggregate and the aggregate node is built
+	// only once every such clause has contributed its calls.
+	var distinctOn []plan.Expr
+	for _, e := range s.DistinctOn {
+		on, err := bindExpr(e, sc)
+		if err != nil {
+			return nil, err
+		}
+		distinctOn = append(distinctOn, on)
+	}
+
 	// Every expression above the grouping has now been bound, so the set of
 	// aggregate calls is complete and the node can be built. Doing it here
 	// rather than before binding is what lets ORDER BY count(*) contribute a
@@ -1036,6 +1036,19 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 	proj.Input = node
 
 	var out plan.Node = proj
+	if s.Distinct {
+		// The output shape is the select list as written; anything appended
+		// below is scaffolding for DISTINCT ON and is trimmed straight off.
+		d := &plan.Distinct{Input: proj, Width: len(proj.Exprs), Cols: proj.Cols}
+		for i, on := range distinctOn {
+			proj.Exprs = append(proj.Exprs, on)
+			proj.Cols = append(proj.Cols, plan.ResultColumn{
+				Name: "", Type: catalog.Type{Kind: on.Type(), Name: on.Type().String()},
+			})
+			d.On = append(d.On, &plan.Column{Ordinal: d.Width + i, Kind: on.Type()})
+		}
+		out = d
+	}
 	if s.Limit != nil || s.Offset != nil {
 		lim := &plan.Limit{Input: out}
 		if lim.Count, err = bindRowCount(s.Limit, "LIMIT"); err != nil {
