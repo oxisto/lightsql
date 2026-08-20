@@ -158,7 +158,11 @@ var Groups = []Group{
 				Note:  "including multi-row VALUES",
 				Setup: probeTable,
 				SQL:   "INSERT INTO t (a, s) VALUES (1, 'x'), (2, 'y')"},
-			{Name: "INSERT ... SELECT", Parse: Yes, Exec: Planned,
+			{Name: "INSERT ... SELECT", Parse: Yes, Exec: Yes,
+				Note: "the source may be any query, and its rows go through the same " +
+					"serial, DEFAULT, CHECK and RETURNING handling as VALUES. Reading the " +
+					"table being written is safe, since a scan takes its rows when the " +
+					"operator is built",
 				Setup: probeJoin,
 				SQL:   "INSERT INTO t (a) SELECT b FROM u"},
 			{Name: "RETURNING", Parse: Yes, Exec: Yes,

@@ -602,11 +602,6 @@ func indexOfColumn(cols []catalog.Column, name string) int {
 // ---------------------------------------------------------------------------
 
 func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
-	if s.Select != nil {
-		return nil, pgerr.New(pgerr.FeatureNotSupported,
-			"INSERT ... SELECT is not supported yet").At(s.Pos())
-	}
-
 	t, err := b.cat.Lookup(s.Table.Schema.Name, s.Table.Name.Name)
 	if err != nil {
 		return nil, at(err, s.Table.Pos())
@@ -637,6 +632,13 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 	}
 
 	ins := &plan.Insert{Table: t, Targets: targets}
+
+	if s.Select != nil {
+		if ins.Source, err = b.insertSource(s.Select, t, targets); err != nil {
+			return nil, err
+		}
+	}
+
 	for _, row := range s.Rows {
 		if len(row) != len(targets) {
 			return nil, pgerr.Newf(pgerr.SyntaxError,
@@ -694,6 +696,40 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 		}
 	}
 	return ins, nil
+}
+
+// insertSource binds the SELECT of an INSERT ... SELECT and adapts its output
+// to the target columns.
+//
+// The adaptation is a projection rather than something the executor does per
+// row, and it converts each column with the same coerce the VALUES form uses.
+// That is what keeps the two spellings of INSERT agreeing about types: without
+// it, `INSERT ... VALUES ('7')` and `INSERT ... SELECT '7'` could disagree
+// about whether a text literal may land in an integer column.
+func (b *Binder) insertSource(sel *ast.SelectStmt, t *catalog.Table, targets []int) (plan.Node, error) {
+	src, err := b.bindSelectNode(sel)
+	if err != nil {
+		return nil, err
+	}
+
+	cols := src.Result()
+	if len(cols) != len(targets) {
+		return nil, pgerr.Newf(pgerr.SyntaxError,
+			"INSERT has %d expressions but %d target columns",
+			len(cols), len(targets)).At(sel.Pos())
+	}
+
+	proj := &plan.Project{Input: src}
+	for i, c := range cols {
+		want := t.Columns[targets[i]].Type
+		var e plan.Expr = &plan.Column{Ordinal: i, Kind: c.Type.Kind, Name: c.Name}
+		if e, err = coerce(e, want.Kind, sel.Pos()); err != nil {
+			return nil, err
+		}
+		proj.Exprs = append(proj.Exprs, e)
+		proj.Cols = append(proj.Cols, plan.ResultColumn{Name: c.Name, Type: want})
+	}
+	return proj, nil
 }
 
 // ---------------------------------------------------------------------------

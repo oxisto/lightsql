@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-59_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-60_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -147,7 +147,7 @@ the two.
 | ✅ | Sequences and SERIAL | ✅ | ✅ | an omitted SERIAL column is filled from a per-column sequence |
 | | **Data manipulation** | | | |
 | ✅ | INSERT ... VALUES | ✅ | ✅ | including multi-row VALUES |
-| ⬜ | INSERT ... SELECT | ✅ | ⬜ |  |
+| ✅ | INSERT ... SELECT | ✅ | ✅ | the source may be any query, and its rows go through the same serial, DEFAULT, CHECK and RETURNING handling as VALUES. Reading the table being written is safe, since a scan takes its rows when the operator is built |
 | ✅ | RETURNING | ✅ | ✅ | on INSERT, UPDATE and DELETE; sees generated serial values |
 | ✅ | UPDATE | ✅ | ✅ | assignments all read the original row, so SET a = b, b = a swaps |
 | ✅ | DELETE | ✅ | ✅ | row order is preserved for the rows that remain |
