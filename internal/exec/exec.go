@@ -50,7 +50,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		if err != nil {
 			return nil, err
 		}
-		pred, err := Compile(n.Pred)
+		pred, err := Compile(n.Pred, tx)
 		if err != nil {
 			return nil, err
 		}
@@ -76,7 +76,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 			keepRight: n.Type == ast.RightJoin || n.Type == ast.FullJoin,
 		}
 		if n.Pred != nil {
-			if op.pred, err = Compile(n.Pred); err != nil {
+			if op.pred, err = Compile(n.Pred, tx); err != nil {
 				return nil, err
 			}
 		}
@@ -105,7 +105,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 			op.funcs = append(op.funcs, agg)
 		}
 		for _, k := range n.Keys {
-			eval, err := Compile(k)
+			eval, err := Compile(k, tx)
 			if err != nil {
 				return nil, err
 			}
@@ -116,7 +116,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 				op.argEvals = append(op.argEvals, nil)
 				continue
 			}
-			eval, err := Compile(c.Arg)
+			eval, err := Compile(c.Arg, tx)
 			if err != nil {
 				return nil, err
 			}
@@ -134,7 +134,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 			seen: builtin.NewKeySet(),
 		}
 		for _, e := range n.On {
-			eval, err := Compile(e)
+			eval, err := Compile(e, tx)
 			if err != nil {
 				return nil, err
 			}
@@ -152,7 +152,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		}
 		evals := make([]Eval, len(n.Exprs))
 		for i, e := range n.Exprs {
-			if evals[i], err = Compile(e); err != nil {
+			if evals[i], err = Compile(e, tx); err != nil {
 				return nil, err
 			}
 		}
@@ -165,7 +165,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		}
 		keys := make([]sortKey, len(n.Keys))
 		for i, k := range n.Keys {
-			eval, err := Compile(k.Expr)
+			eval, err := Compile(k.Expr, tx)
 			if err != nil {
 				return nil, err
 			}
@@ -178,11 +178,11 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		if err != nil {
 			return nil, err
 		}
-		count, err := rowCount(ctx, n.Count, args, math.MaxInt64)
+		count, err := rowCount(ctx, n.Count, tx, args, math.MaxInt64)
 		if err != nil {
 			return nil, err
 		}
-		offset, err := rowCount(ctx, n.Offset, args, 0)
+		offset, err := rowCount(ctx, n.Offset, tx, args, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -195,11 +195,11 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 
 // rowCount evaluates a LIMIT or OFFSET operand, which cannot reference a column
 // and so is constant for the whole statement.
-func rowCount(ctx context.Context, e plan.Expr, args []types.Value, def int64) (int64, error) {
+func rowCount(ctx context.Context, e plan.Expr, tx *storage.Tx, args []types.Value, def int64) (int64, error) {
 	if e == nil {
 		return def, nil
 	}
-	eval, err := Compile(e)
+	eval, err := Compile(e, tx)
 	if err != nil {
 		return 0, err
 	}
@@ -504,13 +504,13 @@ type compiledCheck struct {
 	pred Eval
 }
 
-func compileChecks(checks []plan.Check) ([]compiledCheck, error) {
+func compileChecks(checks []plan.Check, tx *storage.Tx) ([]compiledCheck, error) {
 	if len(checks) == 0 {
 		return nil, nil
 	}
 	out := make([]compiledCheck, len(checks))
 	for i, c := range checks {
-		pred, err := Compile(c.Pred)
+		pred, err := Compile(c.Pred, tx)
 		if err != nil {
 			return nil, err
 		}
@@ -545,14 +545,14 @@ type returningEval struct {
 	evals []Eval
 }
 
-func compileReturning(r *plan.Returning) (*returningEval, error) {
+func compileReturning(r *plan.Returning, tx *storage.Tx) (*returningEval, error) {
 	if r == nil {
 		return nil, nil
 	}
 	evals := make([]Eval, len(r.Exprs))
 	for i, e := range r.Exprs {
 		var err error
-		if evals[i], err = Compile(e); err != nil {
+		if evals[i], err = Compile(e, tx); err != nil {
 			return nil, err
 		}
 	}
@@ -575,21 +575,21 @@ func (r *returningEval) row(ctx context.Context, args []types.Value, in Row) (Ro
 
 // ExecUpdate applies an UPDATE.
 func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []types.Value) (Result, error) {
-	pred, err := compilePredicate(up.Where)
+	pred, err := compilePredicate(up.Where, tx)
 	if err != nil {
 		return Result{}, err
 	}
-	ret, err := compileReturning(up.Returning)
+	ret, err := compileReturning(up.Returning, tx)
 	if err != nil {
 		return Result{}, err
 	}
-	checks, err := compileChecks(up.Checks)
+	checks, err := compileChecks(up.Checks, tx)
 	if err != nil {
 		return Result{}, err
 	}
 	assign := make([]Eval, len(up.Assignments))
 	for i, a := range up.Assignments {
-		if assign[i], err = Compile(a.Value); err != nil {
+		if assign[i], err = Compile(a.Value, tx); err != nil {
 			return Result{}, err
 		}
 	}
@@ -660,11 +660,11 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 
 // ExecDelete applies a DELETE.
 func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []types.Value) (Result, error) {
-	pred, err := compilePredicate(del.Where)
+	pred, err := compilePredicate(del.Where, tx)
 	if err != nil {
 		return Result{}, err
 	}
-	ret, err := compileReturning(del.Returning)
+	ret, err := compileReturning(del.Returning, tx)
 	if err != nil {
 		return Result{}, err
 	}
@@ -843,11 +843,11 @@ func refReplacement(t *catalog.Table, ordinal int, action catalog.RefAction) (ty
 // compilePredicate turns an optional WHERE into a row test. A missing clause
 // matches every row, and a clause evaluating to unknown matches none — the same
 // rule a Filter operator applies.
-func compilePredicate(e plan.Expr) (func(ctx context.Context, args []types.Value, row Row) (bool, error), error) {
+func compilePredicate(e plan.Expr, tx *storage.Tx) (func(ctx context.Context, args []types.Value, row Row) (bool, error), error) {
 	if e == nil {
 		return func(context.Context, []types.Value, Row) (bool, error) { return true, nil }, nil
 	}
-	eval, err := Compile(e)
+	eval, err := Compile(e, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -863,17 +863,17 @@ func compilePredicate(e plan.Expr) (func(ctx context.Context, args []types.Value
 // ExecInsert runs an INSERT.
 func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []types.Value) (Result, error) {
 	width := len(ins.Table.Columns)
-	ret, err := compileReturning(ins.Returning)
+	ret, err := compileReturning(ins.Returning, tx)
 	if err != nil {
 		return Result{}, err
 	}
-	checks, err := compileChecks(ins.Checks)
+	checks, err := compileChecks(ins.Checks, tx)
 	if err != nil {
 		return Result{}, err
 	}
 	defaults := make(map[int]Eval, len(ins.Defaults))
 	for ord, e := range ins.Defaults {
-		if defaults[ord], err = Compile(e); err != nil {
+		if defaults[ord], err = Compile(e, tx); err != nil {
 			return Result{}, err
 		}
 	}
@@ -891,7 +891,7 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 			row[i] = types.Null()
 		}
 		for i, e := range exprs {
-			eval, err := Compile(e)
+			eval, err := Compile(e, tx)
 			if err != nil {
 				return res, err
 			}

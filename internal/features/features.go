@@ -223,11 +223,12 @@ var Groups = []Group{
 				Setup: probeTable,
 				SQL:   "SELECT DISTINCT ON (a) a, b FROM t"},
 			{Name: "Subqueries", Parse: Yes, Exec: Partial,
-				Note: "derived tables in FROM execute, and must have an alias; scalar, IN " +
-					"and EXISTS subqueries parse but are not executed yet. LATERAL is not " +
-					"supported, so a derived table cannot reference the tables beside it",
+				Note: "scalar, IN, EXISTS and derived tables, which must have an alias. " +
+					"A scalar subquery is NULL over no rows and an error over more than one. " +
+					"Only uncorrelated subqueries are supported: one that references the " +
+					"outer query, and LATERAL, are both rejected rather than mis-resolved",
 				Setup: probeJoin,
-				SQL:   "SELECT x.a FROM (SELECT a FROM t) x"},
+				SQL:   "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)"},
 			{Name: "UNION / INTERSECT / EXCEPT", Parse: Planned, Exec: Planned,
 				SQL: "SELECT a FROM t UNION SELECT b FROM u"},
 			{Name: "Common table expressions", Parse: Planned, Exec: Planned,
@@ -260,10 +261,13 @@ var Groups = []Group{
 				Note:  "$1 and ?, not mixed in one statement; the type is inferred from context",
 				Setup: probeTable,
 				SQL:   "SELECT a FROM t WHERE b = $1 AND c = $2"},
-			{Name: "BETWEEN / IN / LIKE", Parse: Yes, Exec: Planned,
-				Note:  "including the negated forms",
+			{Name: "BETWEEN / IN / LIKE", Parse: Yes, Exec: Partial,
+				Note: "IN executes, over both a list and a subquery, and follows SQL's " +
+					"three-valued rule: without a match, a NULL among the candidates " +
+					"makes the answer unknown rather than false, so NOT IN over a NULL " +
+					"returns no rows. BETWEEN and LIKE parse but are not executed yet",
 				Setup: probeTable,
-				SQL:   "SELECT a FROM t WHERE a BETWEEN 1 AND 2"},
+				SQL:   "SELECT a FROM t WHERE a IN (1, 2)"},
 			{Name: "CASE", Parse: Yes, Exec: Planned,
 				Note:  "simple and searched forms",
 				Setup: probeTable,

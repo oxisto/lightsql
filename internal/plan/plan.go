@@ -76,6 +76,45 @@ type Cast struct {
 	Kind types.Kind
 }
 
+// ScalarSubquery is a SELECT used where a single value is expected.
+//
+// It yields NULL when the subquery returns no rows, and raises a cardinality
+// violation when it returns more than one. Picking the first would make the
+// answer depend on a row order the query never asked for.
+type ScalarSubquery struct {
+	Input Node
+	Kind  types.Kind
+}
+
+// ExistsSubquery is EXISTS (SELECT ...), or NOT EXISTS when Negate is set.
+//
+// It is the one subquery form that never yields NULL: a row is either there or
+// it is not, whatever that row happens to contain. That is also why its select
+// list is unconstrained, where a scalar or IN subquery must produce exactly
+// one column.
+type ExistsSubquery struct {
+	Input  Node
+	Negate bool
+}
+
+// InSubquery is X IN (SELECT ...), or NOT IN when Negate is set.
+type InSubquery struct {
+	X      Expr
+	Input  Node
+	Negate bool
+}
+
+// InList is X IN (a, b, c), or NOT IN when Negate is set.
+//
+// It is a separate node from InSubquery rather than one node with two possible
+// sources, because they are two constructs: one evaluates a fixed list of
+// expressions over the current row, the other runs a plan.
+type InList struct {
+	X      Expr
+	List   []Expr
+	Negate bool
+}
+
 func (e *Column) Type() types.Kind { return e.Kind }
 func (e *Const) Type() types.Kind  { return e.Val.Kind() }
 func (e *Param) Type() types.Kind  { return e.Kind }
@@ -84,6 +123,11 @@ func (e *Unary) Type() types.Kind  { return e.Kind }
 func (e *IsNull) Type() types.Kind { return types.KindBool }
 func (e *Cast) Type() types.Kind   { return e.Kind }
 
+func (e *ScalarSubquery) Type() types.Kind { return e.Kind }
+func (e *ExistsSubquery) Type() types.Kind { return types.KindBool }
+func (e *InSubquery) Type() types.Kind     { return types.KindBool }
+func (e *InList) Type() types.Kind         { return types.KindBool }
+
 func (*Cast) exprNode()   {}
 func (*Column) exprNode() {}
 func (*Const) exprNode()  {}
@@ -91,6 +135,11 @@ func (*Param) exprNode()  {}
 func (*Binary) exprNode() {}
 func (*Unary) exprNode()  {}
 func (*IsNull) exprNode() {}
+
+func (*ScalarSubquery) exprNode() {}
+func (*ExistsSubquery) exprNode() {}
+func (*InSubquery) exprNode()     {}
+func (*InList) exprNode()         {}
 
 // ResultColumn describes one column of a node's output. The driver reports these
 // through the RowsColumnType interfaces, which is how an ORM decides what Go

@@ -9,11 +9,13 @@ package exec
 
 import (
 	"context"
+	"errors"
 	"math"
 
 	"github.com/oxisto/lightsql/internal/ast"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/plan"
+	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
 )
 
@@ -33,7 +35,7 @@ type Row []types.Value
 type Eval func(ctx context.Context, args []types.Value, row Row) (types.Value, error)
 
 // Compile turns a bound expression into a closure.
-func Compile(e plan.Expr) (Eval, error) {
+func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 	switch e := e.(type) {
 	case *plan.Const:
 		v := e.Val
@@ -68,7 +70,7 @@ func Compile(e plan.Expr) (Eval, error) {
 		}, nil
 
 	case *plan.IsNull:
-		x, err := Compile(e.X)
+		x, err := Compile(e.X, tx)
 		if err != nil {
 			return nil, err
 		}
@@ -83,7 +85,7 @@ func Compile(e plan.Expr) (Eval, error) {
 		}, nil
 
 	case *plan.Cast:
-		x, err := Compile(e.X)
+		x, err := Compile(e.X, tx)
 		if err != nil {
 			return nil, err
 		}
@@ -100,19 +102,227 @@ func Compile(e plan.Expr) (Eval, error) {
 			return out, nil
 		}, nil
 
+	case *plan.ScalarSubquery:
+		return compileScalarSubquery(e, tx)
+
+	case *plan.ExistsSubquery:
+		return compileExists(e, tx)
+
+	case *plan.InSubquery:
+		return compileInSubquery(e, tx)
+
+	case *plan.InList:
+		return compileInList(e, tx)
+
 	case *plan.Unary:
-		return compileUnary(e)
+		return compileUnary(e, tx)
 
 	case *plan.Binary:
-		return compileBinary(e)
+		return compileBinary(e, tx)
 
 	default:
 		return nil, pgerr.Newf(pgerr.InternalError, "cannot compile expression %T", e)
 	}
 }
 
-func compileUnary(e *plan.Unary) (Eval, error) {
-	x, err := Compile(e.X)
+// Subqueries in expression position are uncorrelated: the binder gives one a
+// scope of its own, so it cannot read the outer row and its answer is therefore
+// the same for every row. Each of the closures below runs its subplan once and
+// keeps the result.
+//
+// That cache lives in the closure, which is safe because a closure is created
+// per execution -- Compile is called from Build, and Build runs each time the
+// statement does. A plan is shared between executions and a compiled expression
+// is not, so caching here cannot leak one execution's rows, or one
+// transaction's snapshot, into the next.
+
+// drainColumn runs a subplan and collects the first column of every row.
+//
+// limit caps how many rows are read, so a scalar subquery can stop as soon as
+// it knows there is more than one rather than draining a whole table to report
+// the error; limit <= 0 reads everything.
+//
+// Copying out row[0] is required, not incidental: an operator's row is only
+// valid until the next Next call. types.Value is a value type, so the append
+// copies it.
+func drainColumn(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value, limit int) (vals []types.Value, err error) {
+	op, err := Build(ctx, n, tx, args)
+	if err != nil {
+		return nil, err
+	}
+	// Join rather than replace: a close failure matters, but not enough to
+	// hide whatever went wrong first.
+	defer func() { err = errors.Join(err, op.Close()) }()
+
+	for limit <= 0 || len(vals) < limit {
+		row, ok, err := op.Next(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		vals = append(vals, row[0])
+	}
+	return vals, nil
+}
+
+func compileScalarSubquery(e *plan.ScalarSubquery, tx *storage.Tx) (Eval, error) {
+	sub := e.Input
+	var (
+		cached types.Value
+		done   bool
+	)
+	return func(ctx context.Context, args []types.Value, _ Row) (types.Value, error) {
+		if done {
+			return cached, nil
+		}
+		// Two rows is all it takes to know there are too many.
+		vals, err := drainColumn(ctx, sub, tx, args, 2)
+		if err != nil {
+			return types.Value{}, err
+		}
+		switch len(vals) {
+		case 0:
+			// No rows is NULL rather than an error: asking for a value that
+			// turns out not to exist is a well-formed question.
+			cached = types.Null()
+		case 1:
+			cached = vals[0]
+		default:
+			return types.Value{}, pgerr.New(pgerr.CardinalityViolation,
+				"more than one row returned by a subquery used as an expression")
+		}
+		done = true
+		return cached, nil
+	}, nil
+}
+
+func compileExists(e *plan.ExistsSubquery, tx *storage.Tx) (Eval, error) {
+	sub, negate := e.Input, e.Negate
+	var (
+		found bool
+		done  bool
+	)
+	return func(ctx context.Context, args []types.Value, _ Row) (types.Value, error) {
+		if !done {
+			// Only the first row is asked for. EXISTS has its answer as soon as
+			// one arrives, and the operator tree is torn down without producing
+			// the rest.
+			ok, err := anyRow(ctx, sub, tx, args)
+			if err != nil {
+				return types.Value{}, err
+			}
+			found, done = ok, true
+		}
+		// EXISTS is never unknown: a row is either there or it is not, whatever
+		// that row contains.
+		return types.Bool(found != negate), nil
+	}, nil
+}
+
+// anyRow reports whether a subplan produces at least one row. It is
+// separate from drainColumn because EXISTS does not care about the select list
+// at all, so a subquery of any width is legal here.
+func anyRow(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value) (found bool, err error) {
+	op, err := Build(ctx, n, tx, args)
+	if err != nil {
+		return false, err
+	}
+	// Join rather than replace: a close failure matters, but not enough to
+	// hide whatever went wrong first.
+	defer func() { err = errors.Join(err, op.Close()) }()
+
+	_, found, err = op.Next(ctx)
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+func compileInSubquery(e *plan.InSubquery, tx *storage.Tx) (Eval, error) {
+	x, err := Compile(e.X, tx)
+	if err != nil {
+		return nil, err
+	}
+	sub, negate := e.Input, e.Negate
+	var (
+		vals []types.Value
+		done bool
+	)
+	return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+		if !done {
+			if vals, err = drainColumn(ctx, sub, tx, args, 0); err != nil {
+				return types.Value{}, err
+			}
+			done = true
+		}
+		xv, err := x(ctx, args, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		return inResult(xv, vals, negate), nil
+	}, nil
+}
+
+func compileInList(e *plan.InList, tx *storage.Tx) (Eval, error) {
+	x, err := Compile(e.X, tx)
+	if err != nil {
+		return nil, err
+	}
+	list := make([]Eval, len(e.List))
+	for i, item := range e.List {
+		if list[i], err = Compile(item, tx); err != nil {
+			return nil, err
+		}
+	}
+	negate := e.Negate
+	vals := make([]types.Value, len(list))
+	return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+		xv, err := x(ctx, args, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		// The list is evaluated per row, unlike a subquery's: an element may
+		// reference a column, so `a IN (b, c)` is a legal and row-dependent
+		// question.
+		for i, ev := range list {
+			if vals[i], err = ev(ctx, args, row); err != nil {
+				return types.Value{}, err
+			}
+		}
+		return inResult(xv, vals, negate), nil
+	}, nil
+}
+
+// inResult applies SQL's three-valued IN.
+//
+// A match is true. Without one, a NULL anywhere -- on the left or among the
+// candidates -- makes the answer unknown rather than false, because the value
+// that is missing might have been the matching one. That is what makes
+// `x NOT IN (SELECT ...)` return nothing when the subquery yields a NULL, which
+// looks like a bug to almost everyone who meets it and is the rule.
+func inResult(x types.Value, vals []types.Value, negate bool) types.Value {
+	if x.IsNull() {
+		return types.Null()
+	}
+	sawNull := false
+	for _, v := range vals {
+		switch types.Eq(x, v) {
+		case types.True:
+			return types.Bool(!negate)
+		case types.Unknown:
+			sawNull = true
+		}
+	}
+	if sawNull {
+		return types.Null()
+	}
+	return types.Bool(negate)
+}
+
+func compileUnary(e *plan.Unary, tx *storage.Tx) (Eval, error) {
+	x, err := Compile(e.X, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -166,12 +376,12 @@ var comparisons = map[ast.BinaryOp]func(a, b types.Value) types.Bool3{
 	},
 }
 
-func compileBinary(e *plan.Binary) (Eval, error) {
-	l, err := Compile(e.L)
+func compileBinary(e *plan.Binary, tx *storage.Tx) (Eval, error) {
+	l, err := Compile(e.L, tx)
 	if err != nil {
 		return nil, err
 	}
-	r, err := Compile(e.R)
+	r, err := Compile(e.R, tx)
 	if err != nil {
 		return nil, err
 	}

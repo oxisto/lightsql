@@ -70,6 +70,15 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 	case *ast.BinaryExpr:
 		return bindBinary(e, sc)
 
+	case *ast.SubqueryExpr:
+		return bindScalarSubquery(e, sc)
+
+	case *ast.ExistsExpr:
+		return bindExists(e, sc)
+
+	case *ast.InExpr:
+		return bindIn(e, sc)
+
 	case *ast.FuncCall:
 		return bindFuncCall(e, sc)
 
@@ -87,6 +96,96 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 //
 // A numeric literal becomes an integer when it fits one and a float otherwise,
 // which is what makes `WHERE id = 1` compare as integers without a cast.
+// subplan binds a SELECT that appears inside an expression.
+//
+// The body is bound in a scope of its own, so it cannot see the row the outer
+// query is processing. Correlated subqueries are not supported yet, and this is
+// what makes one fail with an unresolved column rather than resolve against an
+// ordinal belonging to a row the subplan never sees.
+func subplan(sel *ast.SelectStmt, sc *scope, pos token.Pos) (plan.Node, error) {
+	if sc.b == nil {
+		// The scopes without a binder are the ones where SQL forbids a
+		// subquery: a CHECK constraint and a DEFAULT expression, neither of
+		// which has a row to run one against.
+		return nil, pgerr.New(pgerr.FeatureNotSupported,
+			"cannot use a subquery in this context").At(pos)
+	}
+	return sc.b.bindSelectNode(sel)
+}
+
+// oneColumn rejects a subquery used where a value is expected but which
+// produces a whole row instead.
+func oneColumn(n plan.Node, pos token.Pos) error {
+	if len(n.Result()) != 1 {
+		return pgerr.New(pgerr.SyntaxError,
+			"subquery must return only one column").At(pos)
+	}
+	return nil
+}
+
+func bindScalarSubquery(e *ast.SubqueryExpr, sc *scope) (plan.Expr, error) {
+	node, err := subplan(e.Select, sc, e.Pos())
+	if err != nil {
+		return nil, err
+	}
+	if err := oneColumn(node, e.Pos()); err != nil {
+		return nil, err
+	}
+	return &plan.ScalarSubquery{Input: node, Kind: node.Result()[0].Type.Kind}, nil
+}
+
+func bindExists(e *ast.ExistsExpr, sc *scope) (plan.Expr, error) {
+	node, err := subplan(e.Subquery, sc, e.Pos())
+	if err != nil {
+		return nil, err
+	}
+	// EXISTS asks only whether a row is there, so its select list is not
+	// constrained: SELECT *, SELECT 1 and SELECT a, b all mean the same to it.
+	return &plan.ExistsSubquery{Input: node, Negate: e.Negate}, nil
+}
+
+func bindIn(e *ast.InExpr, sc *scope) (plan.Expr, error) {
+	x, err := bindExpr(e.X, sc)
+	if err != nil {
+		return nil, err
+	}
+
+	if e.Subquery != nil {
+		node, err := subplan(e.Subquery, sc, e.Pos())
+		if err != nil {
+			return nil, err
+		}
+		if err := oneColumn(node, e.Pos()); err != nil {
+			return nil, err
+		}
+		if x, err = coerce(x, node.Result()[0].Type.Kind, e.X.Pos()); err != nil {
+			return nil, err
+		}
+		return &plan.InSubquery{X: x, Input: node, Negate: e.Negate}, nil
+	}
+
+	// The list is checked against the left operand's type here rather than at
+	// runtime, so that `n IN ('a')` is a type error like `n = 'a'` is, instead
+	// of a comparison that quietly matches nothing.
+	list := make([]plan.Expr, 0, len(e.List))
+	for _, item := range e.List {
+		v, err := bindExpr(item, sc)
+		if err != nil {
+			return nil, err
+		}
+		// An unresolved parameter on the left takes its type from the first
+		// element that has one, mirroring how unify treats a comparison.
+		if p, ok := x.(*plan.Param); ok && p.Kind == types.KindNull {
+			p.Kind = v.Type()
+		}
+		if v, err = coerce(v, x.Type(), item.Pos()); err != nil {
+			return nil, err
+		}
+		list = append(list, v)
+	}
+	return &plan.InList{X: x, List: list, Negate: e.Negate}, nil
+}
+
 func bindLiteral(e *ast.Literal) (plan.Expr, error) {
 	switch e.Kind {
 	case ast.LitNull:
