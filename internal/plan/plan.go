@@ -104,6 +104,26 @@ type InSubquery struct {
 	Negate bool
 }
 
+// Case is a CASE expression, in its searched form.
+//
+// The simple form, CASE x WHEN v THEN ..., is rewritten by the binder into the
+// searched one by turning each arm into x = v. That follows the same reasoning
+// as a comma in FROM becoming a cross join: two spellings of one thing produce
+// one plan rather than a second code path through the executor.
+//
+// Else is nil when the clause was omitted, which SQL says yields NULL rather
+// than an error -- a CASE that matches nothing is unknown, not wrong.
+type Case struct {
+	Whens []CaseWhen
+	Else  Expr
+	Kind  types.Kind
+}
+
+// CaseWhen is one arm. Cond is always a predicate, whichever form was written.
+type CaseWhen struct {
+	Cond, Value Expr
+}
+
 // InList is X IN (a, b, c), or NOT IN when Negate is set.
 //
 // It is a separate node from InSubquery rather than one node with two possible
@@ -127,6 +147,7 @@ func (e *ScalarSubquery) Type() types.Kind { return e.Kind }
 func (e *ExistsSubquery) Type() types.Kind { return types.KindBool }
 func (e *InSubquery) Type() types.Kind     { return types.KindBool }
 func (e *InList) Type() types.Kind         { return types.KindBool }
+func (e *Case) Type() types.Kind           { return e.Kind }
 
 func (*Cast) exprNode()   {}
 func (*Column) exprNode() {}
@@ -140,6 +161,7 @@ func (*ScalarSubquery) exprNode() {}
 func (*ExistsSubquery) exprNode() {}
 func (*InSubquery) exprNode()     {}
 func (*InList) exprNode()         {}
+func (*Case) exprNode()           {}
 
 // ResultColumn describes one column of a node's output. The driver reports these
 // through the RowsColumnType interfaces, which is how an ORM decides what Go

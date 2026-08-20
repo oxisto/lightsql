@@ -70,6 +70,9 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 	case *ast.BinaryExpr:
 		return bindBinary(e, sc)
 
+	case *ast.CaseExpr:
+		return bindCase(e, sc)
+
 	case *ast.SubqueryExpr:
 		return bindScalarSubquery(e, sc)
 
@@ -96,6 +99,124 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 //
 // A numeric literal becomes an integer when it fits one and a float otherwise,
 // which is what makes `WHERE id = 1` compare as integers without a cast.
+// bindCase binds a CASE expression.
+//
+// The simple form is rewritten into the searched one: CASE x WHEN v becomes
+// x = v. Both spellings then produce one plan, so the executor has a single
+// shape to run, which is the same trade already made for a comma in FROM.
+func bindCase(e *ast.CaseExpr, sc *scope) (plan.Expr, error) {
+	var operand plan.Expr
+	if e.Operand != nil {
+		var err error
+		if operand, err = bindExpr(e.Operand, sc); err != nil {
+			return nil, err
+		}
+	}
+
+	out := &plan.Case{}
+	// values collects everything the CASE can evaluate to, so the result type
+	// can be settled once all the arms are known rather than guessed from the
+	// first.
+	var values []plan.Expr
+
+	for _, w := range e.Whens {
+		cond, err := bindExpr(w.Cond, sc)
+		if err != nil {
+			return nil, err
+		}
+		if operand != nil {
+			// The simple form compares rather than tests, so the arm need not
+			// be boolean -- it is whatever the operand is.
+			if cond, err = matchArm(operand, cond, w.Cond.Pos()); err != nil {
+				return nil, err
+			}
+		} else if cond.Type() != types.KindBool && cond.Type() != types.KindNull {
+			return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+				"argument of CASE/WHEN must be boolean, not %s", cond.Type()).At(w.Cond.Pos())
+		}
+
+		val, err := bindExpr(w.Value, sc)
+		if err != nil {
+			return nil, err
+		}
+		out.Whens = append(out.Whens, plan.CaseWhen{Cond: cond, Value: val})
+		values = append(values, val)
+	}
+
+	if e.Else != nil {
+		els, err := bindExpr(e.Else, sc)
+		if err != nil {
+			return nil, err
+		}
+		out.Else = els
+		values = append(values, els)
+	}
+
+	kind, err := commonKind(values, e.Pos())
+	if err != nil {
+		return nil, err
+	}
+	out.Kind = kind
+
+	// Every branch is converted to the common type here, so the executor never
+	// has to reconcile them and a result set never changes type from row to row
+	// depending on which arm fired.
+	for i := range out.Whens {
+		if out.Whens[i].Value, err = coerce(out.Whens[i].Value, kind, e.Pos()); err != nil {
+			return nil, err
+		}
+	}
+	if out.Else != nil {
+		if out.Else, err = coerce(out.Else, kind, e.Pos()); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// matchArm turns one arm of a simple CASE into the equality it stands for.
+func matchArm(operand, arm plan.Expr, pos token.Pos) (plan.Expr, error) {
+	arm, err := coerce(arm, operand.Type(), pos)
+	if err != nil {
+		return nil, err
+	}
+	return &plan.Binary{Op: ast.OpEq, L: operand, R: arm, Kind: types.KindBool}, nil
+}
+
+// commonKind settles the type a CASE evaluates to.
+//
+// A NULL branch carries no type and so does not constrain the others. Numeric
+// branches promote to float if any one of them is float, matching what an
+// arithmetic expression over the same values would produce. Anything else that
+// disagrees is a type error, reported here rather than becoming a result column
+// whose type depends on which row you look at.
+func commonKind(values []plan.Expr, pos token.Pos) (types.Kind, error) {
+	kind := types.KindNull
+	numeric := true
+	for _, v := range values {
+		k := v.Type()
+		if k == types.KindNull {
+			continue
+		}
+		if !k.IsNumeric() {
+			numeric = false
+		}
+		switch {
+		case kind == types.KindNull:
+			kind = k
+		case kind == k:
+		case numeric && kind.IsNumeric() && k.IsNumeric():
+			if k == types.KindFloat {
+				kind = k
+			}
+		default:
+			return types.KindNull, pgerr.Newf(pgerr.DatatypeMismatch,
+				"CASE types %s and %s cannot be matched", kind, k).At(pos)
+		}
+	}
+	return kind, nil
+}
+
 // subplan binds a SELECT that appears inside an expression.
 //
 // The body is bound in a scope of its own, so it cannot see the row the outer

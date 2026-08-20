@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-58_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-59_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -176,7 +176,7 @@ the two.
 | ✅ | String concatenation | ✅ | ✅ | NULL propagates, as in PostgreSQL |
 | ✅ | Parameter placeholders | ✅ | ✅ | $1 and ?, not mixed in one statement; the type is inferred from context |
 | 🟡 | BETWEEN / IN / LIKE | ✅ | 🟡 | IN executes, over both a list and a subquery, and follows SQL's three-valued rule: without a match, a NULL among the candidates makes the answer unknown rather than false, so NOT IN over a NULL returns no rows. BETWEEN and LIKE parse but are not executed yet |
-| ⬜ | CASE | ✅ | ⬜ | simple and searched forms |
+| ✅ | CASE | ✅ | ✅ | simple and searched forms; the simple form is rewritten to the searched one, so both take one path. Only a true condition fires an arm, no match without ELSE is NULL, and the branches must share a type so a result column cannot change type from row to row |
 | ✅ | CAST | ✅ | ✅ | both CAST(x AS t) and x::t |
 | ⬜ | Scalar functions | ✅ | ⬜ | parsed generically; the function library is pending |
 | ❌ | Arrays | ❌ | ❌ | out of scope for v1 |

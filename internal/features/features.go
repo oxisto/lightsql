@@ -268,8 +268,11 @@ var Groups = []Group{
 					"returns no rows. BETWEEN and LIKE parse but are not executed yet",
 				Setup: probeTable,
 				SQL:   "SELECT a FROM t WHERE a IN (1, 2)"},
-			{Name: "CASE", Parse: Yes, Exec: Planned,
-				Note:  "simple and searched forms",
+			{Name: "CASE", Parse: Yes, Exec: Yes,
+				Note: "simple and searched forms; the simple form is rewritten to the " +
+					"searched one, so both take one path. Only a true condition fires an " +
+					"arm, no match without ELSE is NULL, and the branches must share a " +
+					"type so a result column cannot change type from row to row",
 				Setup: probeTable,
 				SQL:   "SELECT CASE WHEN a > 1 THEN 1 ELSE 2 END FROM t"},
 			{Name: "CAST", Parse: Yes, Exec: Yes,
