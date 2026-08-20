@@ -362,6 +362,17 @@ type CreateTable struct {
 	IfNotExists bool
 }
 
+// DropTable removes tables.
+//
+// The names are carried rather than resolved *catalog.Table pointers, because
+// IF EXISTS has to tolerate one that is not there, and because the whole set is
+// looked up together under the catalog's lock so a reference between two of
+// them is not mistaken for an outside dependency.
+type DropTable struct {
+	Names    []catalog.QualifiedName
+	IfExists bool
+}
+
 // Insert adds rows to a table.
 type Insert struct {
 	Table *catalog.Table
@@ -437,6 +448,7 @@ type Query struct {
 }
 
 func (*CreateTable) stmtNode() {}
+func (*DropTable) stmtNode()   {}
 func (*Insert) stmtNode()      {}
 func (*Update) stmtNode()      {}
 func (*Delete) stmtNode()      {}

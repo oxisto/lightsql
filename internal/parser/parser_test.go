@@ -339,6 +339,28 @@ func TestParseCreateTable(t *testing.T) {
 		want string
 	}{
 		{
+			name: "drop table",
+			sql:  "DROP TABLE t",
+			want: "(drop-table t)",
+		},
+		{
+			name: "drop several tables if exists",
+			sql:  "DROP TABLE IF EXISTS a, public.b",
+			want: "(drop-table a public.b if-exists)",
+		},
+		{
+			// RESTRICT is the default, so writing it changes nothing and it
+			// does not appear in the tree.
+			name: "drop table restrict",
+			sql:  "DROP TABLE t RESTRICT",
+			want: "(drop-table t)",
+		},
+		{
+			name: "drop table cascade",
+			sql:  "DROP TABLE t CASCADE",
+			want: "(drop-table t cascade)",
+		},
+		{
 			name: "column types and modifiers",
 			sql:  "CREATE TABLE t (a INT, b VARCHAR(255), c NUMERIC(10, 2))",
 			want: "(create-table t (column a (type int)) (column b (type varchar 255)) " +

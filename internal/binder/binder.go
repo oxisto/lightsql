@@ -137,6 +137,8 @@ func (b *Binder) Bind(stmt ast.Stmt) (plan.Stmt, error) {
 	switch s := stmt.(type) {
 	case *ast.CreateTableStmt:
 		return b.bindCreateTable(s)
+	case *ast.DropTableStmt:
+		return bindDropTable(s)
 	case *ast.InsertStmt:
 		return b.bindInsert(s)
 	case *ast.UpdateStmt:
@@ -149,6 +151,40 @@ func (b *Binder) Bind(stmt ast.Stmt) (plan.Stmt, error) {
 		return nil, pgerr.Newf(pgerr.FeatureNotSupported,
 			"statement type %T is not supported yet", stmt).At(stmt.Pos())
 	}
+}
+
+// bindDropTable resolves DROP TABLE.
+//
+// The tables are not looked up here. Existence is decided by the catalog, under
+// the lock that also performs the drop, so that IF EXISTS and a concurrent drop
+// cannot disagree between the check and the act.
+func bindDropTable(s *ast.DropTableStmt) (plan.Stmt, error) {
+	// CASCADE parses but is refused. In PostgreSQL it drops the dependent
+	// objects, which for a table means removing the foreign key from every
+	// surviving child -- and a child's constraints are aliased by the parent's
+	// referencedBy list, so removing one moves the elements those pointers
+	// address. Doing it here would leave foreign key enforcement reading the
+	// wrong constraint, which is a worse outcome than saying no.
+	if s.Cascade {
+		return nil, pgerr.New(pgerr.FeatureNotSupported,
+			"DROP TABLE ... CASCADE is not supported yet; drop the referencing table first").At(s.Pos())
+	}
+
+	out := &plan.DropTable{IfExists: s.IfExists}
+	seen := make(map[string]bool, len(s.Tables))
+	for _, t := range s.Tables {
+		q := catalog.QualifiedName{Schema: t.Schema.Name, Name: t.Name.Name}
+		// PostgreSQL rejects a repeated name rather than dropping it twice,
+		// where the second attempt would report a table that is missing only
+		// because the statement itself removed it.
+		if seen[q.Schema+"."+q.Name] {
+			return nil, pgerr.Newf(pgerr.DuplicateTable,
+				"table %q specified more than once", t.Name.Name).At(t.Pos())
+		}
+		seen[q.Schema+"."+q.Name] = true
+		out.Names = append(out.Names, q)
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------

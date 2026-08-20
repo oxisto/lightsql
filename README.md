@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-61_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-62_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -139,7 +139,7 @@ the two.
 | ✅ | CHECK constraints | ✅ | ✅ | column and table level, enforced on insert and update; satisfied by true or unknown, so a NULL does not violate one |
 | ✅ | Foreign keys | ✅ | ✅ | column and table level, single and multi-column; a NULL in the key is unconstrained, as MATCH SIMPLE requires |
 | ✅ | Referential actions | ✅ | ✅ | ON DELETE and ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL and SET DEFAULT; cascades are part of the transaction |
-| ⬜ | DROP TABLE | ⬜ | ⬜ |  |
+| ✅ | DROP TABLE | ✅ | ✅ | several tables at once, IF EXISTS, and RESTRICT which is the default: a table another one references is kept, unless both are named in the same statement. CASCADE parses but is refused rather than half-performed. Like every DDL statement it is not transactional, so a rolled back drop does not bring the table back |
 | ⬜ | ALTER TABLE | ⬜ | ⬜ |  |
 | ⬜ | CREATE INDEX | ⬜ | ⬜ |  |
 | ⬜ | CREATE VIEW | ⬜ | ⬜ |  |

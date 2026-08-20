@@ -626,6 +626,21 @@ type CreateTableStmt struct {
 
 func (s *CreateTableStmt) Pos() token.Pos { return s.CreatePos }
 
+// DropTableStmt is DROP TABLE, which may name several tables at once.
+//
+// Cascade records whether CASCADE was written. The default is RESTRICT, so a
+// table another one references is kept rather than silently taking its
+// referencing constraints with it.
+type DropTableStmt struct {
+	DropPos  token.Pos
+	IfExists bool
+	Tables   []*TableName
+	Cascade  bool
+}
+
+func (s *DropTableStmt) Pos() token.Pos { return s.DropPos }
+
+func (*DropTableStmt) stmtNode()   {}
 func (*SelectStmt) stmtNode()      {}
 func (*InsertStmt) stmtNode()      {}
 func (*UpdateStmt) stmtNode()      {}

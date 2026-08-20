@@ -599,6 +599,96 @@ func (t *Table) index() error {
 	return nil
 }
 
+// QualifiedName is a table name as written, before the default schema is
+// applied.
+type QualifiedName struct {
+	Schema, Name string
+}
+
+// DropTable removes tables from the catalog.
+//
+// The whole set goes at once rather than one at a time, because a reference
+// between two of the named tables is not a reason to refuse: `DROP TABLE parent,
+// child` is legal even though dropping the parent on its own would not be.
+//
+// A table still referenced from outside the set is refused, which is SQL's
+// RESTRICT default. Dropping one regardless would leave the referencing table
+// enforcing a constraint against a relation nobody can look up.
+func (c *Catalog) DropTable(names []QualifiedName, ifExists bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	going := make(map[string]*Table, len(names))
+	for _, n := range names {
+		schema := n.Schema
+		if schema == "" {
+			schema = DefaultSchema
+		}
+		t, ok := c.tables[key(schema, n.Name)]
+		if !ok {
+			if ifExists {
+				continue
+			}
+			return pgerr.Newf(pgerr.UndefinedTable, "relation %q does not exist", n.Name)
+		}
+		going[key(schema, n.Name)] = t
+	}
+
+	for _, t := range going {
+		if dep := t.referencedFromOutside(going); dep != "" {
+			return pgerr.Newf(pgerr.ForeignKeyViolation,
+				"cannot drop table %q because table %q depends on it", t.Name, dep)
+		}
+	}
+
+	for k, t := range going {
+		// Unregistering the table's own references matters as much as removing
+		// it. A parent keeps a list of the children pointing at it, and leaving
+		// a dropped child there would make a later DELETE from the parent
+		// enforce a constraint against a table nobody can see.
+		t.detach()
+		delete(c.tables, k)
+	}
+	return nil
+}
+
+// referencedFromOutside names a table outside the given set that references t,
+// or returns the empty string when none does.
+func (t *Table) referencedFromOutside(going map[string]*Table) string {
+	t.refsMu.RLock()
+	defer t.refsMu.RUnlock()
+
+	for _, ref := range t.referencedBy {
+		if _, alsoGoing := going[key(ref.Child.Schema, ref.Child.Name)]; !alsoGoing {
+			return ref.Child.Name
+		}
+	}
+	return ""
+}
+
+// detach removes t from the referencedBy list of every table it points at.
+func (t *Table) detach() {
+	for i := range t.ForeignKeys {
+		parent := t.ForeignKeys[i].Parent
+		// A self-reference lives on the table being dropped, so there is
+		// nothing outside it to clean up.
+		if parent == nil || parent == t {
+			continue
+		}
+		parent.removeReferencing(t)
+	}
+}
+
+// removeReferencing drops every reference made by child.
+func (t *Table) removeReferencing(child *Table) {
+	t.refsMu.Lock()
+	defer t.refsMu.Unlock()
+
+	t.referencedBy = slices.DeleteFunc(t.referencedBy, func(r Referencing) bool {
+		return r.Child == child
+	})
+}
+
 // Lookup finds a table. An empty schema means the default schema.
 func (c *Catalog) Lookup(schema, name string) (*Table, error) {
 	if schema == "" {
