@@ -146,7 +146,7 @@ func (p *Prepared) Query(ctx context.Context, tx *storage.Tx, args []types.Value
 		// soon as the operator tree has taken its snapshot.
 		var rows *Rows
 		err := p.eng.withTx(tx, func(t *storage.Tx) error {
-			op, err := exec.Build(q.Root, t, args)
+			op, err := exec.Build(ctx, q.Root, t, args)
 			if err != nil {
 				return err
 			}

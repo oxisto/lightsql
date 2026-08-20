@@ -8,6 +8,7 @@
 package exec
 
 import (
+	"context"
 	"math"
 
 	"github.com/oxisto/lightsql/internal/ast"
@@ -22,18 +23,25 @@ type Row []types.Value
 // Eval is a compiled expression. Compiling to a closure moves the decision about
 // which operation to perform out of the per-row path: by the time Eval is
 // called, the operator and operand types have already been chosen.
-type Eval func(args []types.Value, row Row) (types.Value, error)
+//
+// The context is carried because an expression is not always cheap. A subquery
+// in expression position runs a whole operator tree, and one evaluated per row
+// of its outer query must be cancellable like any other work — checking only at
+// statement entry would leave a query that cannot be interrupted. Most
+// implementations ignore it, which is the point: the cost is a parameter, and
+// the alternative is that the one case which needs it cannot have it.
+type Eval func(ctx context.Context, args []types.Value, row Row) (types.Value, error)
 
 // Compile turns a bound expression into a closure.
 func Compile(e plan.Expr) (Eval, error) {
 	switch e := e.(type) {
 	case *plan.Const:
 		v := e.Val
-		return func([]types.Value, Row) (types.Value, error) { return v, nil }, nil
+		return func(context.Context, []types.Value, Row) (types.Value, error) { return v, nil }, nil
 
 	case *plan.Column:
 		i := e.Ordinal
-		return func(_ []types.Value, row Row) (types.Value, error) { return row[i], nil }, nil
+		return func(_ context.Context, _ []types.Value, row Row) (types.Value, error) { return row[i], nil }, nil
 
 	case *plan.Param:
 		i := e.Ord - 1
@@ -43,7 +51,7 @@ func Compile(e plan.Expr) (Eval, error) {
 		// behave the same as passing the integer 7, rather than silently
 		// matching nothing because a text value never equals an integer.
 		want := e.Kind
-		return func(args []types.Value, _ Row) (types.Value, error) {
+		return func(_ context.Context, args []types.Value, _ Row) (types.Value, error) {
 			if i < 0 || i >= len(args) {
 				return types.Value{}, pgerr.Newf(pgerr.SyntaxError,
 					"there is no parameter $%d", i+1)
@@ -65,8 +73,8 @@ func Compile(e plan.Expr) (Eval, error) {
 			return nil, err
 		}
 		negate := e.Negate
-		return func(args []types.Value, row Row) (types.Value, error) {
-			v, err := x(args, row)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			v, err := x(ctx, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -80,8 +88,8 @@ func Compile(e plan.Expr) (Eval, error) {
 			return nil, err
 		}
 		want := e.Kind
-		return func(args []types.Value, row Row) (types.Value, error) {
-			v, err := x(args, row)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			v, err := x(ctx, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -114,8 +122,8 @@ func compileUnary(e *plan.Unary) (Eval, error) {
 		return x, nil
 
 	case ast.OpNot:
-		return func(args []types.Value, row Row) (types.Value, error) {
-			v, err := x(args, row)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			v, err := x(ctx, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -125,8 +133,8 @@ func compileUnary(e *plan.Unary) (Eval, error) {
 		}, nil
 
 	default: // OpNeg
-		return func(args []types.Value, row Row) (types.Value, error) {
-			v, err := x(args, row)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			v, err := x(ctx, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -172,8 +180,8 @@ func compileBinary(e *plan.Binary) (Eval, error) {
 	// evaluates both operands first.
 	switch e.Op {
 	case ast.OpAnd:
-		return func(args []types.Value, row Row) (types.Value, error) {
-			lv, err := l(args, row)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			lv, err := l(ctx, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -181,7 +189,7 @@ func compileBinary(e *plan.Binary) (Eval, error) {
 			if lv.Truth() == types.False {
 				return types.Bool(false), nil
 			}
-			rv, err := r(args, row)
+			rv, err := r(ctx, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -189,15 +197,15 @@ func compileBinary(e *plan.Binary) (Eval, error) {
 		}, nil
 
 	case ast.OpOr:
-		return func(args []types.Value, row Row) (types.Value, error) {
-			lv, err := l(args, row)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			lv, err := l(ctx, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
 			if lv.Truth() == types.True {
 				return types.Bool(true), nil
 			}
-			rv, err := r(args, row)
+			rv, err := r(ctx, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -206,8 +214,8 @@ func compileBinary(e *plan.Binary) (Eval, error) {
 	}
 
 	if cmp, ok := comparisons[e.Op]; ok {
-		return func(args []types.Value, row Row) (types.Value, error) {
-			lv, rv, err := evalPair(l, r, args, row)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			lv, rv, err := evalPair(ctx, l, r, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -218,8 +226,8 @@ func compileBinary(e *plan.Binary) (Eval, error) {
 	switch e.Op {
 	case ast.OpJSONField, ast.OpJSONText, ast.OpJSONContains:
 		op := e.Op
-		return func(args []types.Value, row Row) (types.Value, error) {
-			lv, rv, err := evalPair(l, r, args, row)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			lv, rv, err := evalPair(ctx, l, r, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -240,8 +248,8 @@ func compileBinary(e *plan.Binary) (Eval, error) {
 	}
 
 	if e.Op == ast.OpConcat {
-		return func(args []types.Value, row Row) (types.Value, error) {
-			lv, rv, err := evalPair(l, r, args, row)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			lv, rv, err := evalPair(ctx, l, r, args, row)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -262,8 +270,8 @@ func compileArithmetic(e *plan.Binary, l, r Eval) (Eval, error) {
 	// expression float, which is what the binder already decided.
 	useInt := e.Kind == types.KindInt
 
-	return func(args []types.Value, row Row) (types.Value, error) {
-		lv, rv, err := evalPair(l, r, args, row)
+	return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+		lv, rv, err := evalPair(ctx, l, r, args, row)
 		if err != nil {
 			return types.Value{}, err
 		}
@@ -325,12 +333,12 @@ func floatArith(op ast.BinaryOp, a, b float64) (types.Value, error) {
 
 // evalPair evaluates both operands, which every non-short-circuiting operator
 // needs.
-func evalPair(l, r Eval, args []types.Value, row Row) (left, right types.Value, err error) {
-	lv, err := l(args, row)
+func evalPair(ctx context.Context, l, r Eval, args []types.Value, row Row) (left, right types.Value, err error) {
+	lv, err := l(ctx, args, row)
 	if err != nil {
 		return types.Value{}, types.Value{}, err
 	}
-	rv, err := r(args, row)
+	rv, err := r(ctx, args, row)
 	if err != nil {
 		return types.Value{}, types.Value{}, err
 	}

@@ -36,13 +36,17 @@ type Operator interface {
 // scan must read through the snapshot of the statement that asked for it: two
 // statements running concurrently on pooled connections legitimately see
 // different data.
-func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
+//
+// The context is taken here, and not only in Next, because building is not
+// purely structural: LIMIT and OFFSET are evaluated now, and a subquery in
+// expression position builds an operator tree of its own.
+func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 	switch n := n.(type) {
 	case *plan.Scan:
 		return &scanOp{rows: n.Table.Rows(tx)}, nil
 
 	case *plan.Filter:
-		input, err := Build(n.Input, tx, args)
+		input, err := Build(ctx, n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -53,11 +57,11 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 		return &filterOp{input: input, pred: pred, args: args}, nil
 
 	case *plan.Join:
-		left, err := Build(n.Left, tx, args)
+		left, err := Build(ctx, n.Left, tx, args)
 		if err != nil {
 			return nil, err
 		}
-		right, err := Build(n.Right, tx, args)
+		right, err := Build(ctx, n.Right, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -79,7 +83,7 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 		return op, nil
 
 	case *plan.Aggregate:
-		input, err := Build(n.Input, tx, args)
+		input, err := Build(ctx, n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -121,7 +125,7 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 		return op, nil
 
 	case *plan.Distinct:
-		input, err := Build(n.Input, tx, args)
+		input, err := Build(ctx, n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -142,7 +146,7 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 		return &singleRowOp{}, nil
 
 	case *plan.Project:
-		input, err := Build(n.Input, tx, args)
+		input, err := Build(ctx, n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -155,7 +159,7 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 		return &projectOp{input: input, evals: evals, args: args, out: make(Row, len(evals))}, nil
 
 	case *plan.Sort:
-		input, err := Build(n.Input, tx, args)
+		input, err := Build(ctx, n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
@@ -170,15 +174,15 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 		return &sortOp{input: input, keys: keys, args: args}, nil
 
 	case *plan.Limit:
-		input, err := Build(n.Input, tx, args)
+		input, err := Build(ctx, n.Input, tx, args)
 		if err != nil {
 			return nil, err
 		}
-		count, err := rowCount(n.Count, args, math.MaxInt64)
+		count, err := rowCount(ctx, n.Count, args, math.MaxInt64)
 		if err != nil {
 			return nil, err
 		}
-		offset, err := rowCount(n.Offset, args, 0)
+		offset, err := rowCount(ctx, n.Offset, args, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -191,7 +195,7 @@ func Build(n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
 
 // rowCount evaluates a LIMIT or OFFSET operand, which cannot reference a column
 // and so is constant for the whole statement.
-func rowCount(e plan.Expr, args []types.Value, def int64) (int64, error) {
+func rowCount(ctx context.Context, e plan.Expr, args []types.Value, def int64) (int64, error) {
 	if e == nil {
 		return def, nil
 	}
@@ -199,7 +203,7 @@ func rowCount(e plan.Expr, args []types.Value, def int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	v, err := eval(args, nil)
+	v, err := eval(ctx, args, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -295,7 +299,7 @@ func (o *filterOp) Next(ctx context.Context) (Row, bool, error) {
 		if err != nil || !ok {
 			return nil, false, err
 		}
-		v, err := o.pred(o.args, row)
+		v, err := o.pred(ctx, o.args, row)
 		if err != nil {
 			return nil, false, err
 		}
@@ -323,7 +327,7 @@ func (o *projectOp) Next(ctx context.Context) (Row, bool, error) {
 		return nil, false, err
 	}
 	for i, eval := range o.evals {
-		if o.out[i], err = eval(o.args, row); err != nil {
+		if o.out[i], err = eval(ctx, o.args, row); err != nil {
 			return nil, false, err
 		}
 	}
@@ -389,7 +393,7 @@ func (o *sortOp) drainAndSort(ctx context.Context) error {
 
 		keys := make([]types.Value, len(o.keys))
 		for i, k := range o.keys {
-			if keys[i], err = k.eval(o.args, row); err != nil {
+			if keys[i], err = k.eval(ctx, o.args, row); err != nil {
 				return err
 			}
 		}
@@ -522,9 +526,9 @@ func compileChecks(checks []plan.Check) ([]compiledCheck, error) {
 // keeps only true — and it is why `CHECK (n >= 0)` does not reject a row whose
 // n is NULL. Reusing the filter rule here would silently make every CHECK an
 // implicit NOT NULL.
-func runChecks(checks []compiledCheck, args []types.Value, row Row, table string) error {
+func runChecks(ctx context.Context, checks []compiledCheck, args []types.Value, row Row, table string) error {
 	for _, c := range checks {
-		v, err := c.pred(args, row)
+		v, err := c.pred(ctx, args, row)
 		if err != nil {
 			return err
 		}
@@ -558,11 +562,11 @@ func compileReturning(r *plan.Returning) (*returningEval, error) {
 // row evaluates the RETURNING list against one affected row. A fresh slice is
 // allocated per row because, unlike an operator's output, these are accumulated
 // rather than consumed immediately.
-func (r *returningEval) row(args []types.Value, in Row) (Row, error) {
+func (r *returningEval) row(ctx context.Context, args []types.Value, in Row) (Row, error) {
 	out := make(Row, len(r.evals))
 	for i, eval := range r.evals {
 		var err error
-		if out[i], err = eval(args, in); err != nil {
+		if out[i], err = eval(ctx, args, in); err != nil {
 			return nil, err
 		}
 	}
@@ -596,7 +600,7 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		match, err := pred(args, v.Vals)
+		match, err := pred(ctx, args, v.Vals)
 		if err != nil {
 			return Result{}, err
 		}
@@ -610,14 +614,14 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		next := make([]types.Value, len(v.Vals))
 		copy(next, v.Vals)
 		for i, a := range up.Assignments {
-			val, err := assign[i](args, v.Vals)
+			val, err := assign[i](ctx, args, v.Vals)
 			if err != nil {
 				return Result{}, err
 			}
 			next[a.Ordinal] = val
 		}
 
-		if err := runChecks(checks, args, next, up.Table.Name); err != nil {
+		if err := runChecks(ctx, checks, args, next, up.Table.Name); err != nil {
 			return Result{}, err
 		}
 		// A key the children point at is changing, so they have to be dealt
@@ -632,7 +636,7 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		res.Affected++
 		if ret != nil {
 			// RETURNING on an UPDATE reports the new values.
-			out, err := ret.row(args, next)
+			out, err := ret.row(ctx, args, next)
 			if err != nil {
 				return Result{}, err
 			}
@@ -671,7 +675,7 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		match, err := pred(args, v.Vals)
+		match, err := pred(ctx, args, v.Vals)
 		if err != nil {
 			return Result{}, err
 		}
@@ -680,7 +684,7 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 		}
 		if ret != nil {
 			// RETURNING on a DELETE reports the row as it was before removal.
-			out, err := ret.row(args, v.Vals)
+			out, err := ret.row(ctx, args, v.Vals)
 			if err != nil {
 				return Result{}, err
 			}
@@ -839,16 +843,16 @@ func refReplacement(t *catalog.Table, ordinal int, action catalog.RefAction) (ty
 // compilePredicate turns an optional WHERE into a row test. A missing clause
 // matches every row, and a clause evaluating to unknown matches none — the same
 // rule a Filter operator applies.
-func compilePredicate(e plan.Expr) (func(args []types.Value, row Row) (bool, error), error) {
+func compilePredicate(e plan.Expr) (func(ctx context.Context, args []types.Value, row Row) (bool, error), error) {
 	if e == nil {
-		return func([]types.Value, Row) (bool, error) { return true, nil }, nil
+		return func(context.Context, []types.Value, Row) (bool, error) { return true, nil }, nil
 	}
 	eval, err := Compile(e)
 	if err != nil {
 		return nil, err
 	}
-	return func(args []types.Value, row Row) (bool, error) {
-		v, err := eval(args, row)
+	return func(ctx context.Context, args []types.Value, row Row) (bool, error) {
+		v, err := eval(ctx, args, row)
 		if err != nil {
 			return false, err
 		}
@@ -891,7 +895,7 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 			if err != nil {
 				return res, err
 			}
-			v, err := eval(args, nil)
+			v, err := eval(ctx, args, nil)
 			if err != nil {
 				return res, err
 			}
@@ -906,12 +910,12 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 		// yield a distinct value per row, and hoisting would quietly give a
 		// multi-row INSERT the same one throughout.
 		for ord, eval := range defaults {
-			if row[ord], err = eval(args, nil); err != nil {
+			if row[ord], err = eval(ctx, args, nil); err != nil {
 				return res, err
 			}
 		}
 
-		if err := runChecks(checks, args, row, ins.Table.Name); err != nil {
+		if err := runChecks(ctx, checks, args, row, ins.Table.Name); err != nil {
 			return res, err
 		}
 		if err := ins.Table.Insert(tx, row); err != nil {
@@ -922,7 +926,7 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 		// RETURNING is evaluated after the row is complete, so a generated
 		// serial is visible to it.
 		if ret != nil {
-			out, err := ret.row(args, row)
+			out, err := ret.row(ctx, args, row)
 			if err != nil {
 				return res, err
 			}
@@ -1055,7 +1059,7 @@ func (o *joinOp) Next(ctx context.Context) (Row, bool, error) {
 		if o.j < len(o.rightRows) {
 			i := o.j
 			o.j++
-			ok, err := o.match(o.cur, o.rightRows[i])
+			ok, err := o.match(ctx, o.cur, o.rightRows[i])
 			if err != nil {
 				return nil, false, err
 			}
@@ -1084,13 +1088,13 @@ func (o *joinOp) Next(ctx context.Context) (Row, bool, error) {
 // gets true can return o.out as it stands. A CROSS JOIN has no condition, so
 // every pair matches. Only true joins the rows: false and unknown are both
 // rejected, which is the same rule a WHERE clause follows.
-func (o *joinOp) match(l, r Row) (bool, error) {
+func (o *joinOp) match(ctx context.Context, l, r Row) (bool, error) {
 	copy(o.out, l)
 	copy(o.out[o.leftWidth:], r)
 	if o.pred == nil {
 		return true, nil
 	}
-	v, err := o.pred(o.args, o.out)
+	v, err := o.pred(ctx, o.args, o.out)
 	if err != nil {
 		return false, err
 	}
@@ -1225,7 +1229,7 @@ func (o *aggregateOp) build(ctx context.Context) error {
 
 		key := make([]types.Value, len(o.keys))
 		for i, k := range o.keys {
-			if key[i], err = k(o.args, row); err != nil {
+			if key[i], err = k(ctx, o.args, row); err != nil {
 				return err
 			}
 		}
@@ -1237,7 +1241,7 @@ func (o *aggregateOp) build(ctx context.Context) error {
 				g.accs[i].Add(types.Null())
 				continue
 			}
-			v, err := eval(o.args, row)
+			v, err := eval(ctx, o.args, row)
 			if err != nil {
 				return err
 			}
@@ -1326,7 +1330,7 @@ func (o *distinctOp) Next(ctx context.Context) (Row, bool, error) {
 			o.key = make([]types.Value, len(o.on))
 		}
 		for i, eval := range o.on {
-			if o.key[i], err = eval(o.args, row); err != nil {
+			if o.key[i], err = eval(ctx, o.args, row); err != nil {
 				return nil, false, err
 			}
 		}
