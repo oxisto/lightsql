@@ -78,6 +78,19 @@ func (s *scope) addTable(t *catalog.Table, qualifier string) {
 	}
 }
 
+// addColumns brings a subplan's output columns into scope under the given
+// qualifier, the way addTable does for a base table. A derived table's columns
+// are named by its select list rather than by the catalog, which is why this
+// takes the plan's result columns instead of a *catalog.Table.
+func (s *scope) addColumns(cols []plan.ResultColumn, qualifier string) {
+	base := len(s.cols)
+	for i, c := range cols {
+		s.cols = append(s.cols, scopeColumn{
+			table: qualifier, name: c.Name, ordinal: base + i, typ: c.Type,
+		})
+	}
+}
+
 // visible reports whether an unqualified reference may resolve to this column.
 func (c *scopeColumn) visible(qualified bool) bool { return qualified || !c.hidden }
 
@@ -826,8 +839,30 @@ func (b *Binder) bindFrom(te ast.TableExpr, sc *scope) (plan.Node, error) {
 		return b.bindJoin(te, sc)
 
 	case *ast.SubqueryRef:
-		return nil, pgerr.New(pgerr.FeatureNotSupported,
-			"subqueries in FROM are not supported yet").At(te.Pos())
+		// The alias is checked before the body is bound, because it is a
+		// structural requirement: without it the derived table's columns have
+		// no name to be qualified by, and reporting a missing alias is more
+		// use than reporting the first thing wrong inside a subquery that
+		// could not have been referenced anyway.
+		if te.Alias.IsEmpty() {
+			return nil, pgerr.New(pgerr.SyntaxError,
+				"subquery in FROM must have an alias").At(te.Pos())
+		}
+		// The body is bound in a scope of its own. Without LATERAL a derived
+		// table cannot see the tables beside it in the outer FROM, and passing
+		// the outer scope down would silently make every derived table lateral
+		// — the reference would resolve, against an ordinal describing a row
+		// the subplan never sees.
+		node, err := b.bindSelectNode(te.Select)
+		if err != nil {
+			return nil, err
+		}
+		// No node of its own: a derived table is exactly the rows its body
+		// produces, so the subplan is spliced straight in. The ordinals the
+		// scope hands out already describe the row the outer plan builds,
+		// because that is how a join concatenates its inputs.
+		sc.addColumns(node.Result(), te.Alias.Name)
+		return node, nil
 
 	default:
 		// Naming the construct rather than printing the Go type keeps the
@@ -942,6 +977,21 @@ func joinCols(left, right plan.Node) []plan.ResultColumn {
 }
 
 func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
+	root, err := b.bindSelectNode(s)
+	if err != nil {
+		return nil, err
+	}
+	return &plan.Query{Root: root}, nil
+}
+
+// bindSelectNode binds a SELECT to the node that produces its rows.
+//
+// It is separate from bindSelect because a SELECT is not always a statement: a
+// derived table is one in FROM position, and a subquery is one in expression
+// position. Those need the node without the plan.Query wrapper, and binding
+// them through the same function is what keeps a subquery's clause handling
+// from drifting away from a top-level query's.
+func (b *Binder) bindSelectNode(s *ast.SelectStmt) (plan.Node, error) {
 	sc := &scope{}
 	// A SELECT without FROM is evaluated over one empty row, so every node
 	// below always has an input and no consumer needs a nil special case.
@@ -1059,7 +1109,7 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 		}
 		out = lim
 	}
-	return &plan.Query{Root: out}, nil
+	return out, nil
 }
 
 // bindOrderBy resolves the ORDER BY terms against the select list and the input

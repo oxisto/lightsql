@@ -222,10 +222,12 @@ var Groups = []Group{
 				Note:  "compares the output row, and treats NULLs as equal; DISTINCT ON keeps the first row per key, so ORDER BY decides which. Unlike PostgreSQL, ORDER BY on an unselected column is accepted rather than rejected",
 				Setup: probeTable,
 				SQL:   "SELECT DISTINCT ON (a) a, b FROM t"},
-			{Name: "Subqueries", Parse: Yes, Exec: Planned,
-				Note:  "scalar, IN, EXISTS, and derived tables",
+			{Name: "Subqueries", Parse: Yes, Exec: Partial,
+				Note: "derived tables in FROM execute, and must have an alias; scalar, IN " +
+					"and EXISTS subqueries parse but are not executed yet. LATERAL is not " +
+					"supported, so a derived table cannot reference the tables beside it",
 				Setup: probeJoin,
-				SQL:   "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)"},
+				SQL:   "SELECT x.a FROM (SELECT a FROM t) x"},
 			{Name: "UNION / INTERSECT / EXCEPT", Parse: Planned, Exec: Planned,
 				SQL: "SELECT a FROM t UNION SELECT b FROM u"},
 			{Name: "Common table expressions", Parse: Planned, Exec: Planned,
