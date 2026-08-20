@@ -560,6 +560,24 @@ func bindBinary(e *ast.BinaryExpr, sc *scope) (plan.Expr, error) {
 
 func isJSON(k types.Kind) bool { return k == types.KindJSON || k == types.KindJSONB }
 
+// literalResolves reports whether an unknown-typed string literal may take this
+// type from the other side of a comparison.
+//
+// These are the kinds a literal is the only way to write: there is no timestamp
+// syntax and no json syntax, so `at > '2024-01-01'` and `doc = '{"a":1}'` would
+// otherwise be type errors and the column would be uncomparable from SQL text.
+// Numbers and booleans are excluded deliberately — they have their own literal
+// syntax, so resolving text against them would accept comparisons PostgreSQL
+// rejects rather than enabling ones it allows.
+func literalResolves(k types.Kind) bool {
+	switch k {
+	case types.KindJSON, types.KindJSONB,
+		types.KindDate, types.KindTime, types.KindTimestamp, types.KindTimestamptz:
+		return true
+	}
+	return false
+}
+
 // unify brings two operands to a common type so the executor can compare or
 // combine them without inspecting types per row.
 //
@@ -587,22 +605,22 @@ func unify(l, r plan.Expr, e *ast.BinaryExpr) (left, right plan.Expr, err error)
 		return l, r, nil
 	}
 
-	// A string literal compared against a document resolves to that document
-	// type. PostgreSQL gives a quoted literal the "unknown" type and lets the
-	// other operand decide; lightsql commits it to text in the binder, so
+	// A string literal compared against a document or an instant resolves to
+	// that type. PostgreSQL gives a quoted literal the "unknown" type and lets
+	// the other operand decide; lightsql commits it to text in the binder, so
 	// without this doc = '{"a":1}' would be a type error and a string literal —
-	// the only way to write a document — could not be compared at all. The rule
-	// is kept to json and jsonb rather than applied to every pair, because
-	// resolving text against, say, an integer would silently accept comparisons
-	// PostgreSQL rejects.
-	if c, ok := l.(*plan.Const); ok && lt == types.KindText && isJSON(rt) {
+	// the only way to write a document or a timestamp — could not be compared at
+	// all. The rule is kept to those kinds rather than applied to every pair,
+	// because resolving text against, say, an integer would silently accept
+	// comparisons PostgreSQL rejects.
+	if c, ok := l.(*plan.Const); ok && lt == types.KindText && literalResolves(rt) {
 		v, err := types.Cast(c.Val, rt)
 		if err != nil {
 			return nil, nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.X.Pos())
 		}
 		return &plan.Const{Val: v}, r, nil
 	}
-	if c, ok := r.(*plan.Const); ok && rt == types.KindText && isJSON(lt) {
+	if c, ok := r.(*plan.Const); ok && rt == types.KindText && literalResolves(lt) {
 		v, err := types.Cast(c.Val, lt)
 		if err != nil {
 			return nil, nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.Y.Pos())

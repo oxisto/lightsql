@@ -317,8 +317,15 @@ var Groups = []Group{
 				SQL:  "CREATE TABLE t (a TEXT, b VARCHAR(255), c CHARACTER VARYING(10))"},
 			{Name: "BOOLEAN", Parse: Yes, Exec: Yes, SQL: "CREATE TABLE t (a BOOLEAN)"},
 			{Name: "Date and time", Parse: Yes, Exec: Partial,
-				Note: "columns and time.Time arguments work; date and time literals are pending",
-				SQL:  "CREATE TABLE t (a DATE, b TIMESTAMP WITH TIME ZONE)"},
+				Note: "columns, time.Time arguments and ISO 8601 literals, with either a " +
+					"space or a T separator. A zone offset is honoured by timestamptz and " +
+					"dropped by timestamp, as \"without time zone\" requires. A bare literal " +
+					"takes its type from the column it is compared or assigned to. " +
+					"now(), CURRENT_TIMESTAMP and INTERVAL are pending, and the non-ISO date " +
+					"styles PostgreSQL accepts are deliberately not, since 01/02/2024 has no " +
+					"reading that is right in both conventions",
+				Setup: []string{"CREATE TABLE t (a DATE, b TIMESTAMP WITH TIME ZONE, c TIMESTAMP)"},
+				SQL:   "INSERT INTO t VALUES ('2024-01-02', '2024-01-02T12:30:00+02:00', '2024-01-02 12:30:00')"},
 			{Name: "BYTEA", Parse: Yes, Exec: Yes, SQL: "CREATE TABLE t (a BYTEA)"},
 			{Name: "NUMERIC / DECIMAL", Parse: Yes, Exec: Partial,
 				Note: "stored as double precision; exact decimal arithmetic is pending",
