@@ -261,13 +261,15 @@ var Groups = []Group{
 				Note:  "$1 and ?, not mixed in one statement; the type is inferred from context",
 				Setup: probeTable,
 				SQL:   "SELECT a FROM t WHERE b = $1 AND c = $2"},
-			{Name: "BETWEEN / IN / LIKE", Parse: Yes, Exec: Partial,
-				Note: "IN executes, over both a list and a subquery, and follows SQL's " +
-					"three-valued rule: without a match, a NULL among the candidates " +
-					"makes the answer unknown rather than false, so NOT IN over a NULL " +
-					"returns no rows. BETWEEN and LIKE parse but are not executed yet",
+			{Name: "BETWEEN / IN / LIKE", Parse: Yes, Exec: Yes,
+				Note: "including the negated forms. BETWEEN is inclusive and rewritten to " +
+					"a pair of comparisons; LIKE supports % and _ with backslash escaping, " +
+					"and is anchored, so it matches the whole string. IN follows SQL's " +
+					"three-valued rule: without a match, a NULL among the candidates makes " +
+					"the answer unknown rather than false, so NOT IN over a NULL returns " +
+					"no rows. ILIKE and an explicit ESCAPE clause are not supported",
 				Setup: probeTable,
-				SQL:   "SELECT a FROM t WHERE a IN (1, 2)"},
+				SQL:   "SELECT a FROM t WHERE a BETWEEN 1 AND 2 AND s LIKE 'x%' AND a IN (1, 2)"},
 			{Name: "CASE", Parse: Yes, Exec: Yes,
 				Note: "simple and searched forms; the simple form is rewritten to the " +
 					"searched one, so both take one path. Only a true condition fires an " +

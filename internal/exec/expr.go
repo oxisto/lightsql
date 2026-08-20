@@ -11,6 +11,8 @@ import (
 	"context"
 	"errors"
 	"math"
+	"regexp"
+	"strings"
 
 	"github.com/oxisto/lightsql/internal/ast"
 	"github.com/oxisto/lightsql/internal/pgerr"
@@ -511,6 +513,10 @@ func compileBinary(e *plan.Binary, tx *storage.Tx) (Eval, error) {
 		}, nil
 	}
 
+	if e.Op == ast.OpLike || e.Op == ast.OpNotLike {
+		return compileLike(e, l, r)
+	}
+
 	if e.Op == ast.OpConcat {
 		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
 			lv, rv, err := evalPair(ctx, l, r, args, row)
@@ -528,7 +534,113 @@ func compileBinary(e *plan.Binary, tx *storage.Tx) (Eval, error) {
 	return compileArithmetic(e, l, r)
 }
 
+// compileLike matches a string against a SQL LIKE pattern.
+//
+// A constant pattern is translated to a regular expression once, here, rather
+// than per row. That is the common case -- a pattern is almost always a literal
+// or a parameter -- and it is what keeps LIKE from recompiling the same
+// expression for every row of a scan.
+func compileLike(e *plan.Binary, l, r Eval) (Eval, error) {
+	negate := e.Op == ast.OpNotLike
+
+	var fixed *regexp.Regexp
+	if c, ok := e.R.(*plan.Const); ok && !c.Val.IsNull() {
+		re, err := likeRegexp(c.Val.AsString())
+		if err != nil {
+			return nil, err
+		}
+		fixed = re
+	}
+
+	return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+		lv, rv, err := evalPair(ctx, l, r, args, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		// NULL on either side is unknown, as it is for a comparison: there is
+		// no string to match and no pattern to match it against.
+		if lv.IsNull() || rv.IsNull() {
+			return types.Null(), nil
+		}
+		re := fixed
+		if re == nil {
+			if re, err = likeRegexp(rv.AsString()); err != nil {
+				return types.Value{}, err
+			}
+		}
+		return types.Bool(re.MatchString(lv.AsString()) != negate), nil
+	}, nil
+}
+
+// likeRegexp translates a SQL LIKE pattern into a regular expression.
+//
+// % stands for any run of characters and _ for exactly one; a backslash escapes
+// the next character, so `100\%` matches a literal per cent sign. Everything
+// else is literal, which QuoteMeta guarantees -- a pattern containing `.` or
+// `*` must match those characters and not act as a regular expression.
+//
+// Iterating bytes is safe despite the pattern being UTF-8, because the three
+// characters given meaning here are ASCII and so can never appear as a
+// continuation byte. Literal bytes are copied through untouched.
+func likeRegexp(pattern string) (*regexp.Regexp, error) {
+	var out, lit strings.Builder
+	// (?s) so that _ and % match a newline too, which SQL does not exempt.
+	out.WriteString("(?s)^")
+
+	flush := func() {
+		if lit.Len() > 0 {
+			out.WriteString(regexp.QuoteMeta(lit.String()))
+			lit.Reset()
+		}
+	}
+	for i := 0; i < len(pattern); i++ {
+		switch c := pattern[i]; c {
+		case '%':
+			flush()
+			out.WriteString(".*")
+		case '_':
+			flush()
+			out.WriteString(".")
+		case '\\':
+			// A trailing backslash stands for itself rather than escaping the
+			// terminator that is not there.
+			if i+1 < len(pattern) {
+				i++
+				lit.WriteByte(pattern[i])
+			} else {
+				lit.WriteByte(c)
+			}
+		default:
+			lit.WriteByte(c)
+		}
+	}
+	flush()
+	out.WriteString("$")
+
+	re, err := regexp.Compile(out.String())
+	if err != nil {
+		return nil, pgerr.Newf(pgerr.InvalidTextForType,
+			"invalid LIKE pattern %q", pattern)
+	}
+	return re, nil
+}
+
+// arithmetic is the set of operators compileArithmetic implements.
+//
+// It is checked rather than assumed because this function is the last branch of
+// compileBinary, so anything not handled above lands here. It used to run such
+// an operator as exponentiation -- which is how LIKE came to answer the float 1
+// for every row instead of failing.
+var arithmetic = map[ast.BinaryOp]bool{
+	ast.OpAdd: true, ast.OpSub: true, ast.OpMul: true,
+	ast.OpDiv: true, ast.OpMod: true, ast.OpExp: true,
+}
+
 func compileArithmetic(e *plan.Binary, l, r Eval) (Eval, error) {
+	if !arithmetic[e.Op] {
+		return nil, pgerr.Newf(pgerr.InternalError,
+			"cannot compile operator %s", e.Op)
+	}
 	op := e.Op
 	// Integer arithmetic stays exact; a float operand makes the whole
 	// expression float, which is what the binder already decided.

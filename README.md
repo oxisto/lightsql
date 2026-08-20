@@ -175,7 +175,7 @@ the two.
 | ✅ | IS NULL / IS DISTINCT FROM | ✅ | ✅ |  |
 | ✅ | String concatenation | ✅ | ✅ | NULL propagates, as in PostgreSQL |
 | ✅ | Parameter placeholders | ✅ | ✅ | $1 and ?, not mixed in one statement; the type is inferred from context |
-| 🟡 | BETWEEN / IN / LIKE | ✅ | 🟡 | IN executes, over both a list and a subquery, and follows SQL's three-valued rule: without a match, a NULL among the candidates makes the answer unknown rather than false, so NOT IN over a NULL returns no rows. BETWEEN and LIKE parse but are not executed yet |
+| ✅ | BETWEEN / IN / LIKE | ✅ | ✅ | including the negated forms. BETWEEN is inclusive and rewritten to a pair of comparisons; LIKE supports % and _ with backslash escaping, and is anchored, so it matches the whole string. IN follows SQL's three-valued rule: without a match, a NULL among the candidates makes the answer unknown rather than false, so NOT IN over a NULL returns no rows. ILIKE and an explicit ESCAPE clause are not supported |
 | ✅ | CASE | ✅ | ✅ | simple and searched forms; the simple form is rewritten to the searched one, so both take one path. Only a true condition fires an arm, no match without ELSE is NULL, and the branches must share a type so a result column cannot change type from row to row |
 | ✅ | CAST | ✅ | ✅ | both CAST(x AS t) and x::t |
 | ⬜ | Scalar functions | ✅ | ⬜ | parsed generically; the function library is pending |

@@ -73,6 +73,9 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 	case *ast.CaseExpr:
 		return bindCase(e, sc)
 
+	case *ast.BetweenExpr:
+		return bindBetween(e, sc)
+
 	case *ast.SubqueryExpr:
 		return bindScalarSubquery(e, sc)
 
@@ -99,6 +102,38 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 //
 // A numeric literal becomes an integer when it fits one and a float otherwise,
 // which is what makes `WHERE id = 1` compare as integers without a cast.
+// bindBetween rewrites BETWEEN into the pair of comparisons it is defined as.
+//
+// `x BETWEEN lo AND hi` is `x >= lo AND x <= hi`, and the negated form is the
+// negation of that whole thing rather than a pair of strict comparisons written
+// out by hand -- which matters under three-valued logic, where NOT of unknown
+// is unknown and must stay that way.
+//
+// Rewriting here rather than adding a plan node means the executor gains
+// nothing to run and the comparisons get the type unification they would have
+// had if written out. The cost is that x is evaluated once per comparison; no
+// expression in lightsql has side effects, so that is a performance note rather
+// than a semantic one.
+func bindBetween(e *ast.BetweenExpr, sc *scope) (plan.Expr, error) {
+	lo := &ast.BinaryExpr{X: e.X, Op: ast.OpGe, OpPos: e.BetweenPos, Y: e.Lo}
+	hi := &ast.BinaryExpr{X: e.X, Op: ast.OpLe, OpPos: e.BetweenPos, Y: e.Hi}
+
+	l, err := bindBinary(lo, sc)
+	if err != nil {
+		return nil, err
+	}
+	r, err := bindBinary(hi, sc)
+	if err != nil {
+		return nil, err
+	}
+
+	both := &plan.Binary{Op: ast.OpAnd, L: l, R: r, Kind: types.KindBool}
+	if !e.Negate {
+		return both, nil
+	}
+	return &plan.Unary{Op: ast.OpNot, X: both, Kind: types.KindBool}, nil
+}
+
 // bindCase binds a CASE expression.
 //
 // The simple form is rewritten into the searched one: CASE x WHEN v becomes
@@ -423,6 +458,20 @@ func bindBinary(e *ast.BinaryExpr, sc *scope) (plan.Expr, error) {
 			return nil, err
 		}
 		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: types.KindText}, nil
+
+	case e.Op == ast.OpLike, e.Op == ast.OpNotLike:
+		// Both sides must be text. Without this the operator fell through to
+		// the arithmetic path, where its default branch is exponentiation: two
+		// strings converted to 0, 0 ** 0 is 1, and every LIKE quietly answered
+		// the float 1 -- which is not true, so a WHERE built on it matched
+		// nothing at all and reported no error.
+		if l, err = coerce(l, types.KindText, e.X.Pos()); err != nil {
+			return nil, err
+		}
+		if r, err = coerce(r, types.KindText, e.Y.Pos()); err != nil {
+			return nil, err
+		}
+		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: types.KindBool}, nil
 
 	case e.Op.IsComparison(), e.Op == ast.OpIsDistinctFrom, e.Op == ast.OpIsNotDistinctFrom:
 		if l, r, err = unify(l, r, e); err != nil {
