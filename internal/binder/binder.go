@@ -1188,9 +1188,18 @@ func (b *Binder) bindSelectItems(items []ast.SelectItem, sc *scope, input plan.N
 // computed expression has no declared type, so it falls back to its kind.
 func resultType(e plan.Expr, sc *scope) catalog.Type {
 	if c, ok := e.(*plan.Column); ok {
-		for _, sc := range sc.cols {
-			if sc.ordinal == c.Ordinal {
-				return sc.typ
+		// A grouped query's ordinals index the grouped row, so the input scope
+		// is the wrong table to look them up in — and it would not fail, it
+		// would return an unrelated column's type.
+		if sc.agg != nil {
+			if t, ok := sc.agg.resultType(c.Ordinal); ok {
+				return t
+			}
+		} else {
+			for _, sc := range sc.cols {
+				if sc.ordinal == c.Ordinal {
+					return sc.typ
+				}
 			}
 		}
 	}
