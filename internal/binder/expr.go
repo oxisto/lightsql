@@ -111,18 +111,42 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 //
 // Rewriting here rather than adding a plan node means the executor gains
 // nothing to run and the comparisons get the type unification they would have
-// had if written out. The cost is that x is evaluated once per comparison; no
-// expression in lightsql has side effects, so that is a performance note rather
-// than a semantic one.
+// had if written out.
+//
+// The left operand is bound once and the bound expression shared by both
+// comparisons. Binding it twice would not merely be wasteful: an aggregate
+// registers itself with the grouping context as it binds, so `count(*) BETWEEN
+// 1 AND 5` would add two accumulators computing the same number, and a scalar
+// subquery would be planned twice. It is still compiled once per comparison, so
+// x is evaluated twice per row; no expression in lightsql has side effects, so
+// that remains a performance note rather than a semantic one.
 func bindBetween(e *ast.BetweenExpr, sc *scope) (plan.Expr, error) {
-	lo := &ast.BinaryExpr{X: e.X, Op: ast.OpGe, OpPos: e.BetweenPos, Y: e.Lo}
-	hi := &ast.BinaryExpr{X: e.X, Op: ast.OpLe, OpPos: e.BetweenPos, Y: e.Hi}
-
-	l, err := bindBinary(lo, sc)
+	x, err := bindExpr(e.X, sc)
 	if err != nil {
 		return nil, err
 	}
-	r, err := bindBinary(hi, sc)
+
+	// compare unifies the shared left operand against one bound bound, building
+	// the comparison the rewrite stands for. The synthetic BinaryExpr exists
+	// only to give unify an operator and a position to report against.
+	compare := func(op ast.BinaryOp, y ast.Expr) (plan.Expr, error) {
+		bound, err := bindExpr(y, sc)
+		if err != nil {
+			return nil, err
+		}
+		syn := &ast.BinaryExpr{X: e.X, Op: op, OpPos: e.BetweenPos, Y: y}
+		l, r, err := unify(x, bound, syn)
+		if err != nil {
+			return nil, err
+		}
+		return &plan.Binary{Op: op, L: l, R: r, Kind: types.KindBool}, nil
+	}
+
+	l, err := compare(ast.OpGe, e.Lo)
+	if err != nil {
+		return nil, err
+	}
+	r, err := compare(ast.OpLe, e.Hi)
 	if err != nil {
 		return nil, err
 	}

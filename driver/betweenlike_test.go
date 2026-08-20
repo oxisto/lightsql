@@ -68,6 +68,22 @@ func TestBetween(t *testing.T) {
 			query: `SELECT id FROM t WHERE id BETWEEN 1 + 1 AND 2 * 2 ORDER BY id`,
 			want:  []string{"2", "3", "4"},
 		},
+		{
+			// The left operand is bound once and shared by both comparisons.
+			// Binding it twice would register this aggregate with the grouping
+			// context twice, giving the group a second accumulator computing
+			// the same number.
+			name:  "aggregate as the left operand",
+			query: `SELECT s FROM t WHERE s IS NOT NULL GROUP BY s HAVING count(*) BETWEEN 1 AND 5 ORDER BY s`,
+			want:  []string{"100%", "a.c", "ada", "bob", "cy"},
+		},
+		{
+			// Likewise a scalar subquery, which would otherwise be planned
+			// twice for one BETWEEN.
+			name:  "scalar subquery as the left operand",
+			query: `SELECT id FROM t WHERE (SELECT count(*) FROM t) BETWEEN 1 AND 100 ORDER BY id LIMIT 2`,
+			want:  []string{"1", "2"},
+		},
 	}
 
 	for _, tt := range tests {

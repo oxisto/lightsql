@@ -536,10 +536,15 @@ func compileBinary(e *plan.Binary, tx *storage.Tx) (Eval, error) {
 
 // compileLike matches a string against a SQL LIKE pattern.
 //
-// A constant pattern is translated to a regular expression once, here, rather
-// than per row. That is the common case -- a pattern is almost always a literal
-// or a parameter -- and it is what keeps LIKE from recompiling the same
-// expression for every row of a scan.
+// A literal pattern is translated once, here. Any other pattern is translated
+// on first use and remembered, which covers the case that matters nearly as
+// much: `LIKE $1` is a different plan.Expr from a constant but is still one
+// pattern for the whole statement, and recompiling it per row would make the
+// parameterised form -- the one an ORM emits -- the slow one.
+//
+// The memo is a single entry rather than a map because a pattern that genuinely
+// varies per row comes from a column, and caching those would grow without
+// bound to no purpose.
 func compileLike(e *plan.Binary, l, r Eval) (Eval, error) {
 	negate := e.Op == ast.OpNotLike
 
@@ -552,6 +557,10 @@ func compileLike(e *plan.Binary, l, r Eval) (Eval, error) {
 		fixed = re
 	}
 
+	var (
+		memoPat string
+		memoRe  *regexp.Regexp
+	)
 	return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
 		lv, rv, err := evalPair(ctx, l, r, args, row)
 		if err != nil {
@@ -562,10 +571,17 @@ func compileLike(e *plan.Binary, l, r Eval) (Eval, error) {
 		if lv.IsNull() || rv.IsNull() {
 			return types.Null(), nil
 		}
+
 		re := fixed
 		if re == nil {
-			if re, err = likeRegexp(rv.AsString()); err != nil {
-				return types.Value{}, err
+			pat := rv.AsString()
+			if memoRe != nil && memoPat == pat {
+				re = memoRe
+			} else {
+				if re, err = likeRegexp(pat); err != nil {
+					return types.Value{}, err
+				}
+				memoPat, memoRe = pat, re
 			}
 		}
 		return types.Bool(re.MatchString(lv.AsString()) != negate), nil
