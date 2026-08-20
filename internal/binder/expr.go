@@ -175,10 +175,19 @@ func bindCase(e *ast.CaseExpr, sc *scope) (plan.Expr, error) {
 }
 
 // matchArm turns one arm of a simple CASE into the equality it stands for.
+//
+// An operand of unknown type constrains nothing, and must not: converting the
+// arm to it means asking for an integer as a NULL, which is not a conversion at
+// all. `CASE NULL WHEN 1 THEN ...` is a legal question with the answer "no
+// match", so it has to reach the executor and compare to unknown rather than be
+// rejected at bind time. This mirrors the rule unify already applies to an
+// ordinary comparison.
 func matchArm(operand, arm plan.Expr, pos token.Pos) (plan.Expr, error) {
-	arm, err := coerce(arm, operand.Type(), pos)
-	if err != nil {
-		return nil, err
+	if operand.Type() != types.KindNull {
+		var err error
+		if arm, err = coerce(arm, operand.Type(), pos); err != nil {
+			return nil, err
+		}
 	}
 	return &plan.Binary{Op: ast.OpEq, L: operand, R: arm, Kind: types.KindBool}, nil
 }

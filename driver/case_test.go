@@ -58,6 +58,26 @@ func TestCaseExpr(t *testing.T) {
 			want:  []string{"ada|eng", "bob|other", "cy|other"},
 		},
 		{
+			// An operand of unknown type matches no arm, so the ELSE wins. It
+			// must not be a bind error: converting the arm to the operand's
+			// type would be asking for the integer 1 as a NULL.
+			name:  "null operand with a typed arm",
+			query: `SELECT CASE NULL WHEN 1 THEN 'a' ELSE 'b' END`,
+			want:  []string{"b"},
+		},
+		{
+			name:  "null operand with no else is null",
+			query: `SELECT CASE NULL WHEN 1 THEN 'a' END IS NULL`,
+			want:  []string{"true"},
+		},
+		{
+			// The mirror image, which already worked: a NULL arm against a
+			// typed operand.
+			name:  "null arm with a typed operand",
+			query: `SELECT CASE 1 WHEN NULL THEN 'a' ELSE 'b' END`,
+			want:  []string{"b"},
+		},
+		{
 			// A NULL branch does not constrain the type of the others.
 			name:  "null branch keeps the other type",
 			query: `SELECT CASE WHEN id = 1 THEN NULL ELSE 'x' END FROM emp ORDER BY id`,
