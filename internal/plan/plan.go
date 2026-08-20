@@ -332,6 +332,11 @@ type Insert struct {
 	// executor never re-derives the column order.
 	Targets []int
 	Rows    [][]Expr
+	// Source is set for INSERT ... SELECT, and is then the only source of
+	// rows; Rows is empty. It produces exactly the target columns, in target
+	// order and already converted to their types, so the executor stores what
+	// it is given rather than reconciling anything per row.
+	Source Node
 	// Serials lists ordinals of serial columns that the statement omitted and
 	// which must therefore be filled from the column's sequence.
 	Serials []int

@@ -2,6 +2,7 @@ package exec
 
 import (
 	"context"
+	"errors"
 	"math"
 	"slices"
 
@@ -879,26 +880,19 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 	}
 
 	var res Result
-	for _, exprs := range ins.Rows {
-		if err := ctx.Err(); err != nil {
-			return res, err
-		}
 
+	// store completes and writes one row from the values for the target
+	// columns. Both spellings of INSERT go through it, so a serial, a default,
+	// a CHECK and a RETURNING clause cannot come to mean different things
+	// depending on whether the rows came from VALUES or from a SELECT.
+	store := func(vals Row) error {
 		// Columns the statement did not name start as NULL, then serials are
 		// filled from their sequence.
 		row := make(Row, width)
 		for i := range row {
 			row[i] = types.Null()
 		}
-		for i, e := range exprs {
-			eval, err := Compile(e, tx)
-			if err != nil {
-				return res, err
-			}
-			v, err := eval(ctx, args, nil)
-			if err != nil {
-				return res, err
-			}
+		for i, v := range vals {
 			row[ins.Targets[i]] = v
 		}
 		for _, ord := range ins.Serials {
@@ -910,16 +904,18 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 		// yield a distinct value per row, and hoisting would quietly give a
 		// multi-row INSERT the same one throughout.
 		for ord, eval := range defaults {
-			if row[ord], err = eval(ctx, args, nil); err != nil {
-				return res, err
+			v, err := eval(ctx, args, nil)
+			if err != nil {
+				return err
 			}
+			row[ord] = v
 		}
 
 		if err := runChecks(ctx, checks, args, row, ins.Table.Name); err != nil {
-			return res, err
+			return err
 		}
 		if err := ins.Table.Insert(tx, row); err != nil {
-			return res, err
+			return err
 		}
 		res.Affected++
 
@@ -928,9 +924,35 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 		if ret != nil {
 			out, err := ret.row(ctx, args, row)
 			if err != nil {
-				return res, err
+				return err
 			}
 			res.Rows = append(res.Rows, out)
+		}
+		return nil
+	}
+
+	if ins.Source != nil {
+		if err := insertFrom(ctx, ins.Source, tx, args, store); err != nil {
+			return res, err
+		}
+	}
+
+	vals := make(Row, len(ins.Targets))
+	for _, exprs := range ins.Rows {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
+		for i, e := range exprs {
+			eval, err := Compile(e, tx)
+			if err != nil {
+				return res, err
+			}
+			if vals[i], err = eval(ctx, args, nil); err != nil {
+				return res, err
+			}
+		}
+		if err := store(vals); err != nil {
+			return res, err
 		}
 	}
 
@@ -943,6 +965,34 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 		return res, err
 	}
 	return res, nil
+}
+
+// insertFrom drives an INSERT ... SELECT, handing each source row to store.
+//
+// The rows are consumed as they are produced rather than collected first, so a
+// large SELECT does not have to be materialised. That is safe even when the
+// source reads the table being written, because a scan takes its rows when the
+// operator is built: the statement sees the table as it was, and cannot chase
+// the rows it is itself appending.
+func insertFrom(ctx context.Context, src plan.Node, tx *storage.Tx, args []types.Value, store func(Row) error) (err error) {
+	op, err := Build(ctx, src, tx, args)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, op.Close()) }()
+
+	for {
+		row, ok, err := op.Next(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if err := store(row); err != nil {
+			return err
+		}
+	}
 }
 
 // ExecCreateTable runs a CREATE TABLE.
