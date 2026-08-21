@@ -149,7 +149,15 @@ var Groups = []Group{
 				Setup: probeTable,
 				SQL:   "DROP TABLE t"},
 			{Name: "ALTER TABLE", Parse: Planned, Exec: Planned, SQL: "ALTER TABLE t ADD COLUMN c INT"},
-			{Name: "CREATE INDEX", Parse: Planned, Exec: Planned, SQL: "CREATE INDEX i ON t (a)"},
+			{Name: "CREATE INDEX", Parse: Yes, Exec: Partial,
+				Note: "UNIQUE and partial indexes are enforced as constraints, including a " +
+					"partial one whose predicate decides which rows it covers. A plain index " +
+					"is recorded but builds no structure and is never chosen, because there " +
+					"is no index selection in the planner yet -- so it costs nothing and " +
+					"speeds nothing up. DROP INDEX is supported; expression indexes and a " +
+					"per-column sort order are not",
+				Setup: probeTable,
+				SQL:   "CREATE INDEX i ON t (a)"},
 			{Name: "CREATE VIEW", Parse: Planned, Exec: Planned, SQL: "CREATE VIEW v AS SELECT 1"},
 			{Name: "CREATE SCHEMA", Parse: Planned, Exec: Planned, SQL: "CREATE SCHEMA s"},
 			{Name: "Sequences and SERIAL", Parse: Yes, Exec: Yes,

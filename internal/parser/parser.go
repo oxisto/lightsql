@@ -203,14 +203,81 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 	}
 }
 
-// parseDrop parses DROP TABLE.
+// parseCreateIndex parses CREATE [UNIQUE] INDEX.
+//
+// index is matched as a word rather than a keyword because PostgreSQL leaves it
+// unreserved: making it a keyword would stop a column being called index, which
+// is legal and not unusual.
+func (p *parser) parseCreateIndex(createPos token.Pos) (ast.Stmt, error) {
+	stmt := &ast.CreateIndexStmt{CreatePos: createPos}
+	stmt.Unique = p.accept(token.Unique)
+	if err := p.expectWord("index"); err != nil {
+		return nil, err
+	}
+
+	if p.accept(token.If) {
+		if err := p.expect(token.Not); err != nil {
+			return nil, err
+		}
+		if err := p.expect(token.Exists); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
+
+	name, err := p.expectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	if err := p.expect(token.On); err != nil {
+		return nil, err
+	}
+	if stmt.Table, err = p.parseTableName(); err != nil {
+		return nil, err
+	}
+
+	if err := p.expect(token.LParen); err != nil {
+		return nil, err
+	}
+	for {
+		col, err := p.expectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Columns = append(stmt.Columns, col)
+		if !p.accept(token.Comma) {
+			break
+		}
+	}
+	if err := p.expect(token.RParen); err != nil {
+		return nil, err
+	}
+
+	// A partial index. The predicate is an ordinary expression over the table's
+	// columns, so it is parsed like any other WHERE clause.
+	if p.accept(token.Where) {
+		if stmt.Where, err = p.parseExpr(bpNone); err != nil {
+			return nil, err
+		}
+	}
+	return stmt, nil
+}
+
+// parseDrop parses DROP TABLE or DROP INDEX.
 //
 // Several tables may be named at once, and PostgreSQL drops them as one
 // statement rather than in sequence, so a reference between two of them is not
 // a reason to refuse.
 func (p *parser) parseDrop() (ast.Stmt, error) {
-	stmt := &ast.DropTableStmt{DropPos: p.cur().Pos}
+	dropPos := p.cur().Pos
 	p.next()
+	if p.atWord("index") {
+		return p.parseDropIndex(dropPos)
+	}
+
+	stmt := &ast.DropTableStmt{DropPos: dropPos}
 	if err := p.expect(token.Table); err != nil {
 		return nil, err
 	}
@@ -240,6 +307,36 @@ func (p *parser) parseDrop() (ast.Stmt, error) {
 		p.next()
 		stmt.Cascade = true
 	case p.atWord("restrict"):
+		p.next()
+	}
+	return stmt, nil
+}
+
+// parseDropIndex parses DROP INDEX.
+func (p *parser) parseDropIndex(dropPos token.Pos) (ast.Stmt, error) {
+	stmt := &ast.DropIndexStmt{DropPos: dropPos}
+	if err := p.expectWord("index"); err != nil {
+		return nil, err
+	}
+	if p.accept(token.If) {
+		if err := p.expect(token.Exists); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+	for {
+		name, err := p.expectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Names = append(stmt.Names, name)
+		if !p.accept(token.Comma) {
+			break
+		}
+	}
+	// RESTRICT is the default and CASCADE means nothing for an index nothing
+	// else depends on, so both are accepted and ignored.
+	if p.atWord("cascade") || p.atWord("restrict") {
 		p.next()
 	}
 	return stmt, nil
@@ -721,6 +818,12 @@ func (p *parser) parseDelete() (*ast.DeleteStmt, error) {
 func (p *parser) parseCreate() (ast.Stmt, error) {
 	createPos := p.cur().Pos
 	p.next()
+
+	// UNIQUE only ever introduces an index here, so it decides the production
+	// before TABLE or INDEX is read.
+	if p.cur().Kind == token.Unique || p.atWord("index") {
+		return p.parseCreateIndex(createPos)
+	}
 	if err := p.expect(token.Table); err != nil {
 		return nil, err
 	}

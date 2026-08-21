@@ -9,6 +9,8 @@ package engine
 import (
 	"context"
 
+	"github.com/oxisto/lightsql/internal/ast"
+
 	"github.com/oxisto/lightsql/internal/binder"
 	"github.com/oxisto/lightsql/internal/catalog"
 	"github.com/oxisto/lightsql/internal/exec"
@@ -35,6 +37,29 @@ func New() *Engine {
 	// itself, so it is handed a closure rather than the dependency being
 	// inverted. SET DEFAULT on a foreign key is the only caller.
 	cat.SetDefaultEvaluator(bnd.EvalConstDefault)
+	// A partial index needs its predicate run while uniqueness is checked, and
+	// the catalog can neither bind nor compile. The engine is the one layer that
+	// sees both, so it closes over them here rather than either stage reaching
+	// across the pipeline.
+	cat.SetPredicateCompiler(func(expr ast.Expr, t *catalog.Table) (func([]types.Value) (bool, error), error) {
+		pred, err := bnd.BindIndexPredicate(expr, t)
+		if err != nil {
+			return nil, err
+		}
+		eval, err := exec.Compile(pred, nil)
+		if err != nil {
+			return nil, err
+		}
+		return func(row []types.Value) (bool, error) {
+			// Only true selects a row into a partial index; false and unknown
+			// both leave it out, as they do for a WHERE clause.
+			v, err := eval(context.Background(), nil, row)
+			if err != nil {
+				return false, err
+			}
+			return v.Truth() == types.True, nil
+		}, nil
+	})
 	return &Engine{mgr: mgr, cat: cat, bnd: bnd}
 }
 
@@ -186,6 +211,16 @@ func (p *Prepared) run(ctx context.Context, tx *storage.Tx, args []types.Value) 
 				return err
 			}
 			return exec.ExecCreateTable(p.eng.cat, s)
+		case *plan.CreateIndex:
+			if err := t.CheckWritable(); err != nil {
+				return err
+			}
+			return exec.ExecCreateIndex(p.eng.cat, s)
+		case *plan.DropIndex:
+			if err := t.CheckWritable(); err != nil {
+				return err
+			}
+			return exec.ExecDropIndex(p.eng.cat, s)
 		case *plan.DropTable:
 			// DDL is a write, so a read-only transaction may not do it.
 			if err := t.CheckWritable(); err != nil {

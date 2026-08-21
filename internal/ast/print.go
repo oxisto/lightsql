@@ -202,6 +202,32 @@ func (p *printer) node(n Node) {
 		p.returning(n.Returning)
 		p.close()
 
+	case *CreateIndexStmt:
+		p.open("create-index")
+		p.atom("%s", n.Name.Name)
+		p.atom("%s", n.Table)
+		if n.Unique {
+			p.atom("unique")
+		}
+		if n.IfNotExists {
+			p.atom("if-not-exists")
+		}
+		for _, c := range n.Columns {
+			p.atom("%s", c.Name)
+		}
+		p.field("where", n.Where)
+		p.close()
+
+	case *DropIndexStmt:
+		p.open("drop-index")
+		for _, n := range n.Names {
+			p.atom("%s", n.Name)
+		}
+		if n.IfExists {
+			p.atom("if-exists")
+		}
+		p.close()
+
 	case *DropTableStmt:
 		p.open("drop-table")
 		for _, t := range n.Tables {

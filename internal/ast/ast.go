@@ -626,6 +626,31 @@ type CreateTableStmt struct {
 
 func (s *CreateTableStmt) Pos() token.Pos { return s.CreatePos }
 
+// CreateIndexStmt is CREATE INDEX.
+//
+// Where is the predicate of a partial index, or nil. A partial index covers
+// only the rows it selects, so a unique one constrains only those.
+type CreateIndexStmt struct {
+	CreatePos   token.Pos
+	Unique      bool
+	IfNotExists bool
+	Name        Name
+	Table       *TableName
+	Columns     []Name
+	Where       Expr
+}
+
+func (s *CreateIndexStmt) Pos() token.Pos { return s.CreatePos }
+
+// DropIndexStmt is DROP INDEX.
+type DropIndexStmt struct {
+	DropPos  token.Pos
+	IfExists bool
+	Names    []Name
+}
+
+func (s *DropIndexStmt) Pos() token.Pos { return s.DropPos }
+
 // DropTableStmt is DROP TABLE, which may name several tables at once.
 //
 // Cascade records whether CASCADE was written. The default is RESTRICT, so a
@@ -640,6 +665,8 @@ type DropTableStmt struct {
 
 func (s *DropTableStmt) Pos() token.Pos { return s.DropPos }
 
+func (*CreateIndexStmt) stmtNode() {}
+func (*DropIndexStmt) stmtNode()   {}
 func (*DropTableStmt) stmtNode()   {}
 func (*SelectStmt) stmtNode()      {}
 func (*InsertStmt) stmtNode()      {}

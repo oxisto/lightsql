@@ -134,6 +134,24 @@ type Referencing struct {
 	FK    *ForeignKey
 }
 
+// Index is a secondary index.
+//
+// lightsql builds no physical structure for one: there is no index selection in
+// the planner yet, so a plain index changes nothing a query can observe and is
+// recorded only so that a schema reads back as it was written. A UNIQUE index
+// is different -- it is a constraint, enforced like any other.
+//
+// Where holds a partial index's predicate as written; see Column.Default for
+// why the catalog stores syntax rather than a bound expression. A row the
+// predicate does not select is not covered by the index, so a unique partial
+// index constrains only the rows it applies to.
+type Index struct {
+	Name    string
+	Columns []int
+	Unique  bool
+	Where   ast.Expr
+}
+
 // Check is a CHECK constraint: a predicate over a single row.
 //
 // It is kept apart from Constraint because the two are enforced by different
@@ -163,6 +181,8 @@ type Table struct {
 	Checks []Check
 	// ForeignKeys are the references this table makes to others.
 	ForeignKeys []ForeignKey
+	// Indexes are the secondary indexes declared on this table.
+	Indexes []Index
 	// referencedBy are the references other tables make to this one, so a
 	// delete or key update can find them without scanning the catalog.
 	//
@@ -177,6 +197,9 @@ type Table struct {
 	refsMu sync.RWMutex
 	// defaultEval evaluates a DEFAULT expression; see SetDefaultEvaluator.
 	defaultEval DefaultEvaluator
+	// predCompiler compiles a partial index predicate; see
+	// SetPredicateCompiler.
+	predCompiler PredicateCompiler
 	// byName resolves a column name to its ordinal. Every reference below the
 	// binder is an ordinal; this map is consulted during binding only.
 	byName map[string]int
@@ -289,6 +312,19 @@ func (c *Catalog) SetDefaultEvaluator(fn DefaultEvaluator) { c.defaultEval = fn 
 
 // DefaultEvaluator binds and evaluates a DEFAULT expression for a column type.
 type DefaultEvaluator func(expr ast.Expr, want types.Kind) (types.Value, error)
+
+// SetPredicateCompiler installs the function that turns a written predicate
+// into something the catalog can run over a row.
+//
+// A partial index needs its WHERE clause evaluated while uniqueness is being
+// checked, and the catalog can no more bind a predicate than it can a DEFAULT.
+// The closure compiles once per check rather than per row, so a partial index
+// over a large table does not re-bind its predicate for every row.
+func (c *Catalog) SetPredicateCompiler(fn PredicateCompiler) { c.predCompiler = fn }
+
+// PredicateCompiler binds a predicate against a table and returns a function
+// that evaluates it over one row.
+type PredicateCompiler func(expr ast.Expr, t *Table) (func(row []types.Value) (bool, error), error)
 
 // CheckForeignKeys verifies that every row this transaction can see satisfies
 // the table's outgoing references.
@@ -414,10 +450,19 @@ type ChildRows struct {
 // its own value must not conflict with itself, and `UPDATE t SET a = a + 1`
 // passes through states that collide but ends in one that does not.
 func (t *Table) CheckConstraints(tx *storage.Tx) error {
-	if len(t.Constraints) == 0 {
+	if len(t.Constraints) == 0 && !t.hasUniqueIndex() {
 		return nil
 	}
 	return t.checkUnique(t.Rows(tx))
+}
+
+func (t *Table) hasUniqueIndex() bool {
+	for _, ix := range t.Indexes {
+		if ix.Unique {
+			return true
+		}
+	}
+	return false
 }
 
 // checkRow enforces the per-row constraints. The caller must hold the write
@@ -444,36 +489,94 @@ func (t *Table) checkRow(row []types.Value) error {
 // The caller must hold the write lock.
 func (t *Table) checkUnique(rows [][]types.Value) error {
 	for _, c := range t.Constraints {
-		// Rows are grouped by hash so the check is linear rather than
-		// quadratic. The candidates in a bucket are still compared properly,
-		// since a hash collision is not a duplicate.
-		buckets := make(map[uint64][]int, len(rows))
-		seed := maphash.MakeSeed()
+		if err := t.checkUniqueOver(rows, c.Columns, nil, func(row []types.Value) error {
+			return t.uniqueViolation(c, row)
+		}); err != nil {
+			return err
+		}
+	}
 
-		for i, row := range rows {
-			// A NULL is never equal to anything, including another NULL, so a
-			// row with a NULL in any key column cannot violate the constraint.
-			// This is why UNIQUE permits any number of NULLs — the single most
-			// surprising rule in this area, and one that using the grouping
-			// form of equality would silently get wrong.
-			if anyNull(row, c.Columns) {
+	for _, ix := range t.Indexes {
+		if !ix.Unique {
+			continue
+		}
+		// A partial index constrains only the rows its predicate selects, so
+		// the predicate is compiled once here and consulted per row. Compiling
+		// per row would re-bind the same expression for every row of the table.
+		var covers func(row []types.Value) (bool, error)
+		if ix.Where != nil {
+			if t.predCompiler == nil {
+				return pgerr.Newf(pgerr.InternalError,
+					"no predicate compiler installed for %q", t.Name)
+			}
+			var err error
+			if covers, err = t.predCompiler(ix.Where, t); err != nil {
+				return err
+			}
+		}
+		if err := t.checkUniqueOver(rows, ix.Columns, covers, func(row []types.Value) error {
+			return t.indexViolation(ix, row)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkUniqueOver verifies that no two covered rows agree on the key columns.
+//
+// covers is nil for a total constraint and reports membership for a partial
+// one. Rows are grouped by hash so the check is linear rather than quadratic;
+// candidates in a bucket are still compared properly, since a hash collision is
+// not a duplicate.
+func (t *Table) checkUniqueOver(
+	rows [][]types.Value,
+	cols []int,
+	covers func(row []types.Value) (bool, error),
+	violation func(row []types.Value) error,
+) error {
+	// Rows are grouped by hash so the check is linear rather than quadratic.
+	// The candidates in a bucket are still compared properly, since a hash
+	// collision is not a duplicate.
+	buckets := make(map[uint64][]int, len(rows))
+	seed := maphash.MakeSeed()
+
+	for i, row := range rows {
+		// A NULL is never equal to anything, including another NULL, so a row
+		// with a NULL in any key column cannot violate the constraint. This is
+		// why UNIQUE permits any number of NULLs — the single most surprising
+		// rule in this area, and one that using the grouping form of equality
+		// would silently get wrong.
+		if anyNull(row, cols) {
+			continue
+		}
+		if covers != nil {
+			// Only true selects a row, so a predicate that is false or unknown
+			// leaves it outside the index — the same rule a WHERE clause
+			// follows, and the reason a NULL column does not join a partial
+			// index written about it.
+			in, err := covers(row)
+			if err != nil {
+				return err
+			}
+			if !in {
 				continue
 			}
-
-			var h maphash.Hash
-			h.SetSeed(seed)
-			for _, ord := range c.Columns {
-				row[ord].Hash(&h)
-			}
-			sum := h.Sum64()
-
-			for _, j := range buckets[sum] {
-				if keyEqual(row, rows[j], c.Columns) {
-					return t.uniqueViolation(c, row)
-				}
-			}
-			buckets[sum] = append(buckets[sum], i)
 		}
+
+		var h maphash.Hash
+		h.SetSeed(seed)
+		for _, ord := range cols {
+			row[ord].Hash(&h)
+		}
+		sum := h.Sum64()
+
+		for _, j := range buckets[sum] {
+			if keyEqual(row, rows[j], cols) {
+				return violation(row)
+			}
+		}
+		buckets[sum] = append(buckets[sum], i)
 	}
 	return nil
 }
@@ -513,6 +616,21 @@ func (t *Table) uniqueViolation(c Constraint, row []types.Value) error {
 			strings.Join(names, ", "), strings.Join(vals, ", "))
 }
 
+// indexViolation reports a duplicate in a unique index. PostgreSQL words this
+// the same as a unique constraint, since an index is how it enforces one.
+func (t *Table) indexViolation(ix Index, row []types.Value) error {
+	names := make([]string, len(ix.Columns))
+	vals := make([]string, len(ix.Columns))
+	for i, ord := range ix.Columns {
+		names[i] = t.Columns[ord].Name
+		vals[i] = row[ord].String()
+	}
+	return pgerr.Newf(pgerr.UniqueViolation,
+		"duplicate key value violates unique constraint %q", ix.Name).
+		WithDetail("Key (%s)=(%s) already exists.",
+			strings.Join(names, ", "), strings.Join(vals, ", "))
+}
+
 // NextSerial returns and consumes the next value of a serial column.
 func (t *Table) NextSerial(ordinal int) int64 {
 	t.mu.Lock()
@@ -536,6 +654,8 @@ type Catalog struct {
 	mgr *storage.TxManager
 	// defaultEval is handed to each table so SET DEFAULT can produce a value.
 	defaultEval DefaultEvaluator
+	// predCompiler is handed to each table so a partial index can be enforced.
+	predCompiler PredicateCompiler
 
 	mu     sync.RWMutex
 	tables map[string]*Table
@@ -560,6 +680,7 @@ func (c *Catalog) CreateTable(t *Table, ifNotExists bool) (created bool, err err
 	}
 	t.heap = storage.NewHeap(c.mgr)
 	t.defaultEval = c.defaultEval
+	t.predCompiler = c.predCompiler
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -597,6 +718,65 @@ func (t *Table) index() error {
 		t.byName[col.Name] = i
 	}
 	return nil
+}
+
+// CreateIndex adds an index to a table.
+//
+// Index names live in one namespace per schema, as in PostgreSQL, so a name
+// already taken on another table is a conflict rather than a shadowing.
+func (c *Catalog) CreateIndex(schema, table string, ix Index, ifNotExists bool) (created bool, err error) {
+	if schema == "" {
+		schema = DefaultSchema
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, t := range c.tables {
+		if t.Schema != schema {
+			continue
+		}
+		for _, existing := range t.Indexes {
+			if existing.Name == ix.Name {
+				if ifNotExists {
+					return false, nil
+				}
+				return false, pgerr.Newf(pgerr.DuplicateTable,
+					"relation %q already exists", ix.Name)
+			}
+		}
+	}
+
+	t, ok := c.tables[key(schema, table)]
+	if !ok {
+		return false, pgerr.Newf(pgerr.UndefinedTable, "relation %q does not exist", table)
+	}
+	t.Indexes = append(t.Indexes, ix)
+	return true, nil
+}
+
+// DropIndex removes an index by name.
+func (c *Catalog) DropIndex(schema, name string, ifExists bool) error {
+	if schema == "" {
+		schema = DefaultSchema
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, t := range c.tables {
+		if t.Schema != schema {
+			continue
+		}
+		if i := slices.IndexFunc(t.Indexes, func(ix Index) bool { return ix.Name == name }); i >= 0 {
+			t.Indexes = slices.Delete(t.Indexes, i, i+1)
+			return nil
+		}
+	}
+	if ifExists {
+		return nil
+	}
+	return pgerr.Newf(pgerr.UndefinedTable, "index %q does not exist", name)
 }
 
 // QualifiedName is a table name as written, before the default schema is
