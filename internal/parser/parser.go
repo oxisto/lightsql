@@ -226,19 +226,22 @@ func (p *parser) parseAlterTable() (ast.Stmt, error) {
 		return nil, err
 	}
 
+	if p.atWord("add") {
+		return p.parseAddColumn(stmt)
+	}
+
 	renamePos := p.cur().Pos
 	if !p.atWord("rename") {
-		// ADD and DROP COLUMN are the forms a reader is most likely to try, so
-		// they are named rather than left to a bare syntax error. Both change
-		// the width of every stored row, and a version's values are documented
-		// as never being mutated once it is in the heap — so supporting them is
-		// a storage decision, not a parsing one.
-		if p.atWord("add") || p.at(token.Drop) || p.atWord("alter") {
+		// DROP COLUMN and a type change are named rather than left to a bare
+		// syntax error, since both are forms a reader will try. Neither can be
+		// served by a missing value the way ADD COLUMN is: dropping shifts every
+		// later column's ordinal, and retyping changes what is already stored.
+		if p.at(token.Drop) || p.atWord("alter") {
 			return nil, pgerr.New(pgerr.FeatureNotSupported,
-				"only ALTER TABLE ... RENAME is supported; adding, dropping or "+
-					"retyping a column would rewrite every stored row").At(p.cur().Pos)
+				"only ALTER TABLE ... ADD COLUMN and RENAME are supported; dropping "+
+					"or retyping a column would rewrite every stored row").At(p.cur().Pos)
 		}
-		return nil, p.unexpected("RENAME")
+		return nil, p.unexpected("ADD or RENAME")
 	}
 	p.next()
 
@@ -270,6 +273,35 @@ func (p *parser) parseAlterTable() (ast.Stmt, error) {
 		return nil, err
 	}
 	stmt.Action = &ast.RenameColumn{RenamePos: renamePos, From: from, To: to}
+	return stmt, nil
+}
+
+// parseAddColumn parses ALTER TABLE ... ADD COLUMN, reusing the column
+// definition production so a column added later accepts what one written at
+// CREATE TABLE does.
+func (p *parser) parseAddColumn(stmt *ast.AlterTableStmt) (ast.Stmt, error) {
+	action := &ast.AddColumn{AddPos: p.cur().Pos}
+	p.next()
+	// COLUMN is optional, as in PostgreSQL.
+	if p.atWord("column") {
+		p.next()
+	}
+	if p.accept(token.If) {
+		if err := p.expect(token.Not); err != nil {
+			return nil, err
+		}
+		if err := p.expect(token.Exists); err != nil {
+			return nil, err
+		}
+		action.IfNotExists = true
+	}
+
+	col, err := p.parseColumnDef()
+	if err != nil {
+		return nil, err
+	}
+	action.Column = col
+	stmt.Action = action
 	return stmt, nil
 }
 

@@ -671,6 +671,15 @@ type RenameTable struct {
 	To        Name
 }
 
+// AddColumn is ALTER TABLE ... ADD COLUMN.
+type AddColumn struct {
+	AddPos      token.Pos
+	IfNotExists bool
+	Column      *ColumnDef
+}
+
+func (a *AddColumn) Pos() token.Pos { return a.AddPos }
+
 // RenameColumn is ALTER TABLE ... RENAME COLUMN ... TO.
 type RenameColumn struct {
 	RenamePos token.Pos
@@ -680,6 +689,7 @@ type RenameColumn struct {
 func (a *RenameTable) Pos() token.Pos  { return a.RenamePos }
 func (a *RenameColumn) Pos() token.Pos { return a.RenamePos }
 
+func (*AddColumn) alterActionNode()    {}
 func (*RenameTable) alterActionNode()  {}
 func (*RenameColumn) alterActionNode() {}
 

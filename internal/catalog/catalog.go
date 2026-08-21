@@ -36,6 +36,17 @@ type Column struct {
 	// because a key over several columns is one constraint on the combination
 	// rather than one per column.
 	PrimaryKey bool
+	// Missing is the value a row stored before this column existed takes.
+	//
+	// ADD COLUMN does not rewrite the rows already in the heap: a version's
+	// values are never mutated once it is linked in, which is what lets a
+	// reader hold one without copying. Rows written earlier are therefore
+	// shorter than the table, and the columns they lack read as this value.
+	// PostgreSQL does the same thing under the name attmissingval.
+	//
+	// It is the zero Value for a column that has always existed, which reads as
+	// NULL and is what a row missing it should say anyway.
+	Missing types.Value
 	// Default is the DEFAULT expression as written, or nil when the column has
 	// none.
 	//
@@ -260,7 +271,29 @@ func (t *Table) Rows(tx *storage.Tx) [][]types.Value {
 	versions := t.Scan(tx)
 	out := make([][]types.Value, len(versions))
 	for i, v := range versions {
-		out[i] = v.Vals
+		out[i] = t.Values(v)
+	}
+	return out
+}
+
+// Values returns a version's row at the table's current width.
+//
+// A row written before an ADD COLUMN is shorter than the table, and the columns
+// it lacks read as their Missing value. Every read of a stored row goes through
+// here rather than touching Vals directly, because a short row reaching an
+// expression that addresses the new column is an out-of-range panic rather than
+// a wrong answer.
+//
+// The common case -- no column was ever added -- returns the stored slice
+// untouched, so this costs a length comparison.
+func (t *Table) Values(v *storage.Version) []types.Value {
+	if len(v.Vals) == len(t.Columns) {
+		return v.Vals
+	}
+	out := make([]types.Value, len(t.Columns))
+	copy(out, v.Vals)
+	for i := len(v.Vals); i < len(t.Columns); i++ {
+		out[i] = t.Columns[i].Missing
 	}
 	return out
 }
@@ -406,10 +439,11 @@ func (t *Table) ChildrenOf(tx *storage.Tx, parent []types.Value) []ChildRows {
 	for _, ref := range t.referencedBy {
 		var rows []*storage.Version
 		for _, v := range ref.Child.Scan(tx) {
-			if anyNull(v.Vals, ref.FK.Columns) {
+			vals := ref.Child.Values(v)
+			if anyNull(vals, ref.FK.Columns) {
 				continue // an unspecified reference points at nothing
 			}
-			if matchesKey(v.Vals, ref.FK.Columns, parent, ref.FK.ParentCols) {
+			if matchesKey(vals, ref.FK.Columns, parent, ref.FK.ParentCols) {
 				rows = append(rows, v)
 			}
 		}
@@ -469,7 +503,8 @@ func (t *Table) hasUniqueIndex() bool {
 // checkRow enforces the per-row constraints. The caller must hold the write
 // lock.
 func (t *Table) checkRow(row []types.Value) error {
-	for i, col := range t.Columns {
+	for i := range t.Columns {
+		col := &t.Columns[i]
 		if col.NotNull && row[i].IsNull() {
 			return pgerr.Newf(pgerr.NotNullViolation,
 				"null value in column %q of relation %q violates not-null constraint",
@@ -711,12 +746,50 @@ func (c *Catalog) CreateTable(t *Table, ifNotExists bool) (created bool, err err
 // index builds the name lookup and rejects duplicate column names.
 func (t *Table) index() error {
 	t.byName = make(map[string]int, len(t.Columns))
-	for i, col := range t.Columns {
-		if _, dup := t.byName[col.Name]; dup {
+	for i := range t.Columns {
+		name := t.Columns[i].Name
+		if _, dup := t.byName[name]; dup {
 			return pgerr.Newf(pgerr.DuplicateColumn,
-				"column %q specified more than once", col.Name)
+				"column %q specified more than once", name)
 		}
-		t.byName[col.Name] = i
+		t.byName[name] = i
+	}
+	return nil
+}
+
+// AddColumn appends a column to a table.
+//
+// The rows already stored are left as they are. They are shorter than the table
+// from now on, and read the new column as missing -- see Column.Missing and
+// Values. Rewriting them instead would mean mutating values a reader may be
+// holding, which the heap does not allow.
+func (c *Catalog) AddColumn(t *Table, col *Column, missing types.Value, check *Check, fk *ForeignKey, ifNotExists bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := t.byName[col.Name]; exists {
+		if ifNotExists {
+			return nil
+		}
+		return pgerr.Newf(pgerr.DuplicateColumn,
+			"column %q of relation %q already exists", col.Name, t.Name)
+	}
+
+	col.Missing = missing
+	t.Columns = append(t.Columns, *col)
+	t.byName[col.Name] = len(t.Columns) - 1
+
+	if check != nil {
+		t.Checks = append(t.Checks, *check)
+	}
+	if fk != nil {
+		t.ForeignKeys = append(t.ForeignKeys, *fk)
+		// Registered only once the column is in place, for the same reason
+		// CreateTable waits: publishing a reference to a half-built table lets
+		// a concurrent statement walk into it. Taking the address of the slice
+		// element keeps parent and child sharing one foreign key.
+		added := &t.ForeignKeys[len(t.ForeignKeys)-1]
+		added.Parent.AddReferencing(Referencing{Child: t, FK: added})
 	}
 	return nil
 }
@@ -994,7 +1067,8 @@ func (t *Table) dependsOnColumnName(name string) string {
 			return "a check constraint"
 		}
 	}
-	for _, col := range t.Columns {
+	for i := range t.Columns {
+		col := &t.Columns[i]
 		if col.Default != nil && ast.ReferencesColumn(col.Default, name) {
 			return "the default for column " + strconv.Quote(col.Name)
 		}

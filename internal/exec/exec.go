@@ -601,7 +601,10 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		match, err := pred(ctx, args, v.Vals)
+		// Read through Values, so a row stored before an ADD COLUMN is seen at
+		// the table's current width rather than short.
+		cur := up.Table.Values(v)
+		match, err := pred(ctx, args, cur)
 		if err != nil {
 			return Result{}, err
 		}
@@ -612,10 +615,10 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		// The replacement is a fresh slice, and every assignment evaluates
 		// against the original row: that is what makes `SET a = b, b = a` a
 		// swap rather than two copies of b.
-		next := make([]types.Value, len(v.Vals))
-		copy(next, v.Vals)
+		next := make([]types.Value, len(cur))
+		copy(next, cur)
 		for i, a := range up.Assignments {
-			val, err := assign[i](ctx, args, v.Vals)
+			val, err := assign[i](ctx, args, cur)
 			if err != nil {
 				return Result{}, err
 			}
@@ -627,7 +630,7 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		}
 		// A key the children point at is changing, so they have to be dealt
 		// with before the parent row moves out from under them.
-		if err := applyRefActions(tx, up.Table, v.Vals, next, onUpdate, wrote); err != nil {
+		if err := applyRefActions(tx, up.Table, cur, next, onUpdate, wrote); err != nil {
 			return Result{}, err
 		}
 		if err := up.Table.Update(tx, v, next); err != nil {
@@ -676,7 +679,8 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		match, err := pred(ctx, args, v.Vals)
+		cur := del.Table.Values(v)
+		match, err := pred(ctx, args, cur)
 		if err != nil {
 			return Result{}, err
 		}
@@ -685,13 +689,13 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 		}
 		if ret != nil {
 			// RETURNING on a DELETE reports the row as it was before removal.
-			out, err := ret.row(ctx, args, v.Vals)
+			out, err := ret.row(ctx, args, cur)
 			if err != nil {
 				return Result{}, err
 			}
 			res.Rows = append(res.Rows, out)
 		}
-		if err := applyRefActions(tx, del.Table, v.Vals, nil, onDelete, wrote); err != nil {
+		if err := applyRefActions(tx, del.Table, cur, nil, onDelete, wrote); err != nil {
 			return Result{}, err
 		}
 		if err := del.Table.Delete(tx, v); err != nil {
@@ -799,16 +803,18 @@ func applyRefAction(tx *storage.Tx, childTable *catalog.Table, fk *catalog.Forei
 			return childTable.Delete(tx, child)
 		}
 		// The parent's key moved, so the child follows it.
-		updated := make([]types.Value, len(child.Vals))
-		copy(updated, child.Vals)
+		cur := childTable.Values(child)
+		updated := make([]types.Value, len(cur))
+		copy(updated, cur)
 		for i, ord := range fk.Columns {
 			updated[ord] = next[fk.ParentCols[i]]
 		}
 		return childTable.Update(tx, child, updated)
 
 	case catalog.SetNull, catalog.SetDefault:
-		updated := make([]types.Value, len(child.Vals))
-		copy(updated, child.Vals)
+		cur := childTable.Values(child)
+		updated := make([]types.Value, len(cur))
+		copy(updated, cur)
 		for _, ord := range fk.Columns {
 			v, err := refReplacement(childTable, ord, action)
 			if err != nil {
@@ -1008,6 +1014,11 @@ func insertFrom(ctx context.Context, src plan.Node, tx *storage.Tx, args []types
 			return err
 		}
 	}
+}
+
+// ExecAddColumn runs ALTER TABLE ... ADD COLUMN.
+func ExecAddColumn(cat *catalog.Catalog, ac *plan.AddColumn) error {
+	return cat.AddColumn(ac.Table, &ac.Column, ac.Missing, ac.Check, ac.ForeignKey, ac.IfNotExists)
 }
 
 // ExecRenameTable runs ALTER TABLE ... RENAME TO.

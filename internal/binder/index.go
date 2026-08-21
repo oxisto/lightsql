@@ -64,8 +64,10 @@ func (b *Binder) BindIndexPredicate(expr ast.Expr, t *catalog.Table) (plan.Expr,
 // The table is not looked up here: the catalog decides existence under the lock
 // that also performs the rename, so a concurrent drop cannot slip between the
 // check and the act.
-func bindAlterTable(s *ast.AlterTableStmt) (plan.Stmt, error) {
+func (b *Binder) bindAlterTable(s *ast.AlterTableStmt) (plan.Stmt, error) {
 	switch a := s.Action.(type) {
+	case *ast.AddColumn:
+		return b.bindAddColumn(s, a)
 	case *ast.RenameTable:
 		return &plan.RenameTable{
 			Schema: s.Table.Schema.Name,

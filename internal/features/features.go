@@ -149,15 +149,17 @@ var Groups = []Group{
 				Setup: probeTable,
 				SQL:   "DROP TABLE t"},
 			{Name: "ALTER TABLE", Parse: Partial, Exec: Partial,
-				Note: "RENAME TO and RENAME COLUMN. A foreign key survives either, since it " +
-					"holds a table pointer and column ordinals rather than names. Adding, " +
-					"dropping or retyping a column is refused with a message saying why: all " +
-					"three change the width of every stored row, and a row version is never " +
-					"mutated once it is in the heap. Renaming a column a CHECK, a DEFAULT or " +
-					"a partial index predicate names is refused too, since those are stored " +
-					"as syntax and would be left pointing at a column that no longer exists",
+				Note: "ADD COLUMN, RENAME TO and RENAME COLUMN. Adding a column does not " +
+					"rewrite the rows already stored: they stay shorter than the table and " +
+					"read it as its DEFAULT, or NULL, which is what PostgreSQL calls a " +
+					"missing value. NOT NULL without a DEFAULT is refused, since every stored " +
+					"row would violate it. A foreign key survives a rename, holding a table " +
+					"pointer and ordinals rather than names, but renaming a column that a " +
+					"CHECK, a DEFAULT or a partial index predicate names is refused, since " +
+					"those are stored as syntax. DROP COLUMN and a type change are not " +
+					"supported: neither can be served by a missing value",
 				Setup: probeTable,
-				SQL:   "ALTER TABLE t RENAME TO u"},
+				SQL:   "ALTER TABLE t ADD COLUMN added INT"},
 			{Name: "CREATE INDEX", Parse: Yes, Exec: Partial,
 				Note: "UNIQUE and partial indexes are enforced as constraints, including a " +
 					"partial one whose predicate decides which rows it covers. A plain index " +
