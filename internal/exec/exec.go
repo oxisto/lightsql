@@ -879,6 +879,11 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 		}
 	}
 
+	conflict, err := compileConflict(ins, tx)
+	if err != nil {
+		return Result{}, err
+	}
+
 	var res Result
 
 	// store completes and writes one row from the values for the target
@@ -909,6 +914,16 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 				return err
 			}
 			row[ord] = v
+		}
+
+		// ON CONFLICT is resolved before the row is written, not after a
+		// violation is raised: the constraint check runs at the end of the
+		// statement over the whole table, by which point it is too late to know
+		// which row collided or to do anything but fail.
+		if conflict != nil {
+			if existing := conflict.find(tx, ins.Table, row); existing != nil {
+				return conflict.resolve(ctx, tx, ins.Table, existing, row, args, checks, ret, &res)
+			}
 		}
 
 		if err := runChecks(ctx, checks, args, row, ins.Table.Name); err != nil {

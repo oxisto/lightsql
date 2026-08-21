@@ -417,8 +417,28 @@ type Insert struct {
 	Defaults map[int]Expr
 	// Checks are the table's CHECK constraints, bound for this statement.
 	Checks []Check
+	// OnConflict is the ON CONFLICT clause, or nil.
+	OnConflict *OnConflict
 	// Returning is nil unless the statement had a RETURNING clause.
 	Returning *Returning
+}
+
+// OnConflict describes what to do when an inserted row collides with a stored
+// one.
+//
+// Arbiter holds the ordinals whose uniqueness defines a collision. It is empty
+// only for a bare DO NOTHING, which yields to any constraint; DO UPDATE always
+// has one, because it must know which row it is changing.
+//
+// The assignments and the predicate are bound against the stored row followed
+// by the proposed one, which is the layout a join produces -- so `excluded.x`
+// is an ordinal past the table's width and nothing below the binder knows the
+// word "excluded".
+type OnConflict struct {
+	Arbiter     []int
+	DoNothing   bool
+	Assignments []Assignment
+	Where       Expr
 }
 
 // Check is a bound CHECK constraint.

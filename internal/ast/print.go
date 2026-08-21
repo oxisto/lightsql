@@ -169,6 +169,26 @@ func (p *printer) node(n Node) {
 		if n.Select != nil {
 			p.field("select", n.Select)
 		}
+		if c := n.OnConflict; c != nil {
+			p.open("on-conflict")
+			for _, t := range c.Target {
+				p.name(t)
+			}
+			if c.DoUpdate == nil {
+				p.atom("do-nothing")
+			} else {
+				p.open("do-update")
+				for _, a := range c.DoUpdate {
+					p.open("=")
+					p.name(a.Column)
+					p.node(a.Value)
+					p.close()
+				}
+				p.close()
+			}
+			p.field("where", c.Where)
+			p.close()
+		}
 		p.returning(n.Returning)
 		p.close()
 

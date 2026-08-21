@@ -344,6 +344,23 @@ func TestParseCreateTable(t *testing.T) {
 			want: "(drop-table t)",
 		},
 		{
+			name: "insert on conflict do nothing",
+			sql:  "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING",
+			want: "(insert t (columns a) (values (lit 1)) (on-conflict do-nothing))",
+		},
+		{
+			name: "insert on conflict do update",
+			sql:  "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = excluded.b",
+			want: "(insert t (columns a b) (values (lit 1) (lit 2)) " +
+				"(on-conflict a (do-update (= b (col excluded.b)))))",
+		},
+		{
+			name: "insert on conflict do update where",
+			sql:  "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 1 WHERE t.b < 5",
+			want: "(insert t (columns a) (values (lit 1)) " +
+				"(on-conflict a (do-update (= b (lit 1))) (where (< (col t.b) (lit 5)))))",
+		},
+		{
 			name: "alter table rename to",
 			sql:  "ALTER TABLE t RENAME TO u",
 			want: "(alter-table t (rename-to u))",

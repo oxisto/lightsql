@@ -728,6 +728,12 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 		return nil, err
 	}
 
+	if s.OnConflict != nil {
+		if ins.OnConflict, err = b.bindOnConflict(s.OnConflict, t); err != nil {
+			return nil, err
+		}
+	}
+
 	// RETURNING sees the row as stored, including generated serial values —
 	// which is the whole point of `INSERT ... RETURNING id`.
 	if len(s.Returning) > 0 {
