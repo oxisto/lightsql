@@ -139,6 +139,8 @@ func (b *Binder) Bind(stmt ast.Stmt) (plan.Stmt, error) {
 		return b.bindCreateTable(s)
 	case *ast.DropTableStmt:
 		return bindDropTable(s)
+	case *ast.AlterTableStmt:
+		return bindAlterTable(s)
 	case *ast.CreateIndexStmt:
 		return b.bindCreateIndex(s)
 	case *ast.DropIndexStmt:

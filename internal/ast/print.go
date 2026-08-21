@@ -202,6 +202,23 @@ func (p *printer) node(n Node) {
 		p.returning(n.Returning)
 		p.close()
 
+	case *AlterTableStmt:
+		p.open("alter-table")
+		p.atom("%s", n.Table)
+		p.node(n.Action)
+		p.close()
+
+	case *RenameTable:
+		p.open("rename-to")
+		p.name(n.To)
+		p.close()
+
+	case *RenameColumn:
+		p.open("rename-column")
+		p.name(n.From)
+		p.name(n.To)
+		p.close()
+
 	case *CreateIndexStmt:
 		p.open("create-index")
 		p.atom("%s", n.Name.Name)

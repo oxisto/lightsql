@@ -344,6 +344,28 @@ func TestParseCreateTable(t *testing.T) {
 			want: "(drop-table t)",
 		},
 		{
+			name: "alter table rename to",
+			sql:  "ALTER TABLE t RENAME TO u",
+			want: "(alter-table t (rename-to u))",
+		},
+		{
+			name: "alter table rename column",
+			sql:  "ALTER TABLE t RENAME COLUMN a TO b",
+			want: "(alter-table t (rename-column a b))",
+		},
+		{
+			// COLUMN is optional, so this is still the column form.
+			name: "alter table rename column without the keyword",
+			sql:  "ALTER TABLE t RENAME a TO b",
+			want: "(alter-table t (rename-column a b))",
+		},
+		{
+			// alter is unreserved, so it stays usable as a column name.
+			name: "alter is not a reserved word",
+			sql:  "SELECT alter FROM t",
+			want: "(select (items (col alter)) (from (table t)))",
+		},
+		{
 			name: "create index",
 			sql:  "CREATE INDEX i ON t (a, b)",
 			want: "(create-index i t a b)",

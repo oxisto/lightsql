@@ -59,6 +59,32 @@ func (b *Binder) BindIndexPredicate(expr ast.Expr, t *catalog.Table) (plan.Expr,
 	return b.bindPredicate(expr, sc, "index predicate")
 }
 
+// bindAlterTable resolves ALTER TABLE.
+//
+// The table is not looked up here: the catalog decides existence under the lock
+// that also performs the rename, so a concurrent drop cannot slip between the
+// check and the act.
+func bindAlterTable(s *ast.AlterTableStmt) (plan.Stmt, error) {
+	switch a := s.Action.(type) {
+	case *ast.RenameTable:
+		return &plan.RenameTable{
+			Schema: s.Table.Schema.Name,
+			From:   s.Table.Name.Name,
+			To:     a.To.Name,
+		}, nil
+	case *ast.RenameColumn:
+		return &plan.RenameColumn{
+			Schema: s.Table.Schema.Name,
+			Table:  s.Table.Name.Name,
+			From:   a.From.Name,
+			To:     a.To.Name,
+		}, nil
+	default:
+		return nil, pgerr.New(pgerr.FeatureNotSupported,
+			"this ALTER TABLE action is not supported yet").At(s.Pos())
+	}
+}
+
 func bindDropIndex(s *ast.DropIndexStmt) (plan.Stmt, error) {
 	out := &plan.DropIndex{IfExists: s.IfExists}
 	for _, n := range s.Names {

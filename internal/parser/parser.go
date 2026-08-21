@@ -198,9 +198,79 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 		return p.parseCreate()
 	case token.Drop:
 		return p.parseDrop()
-	default:
-		return nil, p.unexpected("SELECT, INSERT, UPDATE, DELETE, CREATE or DROP")
 	}
+	// alter is unreserved in PostgreSQL, so it arrives as an identifier and is
+	// matched by value rather than by kind. Making it a keyword would stop a
+	// column being called alter.
+	if p.atWord("alter") {
+		return p.parseAlterTable()
+	}
+	return nil, p.unexpected("SELECT, INSERT, UPDATE, DELETE, CREATE, DROP or ALTER")
+}
+
+// parseAlterTable parses ALTER TABLE.
+//
+// Only the rename forms are parsed. ADD COLUMN and DROP COLUMN both change the
+// shape of every stored row, which is a storage question rather than a syntax
+// one, so they are refused where they are read rather than parsed into a plan
+// nothing can carry out.
+func (p *parser) parseAlterTable() (ast.Stmt, error) {
+	stmt := &ast.AlterTableStmt{AlterPos: p.cur().Pos}
+	p.next()
+	if err := p.expect(token.Table); err != nil {
+		return nil, err
+	}
+
+	var err error
+	if stmt.Table, err = p.parseTableName(); err != nil {
+		return nil, err
+	}
+
+	renamePos := p.cur().Pos
+	if !p.atWord("rename") {
+		// ADD and DROP COLUMN are the forms a reader is most likely to try, so
+		// they are named rather than left to a bare syntax error. Both change
+		// the width of every stored row, and a version's values are documented
+		// as never being mutated once it is in the heap — so supporting them is
+		// a storage decision, not a parsing one.
+		if p.atWord("add") || p.at(token.Drop) || p.atWord("alter") {
+			return nil, pgerr.New(pgerr.FeatureNotSupported,
+				"only ALTER TABLE ... RENAME is supported; adding, dropping or "+
+					"retyping a column would rewrite every stored row").At(p.cur().Pos)
+		}
+		return nil, p.unexpected("RENAME")
+	}
+	p.next()
+
+	// RENAME TO renames the table; RENAME COLUMN renames a column. The word
+	// COLUMN is optional in PostgreSQL, so `RENAME a TO b` means the column
+	// form too -- anything that is not TO is a column name.
+	if p.atWord("to") {
+		p.next()
+		to, err := p.expectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Action = &ast.RenameTable{RenamePos: renamePos, To: to}
+		return stmt, nil
+	}
+
+	if p.atWord("column") {
+		p.next()
+	}
+	from, err := p.expectName()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectWord("to"); err != nil {
+		return nil, err
+	}
+	to, err := p.expectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Action = &ast.RenameColumn{RenamePos: renamePos, From: from, To: to}
+	return stmt, nil
 }
 
 // parseCreateIndex parses CREATE [UNIQUE] INDEX.

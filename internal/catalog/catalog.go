@@ -720,6 +720,72 @@ func (t *Table) index() error {
 	return nil
 }
 
+// RenameTable renames a table, moving it to its new key.
+//
+// Nothing else has to change: a foreign key holds a *Table rather than a name,
+// so a reference survives the rename without being rewritten. That is the
+// payoff of resolving names once, at bind time.
+func (c *Catalog) RenameTable(schema, from, to string) error {
+	if schema == "" {
+		schema = DefaultSchema
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	t, ok := c.tables[key(schema, from)]
+	if !ok {
+		return pgerr.Newf(pgerr.UndefinedTable, "relation %q does not exist", from)
+	}
+	if from == to {
+		return nil
+	}
+	if _, taken := c.tables[key(schema, to)]; taken {
+		return pgerr.Newf(pgerr.DuplicateTable, "relation %q already exists", to)
+	}
+
+	delete(c.tables, key(schema, from))
+	t.Name = to
+	c.tables[key(schema, to)] = t
+	return nil
+}
+
+// RenameColumn renames one column of a table.
+//
+// Only the name changes. Every reference below the binder is an ordinal, so no
+// stored row and no constraint needs rewriting -- but the name lookup the binder
+// consults does, or the new name would not resolve.
+func (c *Catalog) RenameColumn(schema, table, from, to string) error {
+	if schema == "" {
+		schema = DefaultSchema
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	t, ok := c.tables[key(schema, table)]
+	if !ok {
+		return pgerr.Newf(pgerr.UndefinedTable, "relation %q does not exist", table)
+	}
+	i, ok := t.byName[from]
+	if !ok {
+		return pgerr.Newf(pgerr.UndefinedColumn,
+			"column %q of relation %q does not exist", from, table)
+	}
+	if from == to {
+		return nil
+	}
+	if _, taken := t.byName[to]; taken {
+		return pgerr.Newf(pgerr.DuplicateColumn,
+			"column %q of relation %q already exists", to, table)
+	}
+
+	t.Columns[i].Name = to
+	delete(t.byName, from)
+	t.byName[to] = i
+	return nil
+}
+
 // CreateIndex adds an index to a table.
 //
 // Index names live in one namespace per schema, as in PostgreSQL, so a name

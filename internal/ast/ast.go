@@ -626,6 +626,44 @@ type CreateTableStmt struct {
 
 func (s *CreateTableStmt) Pos() token.Pos { return s.CreatePos }
 
+// AlterTableStmt is ALTER TABLE.
+//
+// The action is a typed node rather than a set of optional fields, because
+// ALTER TABLE is a family of unrelated statements sharing a prefix: what RENAME
+// TO carries has nothing to do with what ADD COLUMN would. Fields for both would
+// make every consumer check which of them is set.
+type AlterTableStmt struct {
+	AlterPos token.Pos
+	Table    *TableName
+	Action   AlterAction
+}
+
+func (s *AlterTableStmt) Pos() token.Pos { return s.AlterPos }
+
+// AlterAction is one thing ALTER TABLE can do.
+type AlterAction interface {
+	Node
+	alterActionNode()
+}
+
+// RenameTable is ALTER TABLE ... RENAME TO.
+type RenameTable struct {
+	RenamePos token.Pos
+	To        Name
+}
+
+// RenameColumn is ALTER TABLE ... RENAME COLUMN ... TO.
+type RenameColumn struct {
+	RenamePos token.Pos
+	From, To  Name
+}
+
+func (a *RenameTable) Pos() token.Pos  { return a.RenamePos }
+func (a *RenameColumn) Pos() token.Pos { return a.RenamePos }
+
+func (*RenameTable) alterActionNode()  {}
+func (*RenameColumn) alterActionNode() {}
+
 // CreateIndexStmt is CREATE INDEX.
 //
 // Where is the predicate of a partial index, or nil. A partial index covers
@@ -665,6 +703,7 @@ type DropTableStmt struct {
 
 func (s *DropTableStmt) Pos() token.Pos { return s.DropPos }
 
+func (*AlterTableStmt) stmtNode()  {}
 func (*CreateIndexStmt) stmtNode() {}
 func (*DropIndexStmt) stmtNode()   {}
 func (*DropTableStmt) stmtNode()   {}

@@ -995,6 +995,16 @@ func insertFrom(ctx context.Context, src plan.Node, tx *storage.Tx, args []types
 	}
 }
 
+// ExecRenameTable runs ALTER TABLE ... RENAME TO.
+func ExecRenameTable(cat *catalog.Catalog, rt *plan.RenameTable) error {
+	return cat.RenameTable(rt.Schema, rt.From, rt.To)
+}
+
+// ExecRenameColumn runs ALTER TABLE ... RENAME COLUMN.
+func ExecRenameColumn(cat *catalog.Catalog, rc *plan.RenameColumn) error {
+	return cat.RenameColumn(rc.Schema, rc.Table, rc.From, rc.To)
+}
+
 // ExecCreateIndex runs a CREATE INDEX.
 func ExecCreateIndex(cat *catalog.Catalog, ci *plan.CreateIndex) error {
 	_, err := cat.CreateIndex(ci.Table.Schema, ci.Table.Name, ci.Index, ci.IfNotExists)
