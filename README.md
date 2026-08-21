@@ -187,7 +187,7 @@ the two.
 | ✅ | Floating point | ✅ | ✅ | REAL and DOUBLE PRECISION stored as float64 |
 | ✅ | Character types | ✅ | ✅ | TEXT, VARCHAR(n), CHARACTER VARYING(n), CHAR; length is recorded but not enforced |
 | ✅ | BOOLEAN | ✅ | ✅ |  |
-| 🟡 | Date and time | ✅ | 🟡 | columns and time.Time arguments work; date and time literals are pending |
+| 🟡 | Date and time | ✅ | 🟡 | columns, time.Time arguments and ISO 8601 literals, with either a space or a T separator. A zone offset is honoured by timestamptz and dropped by timestamp, as "without time zone" requires. A bare literal takes its type from the column it is compared or assigned to. now(), CURRENT_TIMESTAMP and INTERVAL are pending, and the non-ISO date styles PostgreSQL accepts are deliberately not, since 01/02/2024 has no reading that is right in both conventions |
 | ✅ | BYTEA | ✅ | ✅ |  |
 | 🟡 | NUMERIC / DECIMAL | ✅ | 🟡 | stored as double precision; exact decimal arithmetic is pending |
 | 🟡 | UUID | ✅ | 🟡 | accepted and stored as text; no validation |

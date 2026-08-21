@@ -94,10 +94,25 @@ func Cast(v Value, want Kind) (Value, error) {
 			return Value{k: want, n: v.n}, nil
 		case KindDate:
 			return Value{k: want, n: uint64(v.AsInt() * 86400 * 1e6)}, nil
+		case KindText:
+			if out, ok := ParseTemporal(v.AsString(), want); ok {
+				return out, nil
+			}
+		}
+
+	case KindTime:
+		if v.Kind() == KindText {
+			if out, ok := ParseTemporal(v.AsString(), want); ok {
+				return out, nil
+			}
 		}
 
 	case KindDate:
 		switch v.Kind() {
+		case KindText:
+			if out, ok := ParseTemporal(v.AsString(), want); ok {
+				return out, nil
+			}
 		case KindTimestamp, KindTimestamptz:
 			// Truncating to the day must floor, not divide toward zero, or
 			// dates before 1970 would land a day late.
