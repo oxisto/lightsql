@@ -153,7 +153,9 @@ var Groups = []Group{
 					"holds a table pointer and column ordinals rather than names. Adding, " +
 					"dropping or retyping a column is refused with a message saying why: all " +
 					"three change the width of every stored row, and a row version is never " +
-					"mutated once it is in the heap",
+					"mutated once it is in the heap. Renaming a column a CHECK, a DEFAULT or " +
+					"a partial index predicate names is refused too, since those are stored " +
+					"as syntax and would be left pointing at a column that no longer exists",
 				Setup: probeTable,
 				SQL:   "ALTER TABLE t RENAME TO u"},
 			{Name: "CREATE INDEX", Parse: Yes, Exec: Partial,

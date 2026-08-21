@@ -12,6 +12,7 @@ import (
 	"cmp"
 	"hash/maphash"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -779,6 +780,16 @@ func (c *Catalog) RenameColumn(schema, table, from, to string) error {
 		return pgerr.Newf(pgerr.DuplicateColumn,
 			"column %q of relation %q already exists", to, table)
 	}
+	if what := t.dependsOnColumnName(from); what != "" {
+		// CHECK predicates, DEFAULT expressions and partial index predicates
+		// are stored as syntax, so they name the column rather than addressing
+		// it by ordinal. Renaming without rewriting them leaves the table
+		// un-insertable, failing on a column the schema no longer shows --
+		// which is far worse than refusing the rename.
+		return pgerr.Newf(pgerr.FeatureNotSupported,
+			"cannot rename column %q of relation %q because %s refers to it by name",
+			from, table, what)
+	}
 
 	t.Columns[i].Name = to
 	delete(t.byName, from)
@@ -965,4 +976,33 @@ func (c *Catalog) Tables() []*Table {
 		return cmp.Compare(a.QualifiedName(), b.QualifiedName())
 	})
 	return out
+}
+
+// dependsOnColumnName names the first stored expression that mentions the given
+// column by name, or returns the empty string when none does.
+//
+// These are the expressions the catalog keeps as syntax rather than as
+// ordinals: a CHECK predicate, a DEFAULT, and a partial index's predicate.
+// Everything else below the binder addresses a column by ordinal and so is
+// unaffected by a rename.
+func (t *Table) dependsOnColumnName(name string) string {
+	for _, c := range t.Checks {
+		if ast.ReferencesColumn(c.Expr, name) {
+			if c.Name != "" {
+				return "check constraint " + strconv.Quote(c.Name)
+			}
+			return "a check constraint"
+		}
+	}
+	for _, col := range t.Columns {
+		if col.Default != nil && ast.ReferencesColumn(col.Default, name) {
+			return "the default for column " + strconv.Quote(col.Name)
+		}
+	}
+	for _, ix := range t.Indexes {
+		if ix.Where != nil && ast.ReferencesColumn(ix.Where, name) {
+			return "the predicate of index " + strconv.Quote(ix.Name)
+		}
+	}
+	return ""
 }

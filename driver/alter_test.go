@@ -127,3 +127,43 @@ func TestAlterTableErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestAlterTableRenameColumnDependencies pins a refusal rather than a feature.
+//
+// A CHECK predicate, a DEFAULT and a partial index predicate are stored as
+// syntax, so they name a column rather than addressing it by ordinal. Renaming
+// without rewriting them leaves the table un-insertable, failing on a column the
+// schema no longer shows -- which is worse than refusing the rename, and is what
+// happened before this check existed.
+func TestAlterTableRenameColumnDependencies(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE r (kind TEXT, n INT CHECK (n > 0), d INT DEFAULT 0)`,
+		`CREATE UNIQUE INDEX ix ON r (kind) WHERE kind = 'a'`,
+	)
+
+	for _, tt := range []struct{ name, stmt, want string }{
+		{"partial index predicate", `ALTER TABLE r RENAME COLUMN kind TO sort`, `index "ix"`},
+		{"check constraint", `ALTER TABLE r RENAME COLUMN n TO m`, "check constraint"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := queryErr(db, tt.stmt)
+			if err == nil {
+				t.Fatalf("%s: expected the rename to be refused", tt.stmt)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("got %v, want it to name what depends on the column", err)
+			}
+		})
+	}
+
+	// A column nothing refers to by name still renames, so the check is not a
+	// blanket refusal.
+	if _, err := db.Exec(`ALTER TABLE r RENAME COLUMN d TO e`); err != nil {
+		t.Errorf("a column with no dependants should rename: %v", err)
+	}
+	// And the table still works afterwards.
+	if _, err := db.Exec(`INSERT INTO r (kind, n) VALUES ('a', 1)`); err != nil {
+		t.Errorf("insert after a permitted rename: %v", err)
+	}
+}
