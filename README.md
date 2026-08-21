@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-62_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-63_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -141,7 +141,7 @@ the two.
 | ✅ | Referential actions | ✅ | ✅ | ON DELETE and ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL and SET DEFAULT; cascades are part of the transaction |
 | ✅ | DROP TABLE | ✅ | ✅ | several tables at once, IF EXISTS, and RESTRICT which is the default: a table another one references is kept, unless both are named in the same statement. CASCADE parses but is refused rather than half-performed. Like every DDL statement it is not transactional, so a rolled back drop does not bring the table back |
 | ⬜ | ALTER TABLE | ⬜ | ⬜ |  |
-| ⬜ | CREATE INDEX | ⬜ | ⬜ |  |
+| 🟡 | CREATE INDEX | ✅ | 🟡 | UNIQUE and partial indexes are enforced as constraints, including a partial one whose predicate decides which rows it covers. A plain index is recorded but builds no structure and is never chosen, because there is no index selection in the planner yet -- so it costs nothing and speeds nothing up. DROP INDEX is supported; expression indexes and a per-column sort order are not |
 | ⬜ | CREATE VIEW | ⬜ | ⬜ |  |
 | ⬜ | CREATE SCHEMA | ⬜ | ⬜ |  |
 | ✅ | Sequences and SERIAL | ✅ | ✅ | an omitted SERIAL column is filled from a per-column sequence |

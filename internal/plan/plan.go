@@ -362,6 +362,20 @@ type CreateTable struct {
 	IfNotExists bool
 }
 
+// CreateIndex adds an index to a table.
+type CreateIndex struct {
+	Table       *catalog.Table
+	Index       catalog.Index
+	IfNotExists bool
+}
+
+// DropIndex removes indexes by name.
+type DropIndex struct {
+	Schema   string
+	Names    []string
+	IfExists bool
+}
+
 // DropTable removes tables.
 //
 // The names are carried rather than resolved *catalog.Table pointers, because
@@ -449,6 +463,8 @@ type Query struct {
 
 func (*CreateTable) stmtNode() {}
 func (*DropTable) stmtNode()   {}
+func (*CreateIndex) stmtNode() {}
+func (*DropIndex) stmtNode()   {}
 func (*Insert) stmtNode()      {}
 func (*Update) stmtNode()      {}
 func (*Delete) stmtNode()      {}

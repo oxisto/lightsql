@@ -344,6 +344,32 @@ func TestParseCreateTable(t *testing.T) {
 			want: "(drop-table t)",
 		},
 		{
+			name: "create index",
+			sql:  "CREATE INDEX i ON t (a, b)",
+			want: "(create-index i t a b)",
+		},
+		{
+			name: "create unique index if not exists",
+			sql:  "CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a)",
+			want: "(create-index i t unique if-not-exists a)",
+		},
+		{
+			name: "partial index",
+			sql:  "CREATE UNIQUE INDEX i ON t (a) WHERE b > 1",
+			want: "(create-index i t unique a (where (> (col b) (lit 1))))",
+		},
+		{
+			// index is unreserved, so it stays usable as a column name.
+			name: "index is not a reserved word",
+			sql:  "SELECT index FROM t",
+			want: "(select (items (col index)) (from (table t)))",
+		},
+		{
+			name: "drop index",
+			sql:  "DROP INDEX IF EXISTS i, j",
+			want: "(drop-index i j if-exists)",
+		},
+		{
 			name: "drop several tables if exists",
 			sql:  "DROP TABLE IF EXISTS a, public.b",
 			want: "(drop-table a public.b if-exists)",
