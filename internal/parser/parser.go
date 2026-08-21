@@ -196,9 +196,53 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 		return p.parseDelete()
 	case token.Create:
 		return p.parseCreate()
+	case token.Drop:
+		return p.parseDrop()
 	default:
-		return nil, p.unexpected("SELECT, INSERT, UPDATE, DELETE or CREATE")
+		return nil, p.unexpected("SELECT, INSERT, UPDATE, DELETE, CREATE or DROP")
 	}
+}
+
+// parseDrop parses DROP TABLE.
+//
+// Several tables may be named at once, and PostgreSQL drops them as one
+// statement rather than in sequence, so a reference between two of them is not
+// a reason to refuse.
+func (p *parser) parseDrop() (ast.Stmt, error) {
+	stmt := &ast.DropTableStmt{DropPos: p.cur().Pos}
+	p.next()
+	if err := p.expect(token.Table); err != nil {
+		return nil, err
+	}
+
+	if p.accept(token.If) {
+		if err := p.expect(token.Exists); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+
+	for {
+		name, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Tables = append(stmt.Tables, name)
+		if !p.accept(token.Comma) {
+			break
+		}
+	}
+
+	// RESTRICT is the default and says so explicitly; both are accepted so a
+	// statement written either way parses.
+	switch {
+	case p.atWord("cascade"):
+		p.next()
+		stmt.Cascade = true
+	case p.atWord("restrict"):
+		p.next()
+	}
+	return stmt, nil
 }
 
 // ---------------------------------------------------------------------------

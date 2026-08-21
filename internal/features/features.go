@@ -140,7 +140,14 @@ var Groups = []Group{
 				Note:  "ON DELETE and ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL and SET DEFAULT; cascades are part of the transaction",
 				Setup: []string{"CREATE TABLE u (id INT PRIMARY KEY)"},
 				SQL:   "CREATE TABLE t (a INT REFERENCES u (id) ON DELETE CASCADE ON UPDATE SET NULL)"},
-			{Name: "DROP TABLE", Parse: Planned, Exec: Planned, SQL: "DROP TABLE t"},
+			{Name: "DROP TABLE", Parse: Yes, Exec: Yes,
+				Note: "several tables at once, IF EXISTS, and RESTRICT which is the default: " +
+					"a table another one references is kept, unless both are named in the same " +
+					"statement. CASCADE parses but is refused rather than half-performed. " +
+					"Like every DDL statement it is not transactional, so a rolled back drop " +
+					"does not bring the table back",
+				Setup: probeTable,
+				SQL:   "DROP TABLE t"},
 			{Name: "ALTER TABLE", Parse: Planned, Exec: Planned, SQL: "ALTER TABLE t ADD COLUMN c INT"},
 			{Name: "CREATE INDEX", Parse: Planned, Exec: Planned, SQL: "CREATE INDEX i ON t (a)"},
 			{Name: "CREATE VIEW", Parse: Planned, Exec: Planned, SQL: "CREATE VIEW v AS SELECT 1"},

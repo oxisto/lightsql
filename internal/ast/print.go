@@ -202,6 +202,19 @@ func (p *printer) node(n Node) {
 		p.returning(n.Returning)
 		p.close()
 
+	case *DropTableStmt:
+		p.open("drop-table")
+		for _, t := range n.Tables {
+			p.atom("%s", t)
+		}
+		if n.IfExists {
+			p.atom("if-exists")
+		}
+		if n.Cascade {
+			p.atom("cascade")
+		}
+		p.close()
+
 	case *CreateTableStmt:
 		p.open("create-table")
 		p.atom("%s", n.Table)

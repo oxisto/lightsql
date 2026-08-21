@@ -995,6 +995,11 @@ func insertFrom(ctx context.Context, src plan.Node, tx *storage.Tx, args []types
 	}
 }
 
+// ExecDropTable runs a DROP TABLE.
+func ExecDropTable(cat *catalog.Catalog, dt *plan.DropTable) error {
+	return cat.DropTable(dt.Names, dt.IfExists)
+}
+
 // ExecCreateTable runs a CREATE TABLE.
 func ExecCreateTable(cat *catalog.Catalog, ct *plan.CreateTable) error {
 	_, err := cat.CreateTable(ct.Table, ct.IfNotExists)

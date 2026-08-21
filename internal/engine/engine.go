@@ -186,6 +186,12 @@ func (p *Prepared) run(ctx context.Context, tx *storage.Tx, args []types.Value) 
 				return err
 			}
 			return exec.ExecCreateTable(p.eng.cat, s)
+		case *plan.DropTable:
+			// DDL is a write, so a read-only transaction may not do it.
+			if err := t.CheckWritable(); err != nil {
+				return err
+			}
+			return exec.ExecDropTable(p.eng.cat, s)
 		case *plan.Insert:
 			if err := t.CheckWritable(); err != nil {
 				return err
