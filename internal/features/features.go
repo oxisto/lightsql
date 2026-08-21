@@ -201,8 +201,14 @@ var Groups = []Group{
 				Note:  "row order is preserved for the rows that remain",
 				Setup: probeTable,
 				SQL:   "DELETE FROM t WHERE a = 1"},
-			{Name: "ON CONFLICT", Parse: Planned, Exec: Planned,
-				SQL: "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING"},
+			{Name: "ON CONFLICT", Parse: Yes, Exec: Yes,
+				Note: "DO NOTHING, with or without a target, and DO UPDATE with an optional " +
+					"WHERE. The update sees the stored row by table name and the proposed one " +
+					"as excluded. A target must be covered by a primary key, unique constraint " +
+					"or total unique index, since one nothing enforces would never detect a " +
+					"collision. A skip reports zero rows affected",
+				Setup: []string{"CREATE TABLE t (a INT PRIMARY KEY, b INT)"},
+				SQL:   "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING"},
 			{Name: "TRUNCATE", Parse: Planned, Exec: Planned, SQL: "TRUNCATE t"},
 		},
 	},

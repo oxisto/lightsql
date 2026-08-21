@@ -477,11 +477,30 @@ type InsertStmt struct {
 	Table     *TableName
 	// Columns is empty when the statement omits the column list, meaning all
 	// columns in declaration order.
-	Columns   []Name
-	Rows      [][]Expr
-	Select    *SelectStmt
-	Returning []SelectItem
+	Columns []Name
+	Rows    [][]Expr
+	Select  *SelectStmt
+	// OnConflict is the ON CONFLICT clause, or nil.
+	OnConflict *OnConflictClause
+	Returning  []SelectItem
 }
+
+// OnConflictClause is ON CONFLICT ... DO NOTHING or DO UPDATE.
+//
+// Target names the columns whose uniqueness decides a conflict. It is empty for
+// a bare ON CONFLICT DO NOTHING, which yields to any unique constraint rather
+// than one in particular -- a distinction SQL makes because DO UPDATE has to
+// know which row it is updating and DO NOTHING does not.
+type OnConflictClause struct {
+	ConflictPos token.Pos
+	Target      []Name
+	// DoUpdate is nil for DO NOTHING.
+	DoUpdate []*Assignment
+	// Where filters which conflicting rows the update applies to.
+	Where Expr
+}
+
+func (c *OnConflictClause) Pos() token.Pos { return c.ConflictPos }
 
 func (s *InsertStmt) Pos() token.Pos { return s.InsertPos }
 

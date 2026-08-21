@@ -779,10 +779,88 @@ func (p *parser) parseInsert() (*ast.InsertStmt, error) {
 		return nil, p.unexpected("VALUES or SELECT")
 	}
 
+	if p.at(token.On) {
+		if stmt.OnConflict, err = p.parseOnConflict(); err != nil {
+			return nil, err
+		}
+	}
+
 	if stmt.Returning, err = p.parseReturning(); err != nil {
 		return nil, err
 	}
 	return stmt, nil
+}
+
+// parseOnConflict parses ON CONFLICT ... DO NOTHING or DO UPDATE SET.
+//
+// conflict, do, nothing and set are unreserved, so they are matched by value.
+// ON is already a keyword because a join needs it.
+func (p *parser) parseOnConflict() (*ast.OnConflictClause, error) {
+	clause := &ast.OnConflictClause{ConflictPos: p.cur().Pos}
+	p.next() // ON
+	if err := p.expectWord("conflict"); err != nil {
+		return nil, err
+	}
+
+	// The conflict target. Absent means "any unique constraint", which only DO
+	// NOTHING can mean: an update has to know which row it is updating.
+	if p.accept(token.LParen) {
+		for {
+			name, err := p.expectName()
+			if err != nil {
+				return nil, err
+			}
+			clause.Target = append(clause.Target, name)
+			if !p.accept(token.Comma) {
+				break
+			}
+		}
+		if err := p.expect(token.RParen); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := p.expectWord("do"); err != nil {
+		return nil, err
+	}
+	if p.atWord("nothing") {
+		p.next()
+		return clause, nil
+	}
+	// UPDATE is a reserved keyword, so it arrives by kind rather than as a
+	// word, unlike conflict, do and nothing around it.
+	if err := p.expect(token.Update); err != nil {
+		return nil, err
+	}
+	if err := p.expect(token.Set); err != nil {
+		return nil, err
+	}
+
+	for {
+		col, err := p.expectName()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(token.Eq); err != nil {
+			return nil, err
+		}
+		val, err := p.parseExpr(bpNone)
+		if err != nil {
+			return nil, err
+		}
+		clause.DoUpdate = append(clause.DoUpdate, &ast.Assignment{Column: col, Value: val})
+		if !p.accept(token.Comma) {
+			break
+		}
+	}
+
+	if p.accept(token.Where) {
+		var err error
+		if clause.Where, err = p.parseExpr(bpNone); err != nil {
+			return nil, err
+		}
+	}
+	return clause, nil
 }
 
 // parseReturning parses an optional RETURNING list, shared by INSERT, UPDATE and
