@@ -285,8 +285,12 @@ var Groups = []Group{
 				Note:  "both CAST(x AS t) and x::t",
 				Setup: probeTable,
 				SQL:   "SELECT CAST(a AS TEXT) FROM t"},
-			{Name: "Scalar functions", Parse: Yes, Exec: Planned,
-				Note:  "parsed generically; the function library is pending",
+			{Name: "Scalar functions", Parse: Yes, Exec: Partial,
+				Note: "coalesce, nullif, now, lower, upper, length, trim, abs and round. " +
+					"NULL propagates for all but coalesce and nullif, and coalesce stops at " +
+					"the first argument that answers. Argument types are checked at bind " +
+					"time, so lower(1) is rejected rather than reading an integer as text. " +
+					"The library is small and grows on demand",
 				Setup: probeTable,
 				SQL:   "SELECT coalesce(a, b, 0) FROM t"},
 			{Name: "Arrays", Parse: No, Exec: No, Note: "out of scope for v1"},

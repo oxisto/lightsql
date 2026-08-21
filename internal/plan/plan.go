@@ -104,6 +104,37 @@ type InSubquery struct {
 	Negate bool
 }
 
+// FuncCall is a call to a scalar function from the builtin registry.
+//
+// The function is named rather than held as a pointer so that a plan stays a
+// description the executor resolves, the way an aggregate call does.
+type FuncCall struct {
+	Func string
+	Args []Expr
+	Kind types.Kind
+}
+
+// Coalesce is COALESCE(a, b, ...), the first argument that is not NULL.
+//
+// It is its own node rather than a registry function because it does two things
+// no ordinary function does: it looks at NULLs instead of propagating them, and
+// it stops at the first argument that answers, so a later one is never
+// evaluated.
+type Coalesce struct {
+	Args []Expr
+	Kind types.Kind
+}
+
+// Now is now(), the time the current transaction began.
+//
+// It is a node rather than a registry function because it reads the transaction
+// rather than its arguments. Reporting the transaction's start instead of the
+// wall clock is what makes every statement in a transaction agree about "now",
+// which is PostgreSQL's rule.
+type Now struct {
+	Kind types.Kind
+}
+
 // Case is a CASE expression, in its searched form.
 //
 // The simple form, CASE x WHEN v THEN ..., is rewritten by the binder into the
@@ -148,6 +179,9 @@ func (e *ExistsSubquery) Type() types.Kind { return types.KindBool }
 func (e *InSubquery) Type() types.Kind     { return types.KindBool }
 func (e *InList) Type() types.Kind         { return types.KindBool }
 func (e *Case) Type() types.Kind           { return e.Kind }
+func (e *FuncCall) Type() types.Kind       { return e.Kind }
+func (e *Coalesce) Type() types.Kind       { return e.Kind }
+func (e *Now) Type() types.Kind            { return e.Kind }
 
 func (*Cast) exprNode()   {}
 func (*Column) exprNode() {}
@@ -162,6 +196,9 @@ func (*ExistsSubquery) exprNode() {}
 func (*InSubquery) exprNode()     {}
 func (*InList) exprNode()         {}
 func (*Case) exprNode()           {}
+func (*FuncCall) exprNode()       {}
+func (*Coalesce) exprNode()       {}
+func (*Now) exprNode()            {}
 
 // ResultColumn describes one column of a node's output. The driver reports these
 // through the RowsColumnType interfaces, which is how an ORM decides what Go

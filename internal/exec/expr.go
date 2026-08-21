@@ -13,8 +13,10 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/oxisto/lightsql/internal/ast"
+	"github.com/oxisto/lightsql/internal/builtin"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/plan"
 	"github.com/oxisto/lightsql/internal/storage"
@@ -107,6 +109,27 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 	case *plan.Case:
 		return compileCase(e, tx)
 
+	case *plan.FuncCall:
+		return compileFuncCall(e, tx)
+
+	case *plan.Coalesce:
+		return compileCoalesce(e, tx)
+
+	case *plan.Now:
+		// Resolved once, here, rather than per row: the transaction's start is
+		// fixed, and reading it per row would only invite it to change.
+		//
+		// A nil transaction means an expression being folded outside a
+		// statement, such as a DEFAULT evaluated to satisfy a referential SET
+		// DEFAULT. There is no transaction to ask, so the wall clock is the
+		// honest answer.
+		at := time.Now().UTC()
+		if tx != nil {
+			at = tx.Started()
+		}
+		v := types.TimeValue(at, e.Kind)
+		return func(context.Context, []types.Value, Row) (types.Value, error) { return v, nil }, nil
+
 	case *plan.ScalarSubquery:
 		return compileScalarSubquery(e, tx)
 
@@ -177,6 +200,75 @@ func compileCase(e *plan.Case, tx *storage.Tx) (Eval, error) {
 		if els != nil {
 			return els(ctx, args, row)
 		}
+		return types.Null(), nil
+	}, nil
+}
+
+// compileFuncCall compiles a call to a scalar function from the registry.
+//
+// A strict function's NULL check happens here, once, rather than inside each
+// implementation. That is what stops a new function from quietly forgetting
+// SQL's rule that NULL propagates -- and it means an implementation may read
+// its arguments without guarding every one.
+func compileFuncCall(e *plan.FuncCall, tx *storage.Tx) (Eval, error) {
+	fn, ok := builtin.LookupScalar(e.Func)
+	if !ok {
+		// The binder accepted the name, so a miss is a bug in the plan rather
+		// than anything a caller did.
+		return nil, pgerr.Newf(pgerr.InternalError, "unknown function %q in plan", e.Func)
+	}
+
+	args := make([]Eval, len(e.Args))
+	for i, a := range e.Args {
+		var err error
+		if args[i], err = Compile(a, tx); err != nil {
+			return nil, err
+		}
+	}
+
+	vals := make([]types.Value, len(args))
+	strict := fn.Strict
+	return func(ctx context.Context, params []types.Value, row Row) (types.Value, error) {
+		for i, a := range args {
+			v, err := a(ctx, params, row)
+			if err != nil {
+				return types.Value{}, err
+			}
+			if strict && v.IsNull() {
+				return types.Null(), nil
+			}
+			vals[i] = v
+		}
+		return fn.Fn(vals)
+	}, nil
+}
+
+// compileCoalesce returns the first argument that is not NULL.
+//
+// Evaluation stops there, so a later argument is never computed. That matters
+// for the shape coalesce is usually written in -- a cheap column with an
+// expensive fallback -- and it is what the SQL standard specifies, coalesce
+// being defined as a CASE.
+func compileCoalesce(e *plan.Coalesce, tx *storage.Tx) (Eval, error) {
+	args := make([]Eval, len(e.Args))
+	for i, a := range e.Args {
+		var err error
+		if args[i], err = Compile(a, tx); err != nil {
+			return nil, err
+		}
+	}
+	return func(ctx context.Context, params []types.Value, row Row) (types.Value, error) {
+		for _, a := range args {
+			v, err := a(ctx, params, row)
+			if err != nil {
+				return types.Value{}, err
+			}
+			if !v.IsNull() {
+				return v, nil
+			}
+		}
+		// Every argument was NULL, so the answer is NULL -- not an error, and
+		// not the zero value of the declared type.
 		return types.Null(), nil
 	}, nil
 }

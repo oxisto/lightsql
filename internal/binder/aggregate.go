@@ -138,6 +138,13 @@ func (c *aggContext) add(fc *ast.FuncCall, agg *builtin.Aggregate, sc *scope) (p
 // the wrong problem: WHERE runs before grouping, so the aggregate has nothing
 // to aggregate over yet.
 func bindFuncCall(fc *ast.FuncCall, sc *scope) (plan.Expr, error) {
+	// A scalar function is legal anywhere an expression is, including inside an
+	// aggregate and below a grouping, so it is resolved before the aggregate
+	// rules below get a say.
+	if e, ok, err := bindScalarCall(fc, sc); ok {
+		return e, err
+	}
+
 	agg, ok := builtin.LookupAggregate(fc.Name.Name)
 	if !ok {
 		return nil, pgerr.Newf(pgerr.UndefinedFunction,
