@@ -80,10 +80,11 @@ func (h *conflictHandler) find(tx *storage.Tx, t *catalog.Table, row Row) *stora
 			continue
 		}
 		for _, v := range t.Scan(tx) {
-			if anyNullAt(v.Vals, cols) {
+			vals := t.Values(v)
+			if anyNullAt(vals, cols) {
 				continue
 			}
-			if sameAt(v.Vals, row, cols) {
+			if sameAt(vals, row, cols) {
 				return v
 			}
 		}
@@ -109,7 +110,8 @@ func (h *conflictHandler) resolve(
 		return nil
 	}
 
-	copy(h.joined, existing.Vals)
+	stored := t.Values(existing)
+	copy(h.joined, stored)
 	copy(h.joined[h.width:], proposed)
 
 	ok, err := h.where(ctx, args, h.joined)
@@ -123,7 +125,7 @@ func (h *conflictHandler) resolve(
 	}
 
 	next := make(Row, h.width)
-	copy(next, existing.Vals)
+	copy(next, stored)
 	for i, eval := range h.assign {
 		v, err := eval(ctx, args, h.joined)
 		if err != nil {

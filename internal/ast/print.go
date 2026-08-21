@@ -228,6 +228,14 @@ func (p *printer) node(n Node) {
 		p.node(n.Action)
 		p.close()
 
+	case *AddColumn:
+		p.open("add-column")
+		if n.IfNotExists {
+			p.atom("if-not-exists")
+		}
+		p.node(n.Column)
+		p.close()
+
 	case *RenameTable:
 		p.open("rename-to")
 		p.name(n.To)

@@ -362,6 +362,22 @@ type CreateTable struct {
 	IfNotExists bool
 }
 
+// AddColumn appends a column to a table.
+//
+// Missing is the value the rows already stored read for it. They are not
+// rewritten -- a version's values are never mutated once it is in the heap --
+// so the column is added to the definition and the old rows are simply shorter
+// than the table from then on.
+type AddColumn struct {
+	Table       *catalog.Table
+	Column      catalog.Column
+	Missing     types.Value
+	IfNotExists bool
+	// Check and ForeignKey are the constraints written on the column, or nil.
+	Check      *catalog.Check
+	ForeignKey *catalog.ForeignKey
+}
+
 // RenameTable renames a table.
 type RenameTable struct {
 	Schema, From, To string
@@ -494,6 +510,7 @@ type Query struct {
 func (*CreateTable) stmtNode()  {}
 func (*DropTable) stmtNode()    {}
 func (*CreateIndex) stmtNode()  {}
+func (*AddColumn) stmtNode()    {}
 func (*RenameTable) stmtNode()  {}
 func (*RenameColumn) stmtNode() {}
 func (*DropIndex) stmtNode()    {}

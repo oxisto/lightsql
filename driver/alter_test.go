@@ -109,9 +109,9 @@ func TestAlterTableErrors(t *testing.T) {
 		{"name already taken", `ALTER TABLE t RENAME TO taken`, "already exists"},
 		{"unknown column", `ALTER TABLE t RENAME COLUMN nope TO x`, "does not exist"},
 		{"column name taken", `ALTER TABLE t RENAME COLUMN nm TO id`, "already exists"},
-		// The forms a reader is most likely to try are named rather than left
-		// to a bare syntax error, and the message says why.
-		{"add column", `ALTER TABLE t ADD COLUMN c INT`, "rewrite every stored row"},
+		// DROP COLUMN is named rather than left to a bare syntax error: unlike
+		// ADD COLUMN it cannot be served by a missing value, since dropping
+		// shifts every later column's ordinal.
 		{"drop column", `ALTER TABLE t DROP COLUMN nm`, "rewrite every stored row"},
 	}
 
@@ -165,5 +165,121 @@ func TestAlterTableRenameColumnDependencies(t *testing.T) {
 	// And the table still works afterwards.
 	if _, err := db.Exec(`INSERT INTO r (kind, n) VALUES ('a', 1)`); err != nil {
 		t.Errorf("insert after a permitted rename: %v", err)
+	}
+}
+
+// TestAlterTableAddColumn covers the half of ADD COLUMN that is not syntax: the
+// rows already stored are not rewritten, so they are shorter than the table and
+// read the new column as its missing value.
+func TestAlterTableAddColumn(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE t (id INT, nm TEXT)`,
+		`INSERT INTO t VALUES (1, 'a'), (2, 'b')`,
+		`ALTER TABLE t ADD COLUMN extra INT`,
+		`ALTER TABLE t ADD COLUMN tag TEXT DEFAULT 'none'`,
+	)
+
+	// A row written before the column existed reads NULL, or the DEFAULT when
+	// one was given.
+	got := rowsOf(t, db, `SELECT id, nm, extra, tag FROM t ORDER BY id`)
+	if want := []string{"1|a|NULL|none", "2|b|NULL|none"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+
+	// The new column behaves like any other afterwards: it can be written,
+	// filtered on and aggregated.
+	mustExecAll(t, db, `UPDATE t SET extra = 9 WHERE id = 1`)
+	if got := rowsOf(t, db, `SELECT id FROM t WHERE extra = 9`); !slices.Equal(got, []string{"1"}) {
+		t.Errorf("filter on the new column: got %v", got)
+	}
+	if got := rowsOf(t, db, `SELECT sum(extra) FROM t`); !slices.Equal(got, []string{"9"}) {
+		t.Errorf("aggregate over the new column: got %v", got)
+	}
+	if got := rowsOf(t, db, `SELECT count(*) FROM t WHERE tag = 'none'`); !slices.Equal(got, []string{"2"}) {
+		t.Errorf("filter on the defaulted column: got %v", got)
+	}
+
+	// A row inserted afterwards is stored at the full width and agrees with the
+	// short ones.
+	mustExecAll(t, db, `INSERT INTO t (id, nm) VALUES (3, 'c')`)
+	got = rowsOf(t, db, `SELECT id, tag FROM t ORDER BY id`)
+	if want := []string{"1|none", "2|none", "3|none"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+
+	// SELECT * reports the new columns.
+	rows, err := db.Query(`SELECT * FROM t`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols, err := rows.Columns()
+	rows.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"id", "nm", "extra", "tag"}; !slices.Equal(cols, want) {
+		t.Errorf("columns = %v, want %v", cols, want)
+	}
+}
+
+// TestAlterTableAddColumnReferences is the statement money-gopher's migration
+// needs, and the foreign key has to be enforced rather than merely recorded.
+func TestAlterTableAddColumnReferences(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE persons (id TEXT PRIMARY KEY)`,
+		`CREATE TABLE sessions (id TEXT PRIMARY KEY)`,
+		`INSERT INTO persons VALUES ('p1')`,
+		`INSERT INTO sessions VALUES ('s1')`,
+		`ALTER TABLE sessions ADD COLUMN person_id TEXT REFERENCES persons(id) ON DELETE SET NULL`,
+	)
+
+	if err := queryErr(db, `INSERT INTO sessions VALUES ('s2', 'nope')`); err == nil {
+		t.Error("a dangling reference was accepted; the foreign key is recorded but not enforced")
+	}
+	mustExecAll(t, db, `INSERT INTO sessions VALUES ('s3', 'p1')`)
+
+	// The referential action fires too, which means the parent learned about
+	// the new child rather than only the child knowing about the parent.
+	mustExecAll(t, db, `DELETE FROM persons WHERE id = 'p1'`)
+	got := rowsOf(t, db, `SELECT id, person_id FROM sessions ORDER BY id`)
+	if want := []string{"s1|NULL", "s3|NULL"}; !slices.Equal(got, want) {
+		t.Errorf("after ON DELETE SET NULL: got %v, want %v", got, want)
+	}
+}
+
+func TestAlterTableAddColumnErrors(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE t (id INT)`,
+		`INSERT INTO t VALUES (1)`,
+		`ALTER TABLE t ADD COLUMN dup INT`,
+	)
+
+	if err := queryErr(db, `ALTER TABLE t ADD COLUMN dup INT`); err == nil {
+		t.Error("expected a duplicate column to be rejected")
+	}
+	if _, err := db.Exec(`ALTER TABLE t ADD COLUMN IF NOT EXISTS dup INT`); err != nil {
+		t.Errorf("IF NOT EXISTS should tolerate an existing column: %v", err)
+	}
+
+	// Every stored row would violate it, since they all read the column as
+	// NULL. Refusing beats writing a table that cannot be read back.
+	err := queryErr(db, `ALTER TABLE t ADD COLUMN n INT NOT NULL`)
+	if err == nil {
+		t.Error("expected NOT NULL without a default to be rejected")
+	} else if !strings.Contains(err.Error(), "null values") {
+		t.Errorf("got %v", err)
+	}
+	// With a default there is a value for them to take.
+	if _, err := db.Exec(`ALTER TABLE t ADD COLUMN n INT NOT NULL DEFAULT 0`); err != nil {
+		t.Errorf("NOT NULL with a default should be accepted: %v", err)
+	}
+
+	// A key over a column every existing row reads identically either collides
+	// immediately or belongs in CREATE TABLE.
+	if err := queryErr(db, `ALTER TABLE t ADD COLUMN k INT PRIMARY KEY`); err == nil {
+		t.Error("expected PRIMARY KEY on ADD COLUMN to be rejected")
 	}
 }

@@ -77,7 +77,10 @@ type scopeColumn struct {
 // is exactly what appending to a shared scope produces.
 func (s *scope) addTable(t *catalog.Table, qualifier string) {
 	base := len(s.cols)
-	for i, c := range t.Columns {
+	// Indexed rather than ranged by value: a Column is large enough that
+	// copying one per iteration shows up, and nothing here needs a copy.
+	for i := range t.Columns {
+		c := &t.Columns[i]
 		s.cols = append(s.cols, scopeColumn{
 			table: qualifier, name: c.Name, ordinal: base + i, typ: c.Type,
 		})
@@ -140,7 +143,7 @@ func (b *Binder) Bind(stmt ast.Stmt) (plan.Stmt, error) {
 	case *ast.DropTableStmt:
 		return bindDropTable(s)
 	case *ast.AlterTableStmt:
-		return bindAlterTable(s)
+		return b.bindAlterTable(s)
 	case *ast.CreateIndexStmt:
 		return b.bindCreateIndex(s)
 	case *ast.DropIndexStmt:
@@ -475,6 +478,20 @@ type refSpec struct {
 	cols []int
 	ref  *ast.ForeignKeyRef
 	pos  token.Pos
+	// pending describes a referencing column that is not in the table yet,
+	// which is the case for ALTER TABLE ... ADD COLUMN. Reading it from the
+	// table instead would index past the end: at CREATE TABLE every column is
+	// appended before the references are resolved, and here none is.
+	pending *catalog.Column
+}
+
+// childColumn is the referencing column, whether or not it has been added to
+// the table yet.
+func (r refSpec) childColumn(t *catalog.Table, i int) catalog.Column {
+	if r.pending != nil {
+		return *r.pending
+	}
+	return t.Columns[r.cols[i]]
 }
 
 // resolveForeignKey turns a written REFERENCES clause into a catalog entry,
@@ -509,17 +526,18 @@ func (b *Binder) resolveForeignKey(t *catalog.Table, r refSpec) (catalog.Foreign
 	}
 
 	// The types must match, or a comparison between them would be meaningless.
-	for i, ord := range r.cols {
-		if got, want := t.Columns[ord].Type.Kind, parent.Columns[parentCols[i]].Type.Kind; got != want {
+	for i := range r.cols {
+		child := r.childColumn(t, i)
+		if got, want := child.Type.Kind, parent.Columns[parentCols[i]].Type.Kind; got != want {
 			return catalog.ForeignKey{}, pgerr.Newf(pgerr.DatatypeMismatch,
 				"foreign key constraint cannot be implemented: column %q is %s and referenced column %q is %s",
-				t.Columns[ord].Name, got, parent.Columns[parentCols[i]].Name, want).At(r.pos)
+				child.Name, got, parent.Columns[parentCols[i]].Name, want).At(r.pos)
 		}
 	}
 
 	name := r.name
 	if name == "" {
-		name = t.Name + "_" + t.Columns[r.cols[0]].Name + "_fkey"
+		name = t.Name + "_" + r.childColumn(t, 0).Name + "_fkey"
 	}
 	fk := catalog.ForeignKey{
 		Name: name, Columns: r.cols,
@@ -631,8 +649,8 @@ func columnOrdinals(t *catalog.Table, names []ast.Name) ([]int, error) {
 }
 
 func indexOfColumn(cols []catalog.Column, name string) int {
-	for i, c := range cols {
-		if c.Name == name {
+	for i := range cols {
+		if cols[i].Name == name {
 			return i
 		}
 	}
@@ -705,10 +723,11 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 	// Columns the statement did not name are filled from their sequence or
 	// their DEFAULT. A serial column wins, since SERIAL is itself shorthand for
 	// a default drawn from a sequence.
-	for i, col := range t.Columns {
+	for i := range t.Columns {
 		if slices.Contains(targets, i) {
 			continue
 		}
+		col := &t.Columns[i]
 		switch {
 		case col.Type.Serial:
 			ins.Serials = append(ins.Serials, i)
@@ -920,8 +939,8 @@ func (b *Binder) bindFrom(te ast.TableExpr, sc *scope) (plan.Node, error) {
 		sc.addTable(t, qualifier)
 
 		cols := make([]plan.ResultColumn, len(t.Columns))
-		for i, c := range t.Columns {
-			cols[i] = plan.ResultColumn{Name: c.Name, Type: c.Type}
+		for i := range t.Columns {
+			cols[i] = plan.ResultColumn{Name: t.Columns[i].Name, Type: t.Columns[i].Type}
 		}
 		return &plan.Scan{Table: t, Cols: cols}, nil
 

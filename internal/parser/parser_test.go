@@ -361,6 +361,23 @@ func TestParseCreateTable(t *testing.T) {
 				"(on-conflict a (do-update (= b (lit 1))) (where (< (col t.b) (lit 5)))))",
 		},
 		{
+			name: "alter table add column",
+			sql:  "ALTER TABLE t ADD COLUMN c INT NOT NULL DEFAULT 0",
+			want: "(alter-table t (add-column (column c (type int) " +
+				"(constraint not null) (constraint default (lit 0)))))",
+		},
+		{
+			// COLUMN is optional here too.
+			name: "alter table add without the keyword",
+			sql:  "ALTER TABLE t ADD c INT",
+			want: "(alter-table t (add-column (column c (type int))))",
+		},
+		{
+			name: "alter table add column if not exists",
+			sql:  "ALTER TABLE t ADD COLUMN IF NOT EXISTS c INT",
+			want: "(alter-table t (add-column if-not-exists (column c (type int))))",
+		},
+		{
 			name: "alter table rename to",
 			sql:  "ALTER TABLE t RENAME TO u",
 			want: "(alter-table t (rename-to u))",
