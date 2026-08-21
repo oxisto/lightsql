@@ -3,6 +3,7 @@ package driver_test
 import (
 	"database/sql"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -148,5 +149,61 @@ func mustExecAll(t *testing.T, db *sql.DB, stmts ...string) {
 		if _, err := db.Exec(s); err != nil {
 			t.Fatalf("%s: %v", s, err)
 		}
+	}
+}
+
+// TestCascadeRecurses covers a cascade reaching past the immediate children.
+//
+// Deleting a row used to remove its children and stop there, leaving the
+// grandchildren pointing at rows that no longer existed -- referential
+// integrity broken by the machinery meant to enforce it, and silently, since
+// nothing revisited them afterwards.
+func TestCascadeRecurses(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE a (id INT PRIMARY KEY)`,
+		`CREATE TABLE b (id INT PRIMARY KEY, a_id INT REFERENCES a(id) ON DELETE CASCADE)`,
+		`CREATE TABLE c (id INT PRIMARY KEY, b_id INT REFERENCES b(id) ON DELETE CASCADE)`,
+		`CREATE TABLE d (id INT PRIMARY KEY, c_id INT REFERENCES c(id) ON DELETE CASCADE)`,
+		`INSERT INTO a VALUES (1), (2)`,
+		`INSERT INTO b VALUES (1, 1), (2, 2)`,
+		`INSERT INTO c VALUES (1, 1), (2, 2)`,
+		`INSERT INTO d VALUES (1, 1), (2, 2)`,
+	)
+
+	if _, err := db.Exec(`DELETE FROM a WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	// The whole chain below the deleted row goes, and the untouched one stays.
+	for _, q := range []string{
+		`SELECT id FROM b ORDER BY id`,
+		`SELECT id FROM c ORDER BY id`,
+		`SELECT id FROM d ORDER BY id`,
+	} {
+		if got := rowsOf(t, db, q); !slices.Equal(got, []string{"2"}) {
+			t.Errorf("%s: got %v, want only the untouched row [2]", q, got)
+		}
+	}
+}
+
+// TestCascadeTerminatesOnACycle pins the guard rather than a behaviour. A table
+// referencing itself makes the cascade graph cyclic, and recursion without a
+// record of what it has already acted on would not come back.
+func TestCascadeTerminatesOnACycle(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE n (id INT PRIMARY KEY, parent INT REFERENCES n(id) ON DELETE CASCADE)`,
+		`INSERT INTO n VALUES (1, NULL)`,
+		`INSERT INTO n VALUES (2, 1)`,
+		`INSERT INTO n VALUES (3, 2)`,
+		`INSERT INTO n VALUES (4, NULL)`,
+	)
+
+	if _, err := db.Exec(`DELETE FROM n WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	// The chain rooted at 1 goes; the unrelated row stays.
+	if got := rowsOf(t, db, `SELECT id FROM n ORDER BY id`); !slices.Equal(got, []string{"4"}) {
+		t.Errorf("got %v, want [4]", got)
 	}
 }

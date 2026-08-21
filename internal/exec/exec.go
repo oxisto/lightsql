@@ -630,7 +630,7 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		}
 		// A key the children point at is changing, so they have to be dealt
 		// with before the parent row moves out from under them.
-		if err := applyRefActions(tx, up.Table, cur, next, onUpdate, wrote); err != nil {
+		if err := applyRefActions(tx, up.Table, cur, next, onUpdate, wrote, cascaded{}); err != nil {
 			return Result{}, err
 		}
 		if err := up.Table.Update(tx, v, next); err != nil {
@@ -695,7 +695,7 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 			}
 			res.Rows = append(res.Rows, out)
 		}
-		if err := applyRefActions(tx, del.Table, cur, nil, onDelete, wrote); err != nil {
+		if err := applyRefActions(tx, del.Table, cur, nil, onDelete, wrote, cascaded{}); err != nil {
 			return Result{}, err
 		}
 		if err := del.Table.Delete(tx, v); err != nil {
@@ -753,8 +753,13 @@ const (
 // whose key columns are unchanged is not a referential event at all, which is
 // why the comparison happens here rather than at the call site: `UPDATE parent
 // SET name = ...` must not cascade.
+// cascaded records the row versions a statement has already acted on, so that a
+// cycle in the foreign key graph -- a table referencing itself, or two tables
+// referencing each other -- terminates instead of recurring forever.
+type cascaded map[*storage.Version]bool
+
 func applyRefActions(tx *storage.Tx, parent *catalog.Table, old, next []types.Value,
-	ev refEvent, wrote touched) error {
+	ev refEvent, wrote touched, seen cascaded) error {
 
 	if !parent.IsReferenced() {
 		return nil
@@ -772,7 +777,11 @@ func applyRefActions(tx *storage.Tx, parent *catalog.Table, old, next []types.Va
 		}
 
 		for _, child := range group.Rows {
-			if err := applyRefAction(tx, group.Ref.Child, fk, child, next, action); err != nil {
+			if seen[child] {
+				continue
+			}
+			seen[child] = true
+			if err := applyRefAction(tx, group.Ref.Child, fk, child, next, action, wrote, seen); err != nil {
 				return err
 			}
 			// A cascade writes to the child, so the child's own constraints
@@ -795,21 +804,35 @@ func matchesParentKey(old, next []types.Value, cols []int) bool {
 }
 
 func applyRefAction(tx *storage.Tx, childTable *catalog.Table, fk *catalog.ForeignKey,
-	child *storage.Version, next []types.Value, action catalog.RefAction) error {
+	child *storage.Version, next []types.Value, action catalog.RefAction,
+	wrote touched, seen cascaded) error {
 
 	switch action {
 	case catalog.Cascade:
+		cur := childTable.Values(child)
 		if next == nil {
+			// The child is going, so whatever references the child has to be
+			// dealt with first. Without this the grandchildren simply stayed,
+			// pointing at a row that no longer existed -- referential integrity
+			// broken by the machinery that enforces it, and silently, since
+			// nothing revisits them.
+			if err := applyRefActions(tx, childTable, cur, nil, onDelete, wrote, seen); err != nil {
+				return err
+			}
 			return childTable.Delete(tx, child)
 		}
 		// The parent's key moved, so the child follows it.
-		cur := childTable.Values(child)
 		updated := make([]types.Value, len(cur))
 		copy(updated, cur)
 		for i, ord := range fk.Columns {
 			updated[ord] = next[fk.ParentCols[i]]
 		}
-		return childTable.Update(tx, child, updated)
+		if err := childTable.Update(tx, child, updated); err != nil {
+			return err
+		}
+		// The child's own key may have been what moved, so anything referencing
+		// the child follows in turn.
+		return applyRefActions(tx, childTable, cur, updated, onUpdate, wrote, seen)
 
 	case catalog.SetNull, catalog.SetDefault:
 		cur := childTable.Values(child)

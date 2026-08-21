@@ -137,7 +137,9 @@ var Groups = []Group{
 				Setup: []string{"CREATE TABLE u (id INT PRIMARY KEY)"},
 				SQL:   "CREATE TABLE t (a INT REFERENCES u (id))"},
 			{Name: "Referential actions", Parse: Yes, Exec: Yes,
-				Note:  "ON DELETE and ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL and SET DEFAULT; cascades are part of the transaction",
+				Note: "ON DELETE and ON UPDATE with CASCADE, RESTRICT, NO ACTION, SET NULL " +
+					"and SET DEFAULT; cascades are part of the transaction, recurse past the " +
+					"immediate children, and terminate on a cyclic reference",
 				Setup: []string{"CREATE TABLE u (id INT PRIMARY KEY)"},
 				SQL:   "CREATE TABLE t (a INT REFERENCES u (id) ON DELETE CASCADE ON UPDATE SET NULL)"},
 			{Name: "DROP TABLE", Parse: Yes, Exec: Yes,
