@@ -12,6 +12,7 @@ import (
 	"cmp"
 	"hash/maphash"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -720,6 +721,82 @@ func (t *Table) index() error {
 	return nil
 }
 
+// RenameTable renames a table, moving it to its new key.
+//
+// Nothing else has to change: a foreign key holds a *Table rather than a name,
+// so a reference survives the rename without being rewritten. That is the
+// payoff of resolving names once, at bind time.
+func (c *Catalog) RenameTable(schema, from, to string) error {
+	if schema == "" {
+		schema = DefaultSchema
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	t, ok := c.tables[key(schema, from)]
+	if !ok {
+		return pgerr.Newf(pgerr.UndefinedTable, "relation %q does not exist", from)
+	}
+	if from == to {
+		return nil
+	}
+	if _, taken := c.tables[key(schema, to)]; taken {
+		return pgerr.Newf(pgerr.DuplicateTable, "relation %q already exists", to)
+	}
+
+	delete(c.tables, key(schema, from))
+	t.Name = to
+	c.tables[key(schema, to)] = t
+	return nil
+}
+
+// RenameColumn renames one column of a table.
+//
+// Only the name changes. Every reference below the binder is an ordinal, so no
+// stored row and no constraint needs rewriting -- but the name lookup the binder
+// consults does, or the new name would not resolve.
+func (c *Catalog) RenameColumn(schema, table, from, to string) error {
+	if schema == "" {
+		schema = DefaultSchema
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	t, ok := c.tables[key(schema, table)]
+	if !ok {
+		return pgerr.Newf(pgerr.UndefinedTable, "relation %q does not exist", table)
+	}
+	i, ok := t.byName[from]
+	if !ok {
+		return pgerr.Newf(pgerr.UndefinedColumn,
+			"column %q of relation %q does not exist", from, table)
+	}
+	if from == to {
+		return nil
+	}
+	if _, taken := t.byName[to]; taken {
+		return pgerr.Newf(pgerr.DuplicateColumn,
+			"column %q of relation %q already exists", to, table)
+	}
+	if what := t.dependsOnColumnName(from); what != "" {
+		// CHECK predicates, DEFAULT expressions and partial index predicates
+		// are stored as syntax, so they name the column rather than addressing
+		// it by ordinal. Renaming without rewriting them leaves the table
+		// un-insertable, failing on a column the schema no longer shows --
+		// which is far worse than refusing the rename.
+		return pgerr.Newf(pgerr.FeatureNotSupported,
+			"cannot rename column %q of relation %q because %s refers to it by name",
+			from, table, what)
+	}
+
+	t.Columns[i].Name = to
+	delete(t.byName, from)
+	t.byName[to] = i
+	return nil
+}
+
 // CreateIndex adds an index to a table.
 //
 // Index names live in one namespace per schema, as in PostgreSQL, so a name
@@ -899,4 +976,33 @@ func (c *Catalog) Tables() []*Table {
 		return cmp.Compare(a.QualifiedName(), b.QualifiedName())
 	})
 	return out
+}
+
+// dependsOnColumnName names the first stored expression that mentions the given
+// column by name, or returns the empty string when none does.
+//
+// These are the expressions the catalog keeps as syntax rather than as
+// ordinals: a CHECK predicate, a DEFAULT, and a partial index's predicate.
+// Everything else below the binder addresses a column by ordinal and so is
+// unaffected by a rename.
+func (t *Table) dependsOnColumnName(name string) string {
+	for _, c := range t.Checks {
+		if ast.ReferencesColumn(c.Expr, name) {
+			if c.Name != "" {
+				return "check constraint " + strconv.Quote(c.Name)
+			}
+			return "a check constraint"
+		}
+	}
+	for _, col := range t.Columns {
+		if col.Default != nil && ast.ReferencesColumn(col.Default, name) {
+			return "the default for column " + strconv.Quote(col.Name)
+		}
+	}
+	for _, ix := range t.Indexes {
+		if ix.Where != nil && ast.ReferencesColumn(ix.Where, name) {
+			return "the predicate of index " + strconv.Quote(ix.Name)
+		}
+	}
+	return ""
 }

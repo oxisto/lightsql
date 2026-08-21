@@ -211,6 +211,16 @@ func (p *Prepared) run(ctx context.Context, tx *storage.Tx, args []types.Value) 
 				return err
 			}
 			return exec.ExecCreateTable(p.eng.cat, s)
+		case *plan.RenameTable:
+			if err := t.CheckWritable(); err != nil {
+				return err
+			}
+			return exec.ExecRenameTable(p.eng.cat, s)
+		case *plan.RenameColumn:
+			if err := t.CheckWritable(); err != nil {
+				return err
+			}
+			return exec.ExecRenameColumn(p.eng.cat, s)
 		case *plan.CreateIndex:
 			if err := t.CheckWritable(); err != nil {
 				return err

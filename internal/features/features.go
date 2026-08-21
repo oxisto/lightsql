@@ -148,7 +148,16 @@ var Groups = []Group{
 					"does not bring the table back",
 				Setup: probeTable,
 				SQL:   "DROP TABLE t"},
-			{Name: "ALTER TABLE", Parse: Planned, Exec: Planned, SQL: "ALTER TABLE t ADD COLUMN c INT"},
+			{Name: "ALTER TABLE", Parse: Partial, Exec: Partial,
+				Note: "RENAME TO and RENAME COLUMN. A foreign key survives either, since it " +
+					"holds a table pointer and column ordinals rather than names. Adding, " +
+					"dropping or retyping a column is refused with a message saying why: all " +
+					"three change the width of every stored row, and a row version is never " +
+					"mutated once it is in the heap. Renaming a column a CHECK, a DEFAULT or " +
+					"a partial index predicate names is refused too, since those are stored " +
+					"as syntax and would be left pointing at a column that no longer exists",
+				Setup: probeTable,
+				SQL:   "ALTER TABLE t RENAME TO u"},
 			{Name: "CREATE INDEX", Parse: Yes, Exec: Partial,
 				Note: "UNIQUE and partial indexes are enforced as constraints, including a " +
 					"partial one whose predicate decides which rows it covers. A plain index " +

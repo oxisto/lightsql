@@ -362,6 +362,16 @@ type CreateTable struct {
 	IfNotExists bool
 }
 
+// RenameTable renames a table.
+type RenameTable struct {
+	Schema, From, To string
+}
+
+// RenameColumn renames one column of a table.
+type RenameColumn struct {
+	Schema, Table, From, To string
+}
+
 // CreateIndex adds an index to a table.
 type CreateIndex struct {
 	Table       *catalog.Table
@@ -461,11 +471,13 @@ type Query struct {
 	Root Node
 }
 
-func (*CreateTable) stmtNode() {}
-func (*DropTable) stmtNode()   {}
-func (*CreateIndex) stmtNode() {}
-func (*DropIndex) stmtNode()   {}
-func (*Insert) stmtNode()      {}
-func (*Update) stmtNode()      {}
-func (*Delete) stmtNode()      {}
-func (*Query) stmtNode()       {}
+func (*CreateTable) stmtNode()  {}
+func (*DropTable) stmtNode()    {}
+func (*CreateIndex) stmtNode()  {}
+func (*RenameTable) stmtNode()  {}
+func (*RenameColumn) stmtNode() {}
+func (*DropIndex) stmtNode()    {}
+func (*Insert) stmtNode()       {}
+func (*Update) stmtNode()       {}
+func (*Delete) stmtNode()       {}
+func (*Query) stmtNode()        {}
