@@ -14,15 +14,19 @@ A small, embeddable SQL engine for Go that speaks the PostgreSQL dialect and plu
 straight into `database/sql`. Run it entirely in memory for tests, or point it at a
 directory for a small file-backed deployment.
 
-> **Status: the core engine works.** `CREATE TABLE`, `INSERT`, `SELECT ... WHERE
-> ... ORDER BY ... LIMIT`, `UPDATE`, `DELETE` and `RETURNING` all run end to end
-> through `database/sql`, with `NOT NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT` and
-> `CHECK` and foreign keys enforced, and real transactions on MVCC — `Begin`,
-> `Commit` and `Rollback` work, and `sql.TxOptions` isolation levels are honoured
-> rather than ignored. Joins, aggregates and file-backed storage are not
-> implemented yet.
-> The compatibility matrix below is generated from the code, and every row is backed by
-> a probe that is actually run — see [Compatibility](#compatibility).
+> **Status: the core engine works.** DDL, `INSERT`, `UPDATE`, `DELETE`,
+> `RETURNING` and `SELECT` with joins, `GROUP BY`, subqueries and `ON CONFLICT`
+> all run end to end through `database/sql`, with `NOT NULL`, `PRIMARY KEY`,
+> `UNIQUE`, `DEFAULT`, `CHECK` and foreign keys enforced, and real transactions
+> on MVCC — `Begin`, `Commit` and `Rollback` work, and `sql.TxOptions` isolation
+> levels are honoured rather than ignored. A database can be kept in a directory
+> and survives a restart.
+> Still missing: `UNION` and its siblings, correlated subqueries, `INTERVAL`
+> arithmetic, and the `information_schema` and `pg_catalog` views that ORMs read
+> when they migrate.
+> Do not take this paragraph's word for any of it. The compatibility matrix below
+> is generated from the code, and every row is backed by a probe that is actually
+> run — see [Compatibility](#compatibility).
 
 ```go
 import (
@@ -42,6 +46,13 @@ func TestOrders(t *testing.T) {
     // ... exercise the code under test against a real SQL engine.
 }
 ```
+
+A name selects an instance **inside the current process**. Two processes opening
+`"TestOrders"` get two separate, empty databases — the name is a key in a map,
+not a path to anything shared. That is what you want for tests, where it means
+one line of setup and no cleanup. For anything that has to outlive one process,
+or be reached from more than one, point the name at a directory instead:
+`sql.Open("lightsql", "file:./demo.db")`.
 
 ## Why
 
@@ -94,9 +105,14 @@ else:
 
 ## Persistence
 
-In-memory is the source of truth. Point a data source name at a directory and each
-committed transaction is appended to a write-ahead log there first, so the database
-comes back after a restart.
+A data source name that is a plain name selects an in-memory instance held in a map
+inside the current process. Nothing about it reaches the filesystem, so a second
+process using the same name gets its own empty database rather than joining the
+first — a stronger constraint than "the data does not survive a restart", and the
+one to check a design against before building a tool that expects to share.
+
+Point the name at a directory instead and each committed transaction is appended to a
+write-ahead log there first, so the database comes back after a restart.
 
 ```go
 db, err := sql.Open("lightsql", "file:./demo.db")          // fsync on every commit
