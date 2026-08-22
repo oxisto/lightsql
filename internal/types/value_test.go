@@ -13,15 +13,13 @@ import (
 // that flows through the executor, so growing it is a real cost and should be a
 // deliberate decision rather than a side effect of adding a field.
 //
-// It has grown once, from 32 to 40, to carry an exact decimal. That was the
-// decision this test exists to force someone to make out loud, so here it is:
-// a scaled int64 would have fitted in the padding beside the kind and cost
-// nothing, and would have stopped being exact the moment two large values were
-// multiplied -- leaving a choice between an overflow error on arithmetic that is
-// mathematically fine and a wrong answer. Neither belongs in a column chosen
-// because a float was not trusted. Every other kind pays a word for it.
+// Exact decimals nearly cost it eight bytes. They do not, because a decimal
+// that fits an int64 -- a price, a quantity, a rate -- lives in the payload
+// word with its scale in the padding beside the kind, and only one too large
+// for that keeps its digits in the string field. Arbitrary precision without a
+// pointer, and without every other kind paying for it.
 func TestValueSize(t *testing.T) {
-	const want = 40
+	const want = 32
 	if got := unsafe.Sizeof(Value{}); got != want {
 		t.Errorf("unsafe.Sizeof(Value{}) = %d, want %d", got, want)
 	}

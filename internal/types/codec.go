@@ -40,8 +40,9 @@ func AppendValue(dst []byte, v Value) []byte {
 		// own encoding because that encoding is not part of any contract: the
 		// standard library is free to change it, and a log written by one
 		// version of Go has to be readable by the next.
-		dst = binary.AppendUvarint(dst, uint64(v.dec.Scale))
-		digits := v.dec.Unscaled.String()
+		d := v.AsDecimal()
+		dst = binary.AppendUvarint(dst, uint64(d.Scale))
+		digits := d.Unscaled.String()
 		dst = binary.AppendUvarint(dst, uint64(len(digits)))
 		return append(dst, digits...)
 	default:

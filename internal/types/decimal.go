@@ -2,6 +2,7 @@ package types
 
 import (
 	"math/big"
+	"strconv"
 	"strings"
 )
 
@@ -48,13 +49,6 @@ func NewDecimal(unscaled *big.Int, scale int32) *Decimal {
 func DecimalFromInt(i int64) *Decimal {
 	return &Decimal{Unscaled: big.NewInt(i), Scale: 0}
 }
-
-// Numeric returns a value holding an exact decimal.
-func Numeric(d *Decimal) Value { return Value{k: KindNumeric, dec: d} }
-
-// AsDecimal returns the decimal payload, which is only meaningful for
-// KindNumeric.
-func (v Value) AsDecimal() *Decimal { return v.dec }
 
 // pow10 returns 10^n as a big.Int. The small exponents that dominate -- a
 // column's declared scale, the difference between two scales -- come from a
@@ -166,10 +160,19 @@ func (d *Decimal) Round(scale int32) *Decimal {
 
 var bigOne = big.NewInt(1)
 
+// formatScaled renders an unscaled int64 at a scale, which is what rendering a
+// result set does to every numeric column. It avoids building a big.Int for a
+// value that never needed one.
+func formatScaled(unscaled int64, scale int32) string {
+	return placePoint(strconv.FormatInt(unscaled, 10), scale)
+}
+
 // String renders the decimal with exactly Scale digits after the point, so a
 // value declared to two places prints as 1.50 rather than 1.5.
-func (d *Decimal) String() string {
-	digits := d.Unscaled.String()
+func (d *Decimal) String() string { return placePoint(d.Unscaled.String(), d.Scale) }
+
+// placePoint inserts the decimal point into a run of digits.
+func placePoint(digits string, scale int32) string {
 	neg := strings.HasPrefix(digits, "-")
 	digits = strings.TrimPrefix(digits, "-")
 
@@ -177,19 +180,19 @@ func (d *Decimal) String() string {
 	if neg {
 		sb.WriteByte('-')
 	}
-	if d.Scale <= 0 {
+	if scale <= 0 {
 		sb.WriteString(digits)
 		return sb.String()
 	}
 	// Left-pad so that a value smaller than one still has a digit before the
 	// point: 5 at scale 2 is 0.05, not .05.
-	if int32(len(digits)) <= d.Scale {
+	if int32(len(digits)) <= scale {
 		sb.WriteString("0.")
-		sb.WriteString(strings.Repeat("0", int(d.Scale)-len(digits)))
+		sb.WriteString(strings.Repeat("0", int(scale)-len(digits)))
 		sb.WriteString(digits)
 		return sb.String()
 	}
-	cut := int32(len(digits)) - d.Scale
+	cut := int32(len(digits)) - scale
 	sb.WriteString(digits[:cut])
 	sb.WriteByte('.')
 	sb.WriteString(digits[cut:])

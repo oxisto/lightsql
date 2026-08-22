@@ -82,19 +82,16 @@ func (k Kind) IsExact() bool { return k == KindInt || k == KindNumeric }
 // exact decimal reaches for the heap.
 type Value struct {
 	k Kind
+	// scale is the number of digits after the point, for KindNumeric only. It
+	// sits here because the seven bytes between the kind and the payload word
+	// are padding either way, so carrying it costs nothing at all.
+	scale uint8
 	// n holds the payload of the scalar kinds: an int64, the bits of a float64,
 	// a bool, a day count, or a microsecond count — whichever k names.
 	n uint64
-	// s holds the payload of the string-shaped kinds: KindText and KindBytea.
+	// s holds the payload of the string-shaped kinds: KindText and KindBytea,
+	// and the digits of a decimal too large to fit in n.
 	s string
-	// dec holds an exact decimal, whose digits do not fit in a word. It is the
-	// only payload behind a pointer, and it is why Value is 40 bytes rather
-	// than 32 -- a cost paid by every kind so that one of them can be right.
-	//
-	// It is never written through once the Value holding it is in use. Values
-	// are copied constantly and share the pointer, so an operation builds a new
-	// Decimal instead.
-	dec *Decimal
 }
 
 // Null returns the SQL NULL value.
@@ -118,13 +115,14 @@ func Float(f float64) Value { return Value{k: KindFloat, n: math.Float64bits(f)}
 // Text returns a text value.
 func Text(s string) Value { return Value{k: KindText, s: s} }
 
-// decimal returns an exact decimal view of any exact numeric value, so that the
-// two exact kinds can be compared without either losing anything.
-func (v Value) decimal() *Decimal {
+// exactNumeric views an integer as a numeric so that the two exact kinds meet
+// on one representation, keeping an int-versus-numeric comparison on the fast
+// path rather than building a big.Int for it.
+func (v Value) exactNumeric() Value {
 	if v.k == KindNumeric {
-		return v.dec
+		return v
 	}
-	return DecimalFromInt(v.AsInt())
+	return Value{k: KindNumeric, n: v.n}
 }
 
 // Bytea returns a byte string value. The bytes are copied into an immutable
@@ -200,7 +198,7 @@ func (v Value) AsBool() bool { return v.n != 0 }
 // wrapping.
 func (v Value) AsInt() int64 {
 	if v.k == KindNumeric {
-		i, _ := v.dec.Int64()
+		i, _ := v.AsDecimal().Int64()
 		return i
 	}
 	return int64(v.n)
@@ -213,7 +211,10 @@ func (v Value) AsFloat() float64 {
 	case KindInt:
 		return float64(int64(v.n))
 	case KindNumeric:
-		return v.dec.Float64()
+		if unscaled, scale, ok := v.smallDecimal(); ok {
+			return float64(unscaled) / math.Pow(10, float64(scale))
+		}
+		return v.AsDecimal().Float64()
 	default:
 		return math.Float64frombits(v.n)
 	}
@@ -250,7 +251,7 @@ func (v Value) String() string {
 	case KindFloat:
 		return strconv.FormatFloat(v.AsFloat(), 'g', -1, 64)
 	case KindNumeric:
-		return v.dec.String()
+		return v.numericString()
 	case KindBytea:
 		// Rendered as PostgreSQL renders it, which is also the form ParseBytea
 		// reads back. Returning the raw bytes would put unprintable characters
@@ -295,7 +296,7 @@ func Compare(a, b Value) int {
 			// to its own neighbours, which is the whole thing a decimal column
 			// was chosen to avoid.
 			if a.k.IsExact() && b.k.IsExact() {
-				return a.decimal().Cmp(b.decimal())
+				return cmpNumeric(a.exactNumeric(), b.exactNumeric())
 			}
 			return cmpFloat(a.AsFloat(), b.AsFloat())
 		}
@@ -305,7 +306,7 @@ func Compare(a, b Value) int {
 	case KindBool:
 		return cmp.Compare(a.n, b.n)
 	case KindNumeric:
-		return a.dec.Cmp(b.dec)
+		return cmpNumeric(a, b)
 	case KindFloat:
 		return cmpFloat(a.AsFloat(), b.AsFloat())
 	case KindText, KindBytea, KindJSON, KindJSONB:
@@ -398,11 +399,12 @@ func (v Value) Hash(h *maphash.Hash) {
 		// Compare finding them equal and Hash disagreeing cannot happen. A
 		// decimal that is a whole number takes the integer path; anything else
 		// takes the float one, bit for bit as KindFloat does.
-		if i, ok := v.dec.Int64(); ok && v.dec.Round(0).Cmp(v.dec) == 0 {
+		d := v.AsDecimal()
+		if i, ok := d.Int64(); ok && d.Round(0).Cmp(d) == 0 {
 			writeUint64(h, uint64(i))
 			return
 		}
-		writeUint64(h, math.Float64bits(v.dec.Float64()))
+		writeUint64(h, math.Float64bits(d.Float64()))
 	default:
 		writeUint64(h, v.n)
 	}

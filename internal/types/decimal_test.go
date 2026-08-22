@@ -269,3 +269,118 @@ func TestNumericCasts(t *testing.T) {
 		t.Error("casting nonsense to numeric succeeded")
 	}
 }
+
+// bigForm returns the same value in the representation used for decimals too
+// large to inline, so a case can be run down both paths.
+//
+// It reaches past the constructor deliberately. Numeric picks the small form
+// whenever it can, which is the whole point of it, so there is no other way to
+// ask for the large one.
+func bigForm(v Value) Value {
+	d := v.AsDecimal()
+	return Value{k: KindNumeric, scale: scaleTag, s: encodeDecimal(d)}
+}
+
+// TestDecimalPathsAgree is the guard against the one thing that hybrid storage
+// can get wrong. A decimal lives in the payload word when it fits and in the
+// string field when it does not, and every operation has a fast path for the
+// first case. If those two paths ever disagree, the answer depends on how large
+// the number happened to be -- which is the most confusing possible bug, and
+// invisible to a test that only ever exercises small values.
+//
+// So every case runs four times: both small, both large, and one of each.
+func TestDecimalPathsAgree(t *testing.T) {
+	operands := []string{
+		"0", "1", "-1", "0.5", "1.50", "-2.25", "100", "0.001",
+		"9223372036854.775807", "-9223372036854.775807",
+		// Past int64 even before scaling, so this one is never inline.
+		"123456789012345678901234567890.12345",
+	}
+	ops := []struct {
+		name string
+		fn   func(a, b Value) Value
+	}{
+		{"add", AddNumeric},
+		{"sub", SubNumeric},
+		{"mul", MulNumeric},
+	}
+
+	for _, as := range operands {
+		for _, bs := range operands {
+			a := Numeric(mustDec(t, as))
+			b := Numeric(mustDec(t, bs))
+
+			for _, op := range ops {
+				t.Run(op.name+" "+as+" "+bs, func(t *testing.T) {
+					want := op.fn(bigForm(a), bigForm(b)).String()
+					for _, pair := range []struct{ x, y Value }{
+						{a, b}, {bigForm(a), b}, {a, bigForm(b)},
+					} {
+						if got := op.fn(pair.x, pair.y).String(); got != want {
+							t.Errorf("%s(%s, %s) = %s down one path and %s down the other",
+								op.name, as, bs, got, want)
+						}
+					}
+				})
+			}
+
+			t.Run("cmp "+as+" "+bs, func(t *testing.T) {
+				want := Compare(bigForm(a), bigForm(b))
+				for _, pair := range []struct{ x, y Value }{
+					{a, b}, {bigForm(a), b}, {a, bigForm(b)},
+				} {
+					if got := Compare(pair.x, pair.y); got != want {
+						t.Errorf("Compare(%s, %s) = %d down one path and %d down the other",
+							as, bs, got, want)
+					}
+				}
+			})
+
+			t.Run("hash "+as+" "+bs, func(t *testing.T) {
+				// Two spellings of one value must hash alike, or a GROUP BY
+				// splits a number across two groups depending on its size.
+				seed := maphash.MakeSeed()
+				hash := func(v Value) uint64 {
+					var h maphash.Hash
+					h.SetSeed(seed)
+					v.Hash(&h)
+					return h.Sum64()
+				}
+				if hash(a) != hash(bigForm(a)) {
+					t.Errorf("%s hashes differently inline and out of line", as)
+				}
+			})
+		}
+	}
+}
+
+// TestDecimalOverflowFallsBack pins that arithmetic which does not fit an int64
+// produces the right answer rather than a wrapped one. Wrapping here would turn
+// a large positive amount into a large negative one, silently, which is the
+// exact failure the fast path has to be trusted not to have.
+func TestDecimalOverflowFallsBack(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b string
+		op   func(a, b Value) Value
+		want string
+	}{
+		{"add past the top", "9223372036854775807", "1", AddNumeric, "9223372036854775808"},
+		{"subtract past the bottom", "-9223372036854775808", "1", SubNumeric, "-9223372036854775809"},
+		{"multiply well past", "9223372036854775807", "2", MulNumeric, "18446744073709551614"},
+		// Aligning the scales overflows before the addition can.
+		{"widening overflows", "9223372036854775.807", "0.000000001", AddNumeric,
+			"9223372036854775.807000001"},
+		// The scales add past what a small value may carry.
+		{"scale grows past the limit", "0.000000001", "0.0000000001", MulNumeric,
+			"0.0000000000000000001"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.op(Numeric(mustDec(t, tt.a)), Numeric(mustDec(t, tt.b)))
+			if got.String() != tt.want {
+				t.Errorf("got %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
