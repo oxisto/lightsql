@@ -1,6 +1,8 @@
 package driver
 
 import (
+	"context"
+	"database/sql/driver"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -166,6 +168,24 @@ func parseBool(s string) (bool, error) {
 		return b, nil
 	}
 }
+
+// NewEngineConnector returns a connector for an engine the caller already has.
+//
+// It exists for a database that is not in the registry and must not be: one
+// opened to look at the past, which has no data source name because nothing
+// else should ever reach it. Everything above the driver still goes through
+// database/sql as usual.
+func NewEngineConnector(e *engine.Engine) driver.Connector {
+	return &engineConnector{engine: e}
+}
+
+type engineConnector struct{ engine *engine.Engine }
+
+func (c *engineConnector) Connect(context.Context) (driver.Conn, error) {
+	return &Conn{eng: c.engine}, nil
+}
+
+func (c *engineConnector) Driver() driver.Driver { return Driver{} }
 
 // Drop releases an instance and everything in it.
 //

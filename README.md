@@ -167,6 +167,7 @@ db, err := sql.Open("lightsql", "file:./demo.db?fsync=off") // faster, loses the
 demo.db/
   LOCK             flock'd, so only one process opens the directory
   wal              every committed change, oldest first
+  wal.old          the log as it was before the last compaction
 ```
 
 The log is logical — row values and the text of DDL statements — rather than physical
@@ -195,6 +196,39 @@ clean up. To look at a database that something else has open, copy the directory
 One limit worth knowing: the log is compacted only when the database is closed, so a
 process that is killed rather than shut down leaves a log that keeps growing across runs.
 Nothing is lost — recovery is unaffected — it just takes longer to open.
+
+## Undoing a mistake
+
+Compacting throws away the history that produced the current state, which is the point of
+it and also a one-way door: a table dropped by accident is recoverable from the log right
+up until the database is closed, and closing is what compacts. A clean shutdown used to
+destroy more than a crash would.
+
+So the log a compaction replaces is kept as `wal.old`, and closing a database that has not
+been written to does not compact at all — otherwise the first thing anyone does after
+noticing a mistake, which is open the database and look, would replace the history they
+came for.
+
+Recovering is three steps. **Copy first, and copy again for each attempt**: opening a
+rescue directory the ordinary way compacts it on close, which is the same door.
+
+```sh
+cp demo.db/wal.old /tmp/rescue.db/wal      # a whole log, so a directory of its own
+
+lightsql -history /tmp/rescue.db           # what happened, numbered
+  1  CREATE TABLE keep (id INT PRIMARY KEY)
+  2  CREATE TABLE lost (id INT PRIMARY KEY, note TEXT)
+  3  DROP TABLE lost                        # <- the one that did the damage
+
+lightsql -at 2 /tmp/rescue.db              # the database as it was before it
+```
+
+Replaying the whole log is not enough on its own: the history contains the mistake, so it
+gets applied again. `-at` stops before it. That database is read-only and never compacts,
+so looking at the past cannot become the present.
+
+One generation is kept, which survives one compaction. It is a window for noticing, not a
+backup — take those too.
 
 This means the working set must fit in memory. That is a deliberate trade for the
 target use cases, not an oversight.
@@ -317,7 +351,7 @@ the two.
 | ✅ | PostgreSQL parity suite | ✅ | ✅ | compat/parity runs the same SQL against lightsql and a real PostgreSQL and compares result sets and SQLSTATEs over two hundred cases; a difference that is understood is recorded rather than deleted, and fails if the two ever agree |
 | ✅ | Command-line shell | ✅ | ✅ | cmd/lightsql opens a database directory and runs SQL, with table, CSV and JSON output, .tables and .schema over the catalog views, and transactions as shell commands since the engine has no BEGIN statement |
 | ✅ | SQLSTATE on every error | ✅ | ✅ | errors satisfy interface{ SQLState() string }, as pgx and lib/pq do |
-| 🟡 | File-backed storage | ✅ | 🟡 | write-ahead log, fsync on commit, compacted at close; open with file:./demo.db. A second process opening the same directory is refused rather than allowed to corrupt it, and the lock is released by the operating system however the holder exits, so a crash leaves nothing stale |
+| 🟡 | File-backed storage | ✅ | 🟡 | write-ahead log, fsync on commit, compacted at close; open with file:./demo.db. A second process opening the same directory is refused rather than allowed to corrupt it, and the lock is released by the operating system however the holder exits, so a crash leaves nothing stale. The log a compaction replaces is kept as wal.old, and lightsql -history and -at read it to recover from a mistaken schema change |
 | | **Lexical** | | | |
 | ✅ | Comments | ✅ | ✅ | -- to end of line, and nestable /* */ |
 | ✅ | Quoted identifiers | ✅ | ✅ | case preserving, doubled quote escapes |

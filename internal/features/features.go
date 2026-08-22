@@ -499,7 +499,8 @@ var Groups = []Group{
 					"file:./demo.db. A second process opening the same directory is refused " +
 					"rather than allowed to corrupt it, and the lock is released by the " +
 					"operating system however the holder exits, so a crash leaves nothing " +
-					"stale"},
+					"stale. The log a compaction replaces is kept as wal.old, and lightsql " +
+					"-history and -at read it to recover from a mistaken schema change"},
 		},
 	},
 	{

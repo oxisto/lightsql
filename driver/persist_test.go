@@ -5,10 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
 	lightsqldriver "github.com/oxisto/lightsql/driver"
+	"github.com/oxisto/lightsql/internal/engine"
 )
 
 // onDisk returns a database in a directory of its own, together with a function
@@ -474,6 +476,104 @@ func TestConcurrentCommitsAllReachTheLog(t *testing.T) {
 	again, _ := onDisk(t, dir)
 	assertRows(t, scanStrings(t, again, `SELECT count(*) FROM t`),
 		[]string{strconv.Itoa(writers * each)})
+}
+
+// TestDroppedTableSurvivesInThePreviousLog is the scenario this exists for,
+// written out end to end because a description of it does not carry the sting.
+//
+// A table is dropped by mistake. The process is stopped -- which is the right
+// instinct, and is the advice anyone would give -- and stopping it checkpoints,
+// which rewrites the log as the state after the drop. The rows were recoverable
+// right up until the shutdown, and the shutdown is what removed them: a clean
+// exit destroyed more than a crash would have.
+//
+// The superseded log is now kept beside the live one, so the window between a
+// mistake and noticing it survives one shutdown.
+func TestDroppedTableSurvivesInThePreviousLog(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "demo.db")
+
+	db, shut := onDisk(t, dir)
+	mustExec(t, db, `CREATE TABLE keep (id INT PRIMARY KEY)`)
+	mustExec(t, db, `CREATE TABLE lost (id INT PRIMARY KEY, note TEXT)`)
+	mustExec(t, db, `INSERT INTO keep VALUES (1)`)
+	mustExec(t, db, `INSERT INTO lost VALUES (1, 'one'), (2, 'two'), (3, 'three')`)
+	// The mistake.
+	mustExec(t, db, `DROP TABLE lost`)
+	// And the instinct that used to make it permanent.
+	shut()
+
+	// The live database is as the drop left it: the table is gone.
+	live, liveShut := onDisk(t, dir)
+	if _, err := live.Exec(`SELECT count(*) FROM lost`); err == nil {
+		t.Fatal("the dropped table is still in the live database")
+	}
+	assertRows(t, scanStrings(t, live, `SELECT id FROM keep`), []string{"1"})
+	liveShut()
+
+	// The rows are in the superseded log, which is a whole log: copied into a
+	// directory of its own it opens like any other database. That copy is the
+	// documented recipe, and it is what someone recovering will actually do.
+	rescue := filepath.Join(t.TempDir(), "rescue.db")
+	if err := os.MkdirAll(rescue, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "wal.old"))
+	if err != nil {
+		t.Fatalf("the previous log was not kept: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rescue, "wal"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two copies, deliberately. Opening a rescue directory the ordinary way
+	// checkpoints it on close, which rewrites it as the state after the drop --
+	// destroying the history being recovered from. Writing this test the
+	// obvious way reproduced exactly that, which is a fair warning about how
+	// easy the mistake is: every attempt gets its own copy.
+	doomed := filepath.Join(t.TempDir(), "doomed.db")
+	if err := os.MkdirAll(doomed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doomed, "wal"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replaying all of it re-applies the drop: the history contains the
+	// mistake. Recovery has to stop before the statement that did the damage,
+	// which is why keeping the log was only half the fix.
+	replayed, replayedShut := onDisk(t, doomed)
+	if _, err := replayed.Exec(`SELECT count(*) FROM lost`); err == nil {
+		t.Error("replaying the whole history did not re-apply the drop")
+	}
+	replayedShut()
+
+	stmts, err := engine.SchemaHistory(rescue)
+	if err != nil {
+		t.Fatalf("reading the schema history: %v", err)
+	}
+	// The drop is the last of them, so the state to recover is the one before.
+	before := len(stmts) - 1
+	if got := stmts[before]; !strings.Contains(strings.ToUpper(got), "DROP TABLE LOST") {
+		t.Fatalf("the last schema statement is %q, want the drop", got)
+	}
+
+	eng, err := engine.OpenAt(rescue, before)
+	if err != nil {
+		t.Fatalf("opening before the drop: %v", err)
+	}
+	defer eng.Close()
+	recovered := sql.OpenDB(lightsqldriver.NewEngineConnector(eng))
+	defer recovered.Close()
+
+	assertRows(t, scanStrings(t, recovered, `SELECT note FROM lost ORDER BY id`),
+		[]string{"one", "two", "three"})
+
+	// Looking at the past cannot become the present: the recovered database
+	// refuses writes, so a stray statement cannot turn a rescue into a second
+	// incident.
+	if _, err := recovered.Exec(`DELETE FROM lost`); err == nil {
+		t.Error("a database opened for recovery accepted a write")
+	}
 }
 
 // logSize reports how large the write-ahead log is.

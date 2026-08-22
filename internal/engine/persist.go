@@ -27,12 +27,44 @@ import (
 // acknowledged transaction, which is why it is what a file-backed database
 // gets by default.
 func Open(dir string, fsync bool) (*Engine, error) {
+	return open(dir, fsync, allSchema)
+}
+
+// allSchema means replay the log to the end.
+const allSchema = -1
+
+// OpenAt opens a database replaying only the first n schema statements.
+//
+// This is for getting back what a schema statement destroyed. Keeping the
+// superseded log is not enough on its own, because the history it holds
+// contains the mistake: replaying all of it drops the table again. Stopping
+// before the statement that did the damage is what actually recovers the rows.
+//
+// The database it produces is a view of the past and must not become the
+// present, so it is opened read-only and never checkpoints. Closing it would
+// otherwise write the truncated history back as the whole truth, which is the
+// same one-way door this exists to prop open, in a worse place.
+func OpenAt(dir string, n int) (*Engine, error) {
+	e, err := open(dir, false, n)
+	if err != nil {
+		return nil, err
+	}
+	e.readOnly = true
+	// Nothing may be written to a database opened this way, so the journal is
+	// left off: a statement that tried would otherwise append to the log being
+	// examined.
+	e.mgr.SetJournal(nil)
+	return e, nil
+}
+
+func open(dir string, fsync bool, stopAfter int) (*Engine, error) {
 	log, err := wal.Open(dir, fsync)
 	if err != nil {
 		return nil, err
 	}
 
 	e := New()
+	e.stopAfter = stopAfter
 	if err := e.recover(log); err != nil {
 		_ = log.Close()
 		return nil, err
@@ -40,6 +72,30 @@ func Open(dir string, fsync bool) (*Engine, error) {
 	e.log = log
 	e.mgr.SetJournal(log)
 	return e, nil
+}
+
+// SchemaHistory lists the schema statements in a database's log, in the order
+// they were applied.
+//
+// It is what someone recovering reads first: the position of the statement that
+// did the damage is the number to hand to OpenAt.
+func SchemaHistory(dir string) ([]string, error) {
+	log, err := wal.Open(dir, false)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = log.Close() }()
+
+	var out []string
+	err = log.Replay(func(recs []wal.Record) error {
+		for i := range recs {
+			if recs[i].Kind == wal.DDL {
+				out = append(out, recs[i].SQL)
+			}
+		}
+		return nil
+	})
+	return out, err
 }
 
 // Checkpoint rewrites the log as the database's current state rather than the
@@ -85,7 +141,12 @@ func (e *Engine) Close() error {
 	if e.log == nil {
 		return nil
 	}
-	err := e.Checkpoint()
+	// A database opened to look at the past never compacts: writing a truncated
+	// history back as the whole truth would destroy the rest of it.
+	var err error
+	if !e.readOnly {
+		err = e.Checkpoint()
+	}
 	e.mgr.SetJournal(nil)
 	log := e.log
 	e.log = nil
@@ -143,16 +204,28 @@ func (e *Engine) recover(log *wal.Log) error {
 func (e *Engine) apply(ctx context.Context, tx *storage.Tx, rec *wal.Record, rows map[*catalog.Table]map[uint64][]types.Value) error {
 	switch rec.Kind {
 	case wal.DDL:
+		if e.stopAfter != allSchema && e.applied >= e.stopAfter {
+			// Recovery has reached the point it was asked to stop at. Later
+			// schema statements are skipped, and so is everything that depends
+			// on them -- a row inserted into a table this replay never created
+			// has nowhere to go, which the Insert case below reports as the
+			// unknown relation it is.
+			return nil
+		}
 		if _, err := e.ExecBatch(ctx, tx, rec.SQL, nil); err != nil {
 			return pgerr.Newf(pgerr.DataCorrupted,
 				"replaying %q from the write-ahead log: %v", rec.SQL, err)
 		}
+		e.applied++
 		e.rememberSchema(*rec)
 		return nil
 
 	case wal.Missing:
 		t, err := e.cat.LookupQualified(rec.Table)
 		if err != nil {
+			if e.stopAfter != allSchema {
+				return nil
+			}
 			return err
 		}
 		if err := t.SetMissing(int(rec.Column), rec.Vals[0]); err != nil {
@@ -164,6 +237,13 @@ func (e *Engine) apply(ctx context.Context, tx *storage.Tx, rec *wal.Record, row
 	case wal.Insert:
 		t, err := e.cat.LookupQualified(rec.Table)
 		if err != nil {
+			if e.stopAfter != allSchema {
+				// A partial replay legitimately has rows for tables it did not
+				// create, and for tables a later statement renamed. Skipping
+				// them is the point; failing would make recovery impossible
+				// for the one case it exists to serve.
+				return nil
+			}
 			return err
 		}
 		held, ok := rows[t]
@@ -177,6 +257,9 @@ func (e *Engine) apply(ctx context.Context, tx *storage.Tx, rec *wal.Record, row
 	default:
 		t, err := e.cat.LookupQualified(rec.Table)
 		if err != nil {
+			if e.stopAfter != allSchema {
+				return nil
+			}
 			return err
 		}
 		delete(rows[t], rec.Row)

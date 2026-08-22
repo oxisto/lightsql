@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -370,5 +371,185 @@ func TestLockSurvivesACheckpoint(t *testing.T) {
 	_, got := openAt(t, dir)
 	if len(got) != 2 {
 		t.Errorf("replayed %d transactions, want the checkpoint and the write after it", len(got))
+	}
+}
+
+// TestCheckpointKeepsThePreviousLog is the fix for a one-way door.
+//
+// Compacting is what makes a dropped table unrecoverable, and closing is what
+// compacts -- so shutting a database down cleanly destroyed history that a
+// crash would have left intact. That is backwards, and it cost someone a
+// hundred and seventy-six rows: they stopped the process to preserve the
+// evidence, and stopping it was what removed the evidence.
+func TestCheckpointKeepsThePreviousLog(t *testing.T) {
+	dir := t.TempDir()
+
+	l, _ := openAt(t, dir)
+	history := [][]Record{
+		{DDLRecord("create table t (a int)")},
+		{InsertRecord("public.t", 1, []types.Value{types.Int(1)})},
+		{InsertRecord("public.t", 2, []types.Value{types.Int(2)})},
+	}
+	for _, tx := range history {
+		if err := l.Write(tx); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	// A checkpoint describing a state in which the table is gone, which is what
+	// closing after a DROP TABLE produces.
+	if err := l.Checkpoint([]Record{DDLRecord("create table other (a int)")}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The live log is the compacted one.
+	_, now := openAt(t, dir)
+	if len(now) != 1 {
+		t.Fatalf("the live log holds %d transactions, want the checkpoint", len(now))
+	}
+
+	// The history is still there under the other name, and is a whole log: a
+	// copy of it into a directory of its own opens and replays.
+	old := t.TempDir()
+	data, err := os.ReadFile(filepath.Join(dir, PreviousName))
+	if err != nil {
+		t.Fatalf("reading the previous log: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(old, Name), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, recovered := openAt(t, old)
+	assertLog(t, recovered, history)
+}
+
+// TestIdleCloseKeepsTheGeneration pins what makes one generation enough to be
+// useful. Opening a database and closing it again without writing anything must
+// leave both files alone -- otherwise the first thing anyone does after
+// noticing a mistake, which is open the database to look at it, replaces the
+// history they came for with the state they already have.
+func TestIdleCloseKeepsTheGeneration(t *testing.T) {
+	dir := t.TempDir()
+
+	l, _ := openAt(t, dir)
+	if err := l.Write([]Record{DDLRecord("create table t (a int)")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Checkpoint([]Record{DDLRecord("create table gone (a int)")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	kept, err := os.ReadFile(filepath.Join(dir, PreviousName))
+	if err != nil {
+		t.Fatalf("the previous log was not kept: %v", err)
+	}
+
+	// Open, read nothing, close. Twice, since a mistake is rarely noticed on
+	// the first look.
+	for range 2 {
+		again, _ := openAt(t, dir)
+		if err := again.Checkpoint([]Record{DDLRecord("create table gone (a int)")}); err != nil {
+			t.Fatalf("Checkpoint: %v", err)
+		}
+		if err := again.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now, err := os.ReadFile(filepath.Join(dir, PreviousName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(kept, now) {
+		t.Error("looking at the database replaced the history it was kept for")
+	}
+}
+
+// TestCheckpointKeepsOnlyOneGeneration pins the bound. Keeping every generation
+// would grow without limit, and the window that matters is the one between a
+// mistake and someone noticing it.
+//
+// The generation rotates only when something was actually written, so a run of
+// checkpoints does not walk the history off the end: two writes give two
+// rotations, and the kept copy is the one the second replaced.
+func TestCheckpointKeepsOnlyOneGeneration(t *testing.T) {
+	dir := t.TempDir()
+
+	l, _ := openAt(t, dir)
+	for _, table := range []string{"first", "second"} {
+		if err := l.Write([]Record{DDLRecord("create table " + table + " (a int)")}); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Checkpoint([]Record{DDLRecord("checkpoint after " + table)}); err != nil {
+			t.Fatalf("checkpoint after %s: %v", table, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	old := t.TempDir()
+	data, err := os.ReadFile(filepath.Join(dir, PreviousName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(old, Name), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, recovered := openAt(t, old)
+	// What the second checkpoint replaced: the first checkpoint's own content
+	// followed by the write that came after it.
+	if len(recovered) != 2 || recovered[0][0].SQL != "checkpoint after first" {
+		t.Errorf("the kept generation is %v, want the one the last checkpoint replaced", recovered)
+	}
+}
+
+// TestPreviousLogDoesNotDisturbRecovery pins that the extra file is inert: it
+// is not read, not truncated, and not mistaken for the log.
+func TestPreviousLogDoesNotDisturbRecovery(t *testing.T) {
+	dir := t.TempDir()
+
+	l, _ := openAt(t, dir)
+	if err := l.Write([]Record{DDLRecord("create table t (a int)")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Checkpoint([]Record{DDLRecord("create table t (a int)")}); err != nil {
+		t.Fatal(err)
+	}
+	next := []Record{InsertRecord("public.t", 1, []types.Value{types.Int(1)})}
+	if err := l.Write(next); err != nil {
+		t.Fatalf("writing after a checkpoint: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, got := openAt(t, dir)
+	assertLog(t, got, [][]Record{{DDLRecord("create table t (a int)")}, next})
+
+	before, err := os.Stat(filepath.Join(dir, PreviousName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reopening must not touch it. The directory has to be released first --
+	// the lock refuses a second opener, which is #62 working as intended.
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := openAt(t, dir)
+	if err := again.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(filepath.Join(dir, PreviousName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() != after.Size() {
+		t.Errorf("the previous log changed size on reopen: %d then %d", before.Size(), after.Size())
 	}
 }
