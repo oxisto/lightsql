@@ -277,7 +277,7 @@ the two.
 | ✅ | CAST | ✅ | ✅ | both CAST(x AS t) and x::t |
 | 🟡 | Scalar functions | ✅ | 🟡 | coalesce, nullif, now, lower, upper, length, octet_length, trim, abs and round. length counts characters of text and bytes of bytea, as PostgreSQL does for each, while octet_length always counts bytes. NULL propagates for all but coalesce and nullif, and coalesce stops at the first argument that answers. Argument types are checked at bind time, so lower(1) is rejected rather than reading an integer as text. The library is small and grows on demand |
 | ❌ | Arrays | ❌ | ❌ | out of scope for v1 |
-| ✅ | JSONB | ✅ | ✅ | canonicalised on store; scans as []byte |
+| ✅ | JSONB | ✅ | ✅ | canonicalised on store the way PostgreSQL canonicalises it: keys ordered by length then bytewise, a space after each colon and comma, and numbers read as numeric so 1e2 becomes 100 while 1.50 keeps its zero. Scans as []byte |
 | ✅ | JSON | ✅ | ✅ | kept exactly as written, unlike jsonb |
 | | **Types** | | | |
 | ✅ | Integer types | ✅ | ✅ | SMALLINT, INT, BIGINT stored as int64 |
@@ -305,7 +305,7 @@ the two.
 | 🟡 | information_schema | ✅ | 🟡 | tables, columns, table_constraints and key_column_usage, computed from the catalog on read rather than stored. The column lists are a subset of PostgreSQL's -- the ones tools actually read -- and every text column is text rather than a domain such as sql_identifier, since nothing would enforce the domain's constraint. Writing to one is refused rather than ignored. Unqualified names do not reach it, as in PostgreSQL |
 | 🟡 | pg_catalog | ✅ | 🟡 | pg_tables, pg_namespace, pg_class and pg_attribute, computed the same way. An unqualified name finds them, as PostgreSQL's implicit search_path does, which is what lets a migration tool ask FROM pg_tables whether its version table exists. oid columns are positions in a sorted list, stable only for as long as the set of tables is |
 | ✅ | Context cancellation | ✅ | ✅ | checked inside the operator loop, so a running query stops |
-| ✅ | PostgreSQL parity suite | ✅ | ✅ | compat/parity runs the same SQL against lightsql and a real PostgreSQL and compares result sets and SQLSTATEs; a difference that is understood is recorded rather than deleted, and fails if the two ever agree |
+| ✅ | PostgreSQL parity suite | ✅ | ✅ | compat/parity runs the same SQL against lightsql and a real PostgreSQL and compares result sets and SQLSTATEs over two hundred cases; a difference that is understood is recorded rather than deleted, and fails if the two ever agree |
 | ✅ | Command-line shell | ✅ | ✅ | cmd/lightsql opens a database directory and runs SQL, with table, CSV and JSON output, .tables and .schema over the catalog views, and transactions as shell commands since the engine has no BEGIN statement |
 | ✅ | SQLSTATE on every error | ✅ | ✅ | errors satisfy interface{ SQLState() string }, as pgx and lib/pq do |
 | 🟡 | File-backed storage | ✅ | 🟡 | write-ahead log, fsync on commit, compacted at close; open with file:./demo.db |

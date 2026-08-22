@@ -2,9 +2,13 @@ package types
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -81,16 +85,109 @@ func canonicalJSON(text string) (string, error) {
 		return "", &ErrJSON{Text: text, Detail: "unexpected trailing data"}
 	}
 
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	// HTML escaping would turn < and & into < and &, which is a
-	// display concern that has no business changing a stored value.
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
+	var b strings.Builder
+	if err := writeCanonical(&b, v); err != nil {
 		return "", &ErrJSON{Text: text, Detail: err.Error()}
 	}
+	return b.String(), nil
+}
+
+// writeCanonical emits a decoded document the way PostgreSQL emits jsonb.
+//
+// The standard library's encoder is close but not the same, and the three
+// differences are all visible to anyone who casts a jsonb to text:
+//
+//   - PostgreSQL puts a space after each colon and comma.
+//   - It orders object keys by length first and then bytewise, so a, z, bb,
+//     ccc rather than a, bb, ccc, z. Sorting only bytewise looks equally
+//     canonical and is a different order.
+//   - It reads a number as numeric and re-emits it, so 1e2 becomes 100 while
+//     1.50 stays 1.50. The exponent is not part of the stored value.
+func writeCanonical(b *strings.Builder, v any) error {
+	switch v := v.(type) {
+	case nil:
+		b.WriteString("null")
+	case bool:
+		if v {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	case json.Number:
+		b.WriteString(canonicalNumber(string(v)))
+	case string:
+		return writeJSONString(b, v)
+	case []any:
+		b.WriteByte('[')
+		for i, e := range v {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if err := writeCanonical(b, e); err != nil {
+				return err
+			}
+		}
+		b.WriteByte(']')
+	case map[string]any:
+		keys := slices.SortedFunc(maps.Keys(v), compareJSONKeys)
+		b.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if err := writeJSONString(b, k); err != nil {
+				return err
+			}
+			b.WriteString(": ")
+			if err := writeCanonical(b, v[k]); err != nil {
+				return err
+			}
+		}
+		b.WriteByte('}')
+	default:
+		return fmt.Errorf("unexpected %T in a decoded document", v)
+	}
+	return nil
+}
+
+// compareJSONKeys orders object keys as PostgreSQL does: shorter first, and
+// bytewise within a length.
+func compareJSONKeys(a, b string) int {
+	if d := cmp.Compare(len(a), len(b)); d != 0 {
+		return d
+	}
+	return cmp.Compare(a, b)
+}
+
+// canonicalNumber re-renders a JSON number the way PostgreSQL does, which is as
+// a numeric: the exponent is folded in and trailing zeros are kept, so 1e2 is
+// 100 and 1.50 stays 1.50.
+//
+// Text that will not parse as a decimal is left alone rather than dropped. The
+// JSON decoder has already accepted it as a number, so refusing it here would
+// reject a document over a disagreement between two parsers.
+func canonicalNumber(text string) string {
+	d, err := ParseDecimal(text)
+	if err != nil {
+		return text
+	}
+	return d.String()
+}
+
+// writeJSONString quotes a string, escaping only what JSON requires.
+//
+// HTML escaping would turn < and & into \u003c and \u0026, which is a display
+// concern that has no business changing a stored value.
+func writeJSONString(b *strings.Builder, s string) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		return err
+	}
 	// Encode appends a newline.
-	return strings.TrimSuffix(buf.String(), "\n"), nil
+	b.WriteString(strings.TrimSuffix(buf.String(), "\n"))
+	return nil
 }
 
 // JSONField implements the -> operator: the member or element at key, as JSON.

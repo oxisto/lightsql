@@ -11,21 +11,32 @@ func TestParseJSONBCanonicalises(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"key order is normalised", `{"b":1,"a":2}`, `{"a":2,"b":1}`},
-		{"whitespace is dropped", "{ \"a\" :\n 1 }", `{"a":1}`},
-		{"nested objects sort too", `{"b":{"z":1,"y":2}}`, `{"b":{"y":2,"z":1}}`},
+		// The rendered form is PostgreSQL's, down to the space after each colon
+		// and comma. The parity suite compares this text directly, so a tidier
+		// spacing of our own would be a difference visible to anyone who casts
+		// a jsonb to text.
+		{"key order is normalised", `{"b":1,"a":2}`, `{"a": 2, "b": 1}`},
+		// Keys sort by length first and then bytewise, which is PostgreSQL's
+		// order and not the plain bytewise one encoding/json produces.
+		{"shorter keys sort first", `{"bb":1,"a":2,"ccc":3,"z":4}`, `{"a": 2, "z": 4, "bb": 1, "ccc": 3}`},
+		{"whitespace is dropped", "{ \"a\" :\n 1 }", `{"a": 1}`},
+		{"nested objects sort too", `{"b":{"z":1,"y":2}}`, `{"b": {"y": 2, "z": 1}}`},
 		// A later duplicate wins, which is what encoding/json does on decode and
 		// what PostgreSQL's jsonb does on input.
-		{"duplicate keys collapse", `{"a":1,"a":2}`, `{"a":2}`},
+		{"duplicate keys collapse", `{"a":1,"a":2}`, `{"a": 2}`},
 		// Array order is data, not formatting, so it must survive.
-		{"array order is preserved", `[3,1,2]`, `[3,1,2]`},
+		{"array order is preserved", `[3,1,2]`, `[3, 1, 2]`},
 		{"scalars are documents", `42`, `42`},
 		{"strings stay quoted", `"x"`, `"x"`},
+		// A number is read as a numeric and re-emitted, so the exponent is
+		// folded in while trailing zeros stay -- again as PostgreSQL does.
+		{"exponents are folded in", `{"e":1e2}`, `{"e": 100}`},
+		{"trailing zeros are kept", `{"n":1.50}`, `{"n": 1.50}`},
 		// A large integer must not round-trip through float64. Without
 		// UseNumber this comes back as 1.2345678901234568e+18.
-		{"big integers keep precision", `{"n":1234567890123456789}`, `{"n":1234567890123456789}`},
+		{"big integers keep precision", `{"n":1234567890123456789}`, `{"n": 1234567890123456789}`},
 		// HTML escaping is a display concern and must not alter a stored value.
-		{"angle brackets are not escaped", `{"h":"<a>&b"}`, `{"h":"<a>&b"}`},
+		{"angle brackets are not escaped", `{"h":"<a>&b"}`, `{"h": "<a>&b"}`},
 	}
 
 	for _, tt := range tests {
@@ -256,7 +267,7 @@ func TestCastToJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.AsString() != `{"a":2,"b":1}` {
+	if v.AsString() != `{"a": 2, "b": 1}` {
 		t.Errorf("text::jsonb = %q, want canonical form", v.AsString())
 	}
 

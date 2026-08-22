@@ -52,7 +52,7 @@ func TestJSONBRoundTrip(t *testing.T) {
 	if err := db.QueryRow(`SELECT doc FROM docs WHERE id = 1`).Scan(&s); err != nil {
 		t.Fatalf("scan into string: %v", err)
 	}
-	if s != `{"name":"widget","tags":["a","b"]}` {
+	if s != `{"name": "widget", "tags": ["a", "b"]}` {
 		t.Errorf("stored form = %s, want canonical form", s)
 	}
 }
@@ -74,7 +74,7 @@ func TestJSONBIsCanonicalisedAndJSONIsNot(t *testing.T) {
 	if err := db.QueryRow(`SELECT b, j FROM docs`).Scan(&gotB, &gotJ); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	if gotB != `{"a":2,"b":1}` {
+	if gotB != `{"a": 2, "b": 1}` {
 		t.Errorf("jsonb = %s, want keys sorted and whitespace dropped", gotB)
 	}
 	if gotJ != written {
