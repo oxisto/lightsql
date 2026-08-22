@@ -104,7 +104,11 @@ func TestDecodeUnknownKind(t *testing.T) {
 // whatever is on disk, so the decoder's contract is that it either returns a
 // value or an error.
 func FuzzDecodeValue(f *testing.F) {
-	for _, v := range []Value{Null(), Int(-1), Text("hello"), Bytea([]byte{1, 2}), Float(1.5)} {
+	seeds := []Value{Null(), Int(-1), Text("hello"), Bytea([]byte{1, 2}), Float(1.5)}
+	if d, err := ParseDecimal("-12345.6789"); err == nil {
+		seeds = append(seeds, Numeric(d))
+	}
+	for _, v := range seeds {
 		f.Add(AppendValue(nil, v))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
