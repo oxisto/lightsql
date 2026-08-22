@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-65_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-66_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -94,20 +94,38 @@ else:
 
 ## Persistence
 
-In-memory is the source of truth. When a directory is configured, each committed
-transaction appends a record to a write-ahead log, and a periodic checkpoint writes a
-full snapshot and truncates the log.
+In-memory is the source of truth. Point a data source name at a directory and each
+committed transaction is appended to a write-ahead log there first, so the database
+comes back after a restart.
 
-```
-mydb/
-  LOCK             flock'd, so only one process opens the directory
-  snapshot.0007    full catalog and rows
-  wal.0007         commit records since snapshot 7
+```go
+db, err := sql.Open("lightsql", "file:./demo.db")          // fsync on every commit
+db, err := sql.Open("lightsql", "file:./demo.db?fsync=off") // faster, loses the guarantee
 ```
 
-The log is logical (row changes and DDL) rather than physical pages, encoded as
-length-prefixed varints with a CRC per record. Recovery loads the snapshot and replays
-committed records, discarding a torn trailing record.
+```
+demo.db/
+  wal              every committed change, oldest first
+```
+
+The log is logical — row values and the text of DDL statements — rather than physical
+pages, so the format does not change every time an internal structure does. DDL is
+recorded as the statement that was run, because replaying it rebuilds the catalog
+exactly, including the `DEFAULT` expressions and `CHECK` predicates the catalog itself
+stores as syntax.
+
+**One frame holds one transaction**, length-prefixed with a CRC32 over its records. A
+torn write therefore fails its checksum and the whole transaction is discarded, so
+recovery never applies half of one. Recovery is also a repair: the partial tail is
+truncated, without which the next commit would land after unreadable bytes and be lost
+at the restart after that.
+
+Closing the database rewrites the log as the state rather than the history that produced
+it, so a table updated a million times does not replay a million versions at startup.
+
+Two limits worth knowing before pointing something at a directory: the log is compacted
+only when the database is closed, and nothing stops a second process opening the same
+directory — there is no lock file yet.
 
 This means the working set must fit in memory. That is a deliberate trade for the
 target use cases, not an oversight.
@@ -208,7 +226,7 @@ the two.
 | ⬜ | pg_catalog | ✅ | ⬜ | the subset ORMs actually read, such as pg_class and pg_attribute |
 | ✅ | Context cancellation | ✅ | ✅ | checked inside the operator loop, so a running query stops |
 | ✅ | SQLSTATE on every error | ✅ | ✅ | errors satisfy interface{ SQLState() string }, as pgx and lib/pq do |
-| ⬜ | File-backed storage | ⬜ | ⬜ | WAL plus periodic snapshot |
+| 🟡 | File-backed storage | ✅ | 🟡 | write-ahead log, fsync on commit, compacted at close; open with file:./demo.db |
 | | **Lexical** | | | |
 | ✅ | Comments | ✅ | ✅ | -- to end of line, and nestable /* */ |
 | ✅ | Quoted identifiers | ✅ | ✅ | case preserving, doubled quote escapes |

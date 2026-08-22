@@ -1,6 +1,10 @@
 package storage
 
-import "github.com/oxisto/lightsql/internal/wal"
+import (
+	"slices"
+
+	"github.com/oxisto/lightsql/internal/wal"
+)
 
 // Journal is where a committing transaction's changes are made durable.
 //
@@ -54,11 +58,44 @@ func (t *Tx) Log(rec wal.Record) {
 // at commit: a CREATE TABLE in a transaction that later rolls back is still
 // there afterwards. Buffering it would mean the log disagreed with the running
 // database about exactly the statements where the disagreement is permanent.
-func (t *Tx) LogNow(rec wal.Record) error {
-	if t.journal == nil {
+// It takes several records because a statement can need more than one -- ADD
+// COLUMN logs both the statement and the value it computed for the rows that
+// predate it -- and they must reach the log together. Written separately, a
+// crash between them would replay the statement without the value it produced.
+func (t *Tx) LogNow(recs ...wal.Record) error {
+	if t.journal == nil || len(recs) == 0 {
 		return nil
 	}
-	return t.journal.Write([]wal.Record{rec})
+	return t.journal.Write(recs)
+}
+
+// RenameLogged rewrites the buffered records that name a table which has just
+// been renamed.
+//
+// A record names its table by name, and DDL is written to the log as it runs
+// while rows wait for the commit. So `BEGIN; INSERT INTO t ...; ALTER TABLE t
+// RENAME TO u; COMMIT` puts the rename in the log first, and by the time
+// recovery reaches the buffered rows there is no table called t any more. The
+// buffer is small and a rename is rare, so correcting it here costs nothing and
+// keeps the alternative -- naming tables by a number whose meaning depends on
+// replaying the log in exactly the right order -- off the table. A wrong name
+// fails recovery loudly; a wrong number would quietly fill the wrong table.
+func (t *Tx) RenameLogged(from, to string) {
+	for i := range t.pending {
+		if t.pending[i].Table == from {
+			t.pending[i].Table = to
+		}
+	}
+}
+
+// ForgetLogged discards the buffered records naming a table that has just been
+// dropped, for the same reason RenameLogged rewrites them. The rows went with
+// the table in memory, and replaying them into a table that no longer exists
+// would fail recovery over work that was already discarded.
+func (t *Tx) ForgetLogged(names ...string) {
+	t.pending = slices.DeleteFunc(t.pending, func(r wal.Record) bool {
+		return slices.Contains(names, r.Table)
+	})
 }
 
 // flush writes the buffered records, and is called by Commit before the

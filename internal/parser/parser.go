@@ -12,35 +12,70 @@
 package parser
 
 import (
+	"strings"
+
 	"github.com/oxisto/lightsql/internal/ast"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/scanner"
 	"github.com/oxisto/lightsql/internal/token"
 )
 
+// Statement is a parsed statement together with the source text it came from.
+//
+// The text is kept because the write-ahead log records a DDL statement as the
+// SQL that was executed: replaying that rebuilds the catalog exactly, including
+// the DEFAULT expressions and CHECK predicates the catalog itself stores as
+// syntax. Recovering it afterwards from a node's position would mean guessing
+// where the statement ended, which the parser already knows.
+type Statement struct {
+	Stmt ast.Stmt
+	Text string
+}
+
 // Parse parses one or more semicolon-separated statements.
 func Parse(src string) ([]ast.Stmt, error) {
+	stmts, err := ParseAll(src)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ast.Stmt, len(stmts))
+	for i, s := range stmts {
+		out[i] = s.Stmt
+	}
+	return out, nil
+}
+
+// ParseAll parses one or more semicolon-separated statements, keeping the text
+// of each.
+func ParseAll(src string) ([]Statement, error) {
 	toks, err := scanner.Tokens(src)
 	if err != nil {
 		return nil, err
 	}
 	p := &parser{src: src, toks: toks}
 
-	var stmts []ast.Stmt
+	var stmts []Statement
 	for {
 		for p.accept(token.Semicolon) {
 		}
 		if p.at(token.EOF) {
 			break
 		}
+		start := p.cur().Pos
 		stmt, err := p.parseStmt()
 		if err != nil {
 			return nil, err
 		}
-		stmts = append(stmts, stmt)
 		if !p.at(token.EOF) && !p.at(token.Semicolon) {
 			return nil, p.unexpected("end of statement")
 		}
+		// The statement runs up to whatever terminated it. Trimming is what
+		// keeps a trailing comment or newline out of the recorded text; the
+		// separator itself is never part of the statement.
+		stmts = append(stmts, Statement{
+			Stmt: stmt,
+			Text: strings.TrimSpace(src[start:p.cur().Pos]),
+		})
 	}
 	if len(stmts) == 0 {
 		return nil, pgerr.Syntaxf(token.Pos(len(src)), "empty query")

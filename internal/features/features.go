@@ -419,8 +419,12 @@ var Groups = []Group{
 				Note: "checked inside the operator loop, so a running query stops"},
 			{Name: "SQLSTATE on every error", Parse: Yes, Exec: Yes,
 				Note: "errors satisfy interface{ SQLState() string }, as pgx and lib/pq do"},
-			{Name: "File-backed storage", Parse: Planned, Exec: Planned,
-				Note: "WAL plus periodic snapshot"},
+			// Partial rather than yes: what is on disk is correct and a crash
+			// during a commit loses at most that commit, but the log is
+			// compacted only when the database is closed, and nothing stops a
+			// second process opening the same directory.
+			{Name: "File-backed storage", Parse: Yes, Exec: Partial,
+				Note: "write-ahead log, fsync on commit, compacted at close; open with file:./demo.db"},
 		},
 	},
 	{
