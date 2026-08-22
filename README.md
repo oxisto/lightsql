@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-68_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-70_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -21,9 +21,10 @@ directory for a small file-backed deployment.
 > on MVCC — `Begin`, `Commit` and `Rollback` work, and `sql.TxOptions` isolation
 > levels are honoured rather than ignored. A database can be kept in a directory
 > and survives a restart.
-> Still missing: `UNION` and its siblings, correlated subqueries, `INTERVAL`
-> arithmetic, and the `information_schema` and `pg_catalog` views that ORMs read
-> when they migrate.
+> `information_schema` and `pg_catalog` are exposed as read-only views computed
+> from the catalog, so a migration tool can ask what is there.
+> Still missing: `UNION` and its siblings, correlated subqueries, and `INTERVAL`
+> arithmetic.
 > Do not take this paragraph's word for any of it. The compatibility matrix below
 > is generated from the code, and every row is backed by a probe that is actually
 > run — see [Compatibility](#compatibility).
@@ -240,8 +241,8 @@ the two.
 | ✅ | Multi-statement Exec | ✅ | ✅ | a fixture can be one semicolon-separated batch |
 | ✅ | Prepared statements | ✅ | ✅ | bound once, executed repeatedly |
 | ✅ | Column type introspection | ✅ | ✅ | ScanType, DatabaseTypeName and Nullable for ORMs |
-| ⬜ | information_schema | ✅ | ⬜ | tables, columns, table_constraints and key_column_usage as read-only views over the catalog; ORMs query these when migrating |
-| ⬜ | pg_catalog | ✅ | ⬜ | the subset ORMs actually read, such as pg_class and pg_attribute |
+| 🟡 | information_schema | ✅ | 🟡 | tables, columns, table_constraints and key_column_usage, computed from the catalog on read rather than stored. The column lists are a subset of PostgreSQL's -- the ones tools actually read -- and every text column is text rather than a domain such as sql_identifier, since nothing would enforce the domain's constraint. Writing to one is refused rather than ignored. Unqualified names do not reach it, as in PostgreSQL |
+| 🟡 | pg_catalog | ✅ | 🟡 | pg_tables, pg_namespace, pg_class and pg_attribute, computed the same way. An unqualified name finds them, as PostgreSQL's implicit search_path does, which is what lets a migration tool ask FROM pg_tables whether its version table exists. oid columns are positions in a sorted list, stable only for as long as the set of tables is |
 | ✅ | Context cancellation | ✅ | ✅ | checked inside the operator loop, so a running query stops |
 | ✅ | SQLSTATE on every error | ✅ | ✅ | errors satisfy interface{ SQLState() string }, as pgx and lib/pq do |
 | 🟡 | File-backed storage | ✅ | 🟡 | write-ahead log, fsync on commit, compacted at close; open with file:./demo.db |

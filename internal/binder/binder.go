@@ -699,9 +699,9 @@ func indexOfColumn(cols []catalog.Column, name string) int {
 // ---------------------------------------------------------------------------
 
 func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
-	t, err := b.cat.Lookup(s.Table.Schema.Name, s.Table.Name.Name)
+	t, err := b.lookupWritable(s.Table.Schema.Name, s.Table.Name.Name, s.Table.Pos())
 	if err != nil {
-		return nil, at(err, s.Table.Pos())
+		return nil, err
 	}
 
 	// Without an explicit column list, the targets are every column in
@@ -929,9 +929,9 @@ func (b *Binder) bindDelete(s *ast.DeleteStmt) (plan.Stmt, error) {
 // bindTarget resolves the table a DML statement operates on and builds the scope
 // its expressions see.
 func (b *Binder) bindTarget(name *ast.TableName, alias ast.Name) (*catalog.Table, *scope, error) {
-	t, err := b.cat.Lookup(name.Schema.Name, name.Name.Name)
+	t, err := b.lookupWritable(name.Schema.Name, name.Name.Name, name.Pos())
 	if err != nil {
-		return nil, nil, at(err, name.Pos())
+		return nil, nil, err
 	}
 	qualifier := t.Name
 	if !alias.IsEmpty() {
@@ -975,6 +975,41 @@ func (b *Binder) bindReturning(items []ast.SelectItem, sc *scope) (*plan.Returni
 // SELECT
 // ---------------------------------------------------------------------------
 
+// lookupWritable resolves a table a statement intends to change.
+//
+// It exists so that writing to a computed catalog view says so, rather than
+// reporting that the relation does not exist. It does exist; it just cannot be
+// written, and telling someone their table is missing when they can select from
+// it sends them looking in the wrong place.
+func (b *Binder) lookupWritable(schema, name string, pos token.Pos) (*catalog.Table, error) {
+	if v, ok := b.cat.LookupSystemView(schema, name); ok {
+		return nil, pgerr.Newf(pgerr.FeatureNotSupported,
+			"relation %q is a read-only system view", v.QualifiedName()).
+			WithDetail("Its rows are computed from the catalog, so there is nothing to change.").
+			At(pos)
+	}
+	t, err := b.cat.Lookup(schema, name)
+	if err != nil {
+		return nil, at(err, pos)
+	}
+	return t, nil
+}
+
+// bindSystemView brings a computed catalog view into scope and returns the node
+// that produces it.
+func (b *Binder) bindSystemView(v *catalog.SystemView, te *ast.TableRef, sc *scope) plan.Node {
+	qualifier := v.Name
+	if !te.Alias.IsEmpty() {
+		qualifier = te.Alias.Name
+	}
+	cols := make([]plan.ResultColumn, len(v.Columns))
+	for i := range v.Columns {
+		cols[i] = plan.ResultColumn{Name: v.Columns[i].Name, Type: v.Columns[i].Type}
+	}
+	sc.addColumns(cols, qualifier)
+	return &plan.SystemScan{View: v, Cat: b.cat, Cols: cols}
+}
+
 // bindFrom resolves one FROM item, bringing its columns into sc and returning
 // the node that produces them.
 //
@@ -985,6 +1020,14 @@ func (b *Binder) bindReturning(items []ast.SelectItem, sc *scope) (*plan.Returni
 func (b *Binder) bindFrom(te ast.TableExpr, sc *scope) (plan.Node, error) {
 	switch te := te.(type) {
 	case *ast.TableRef:
+		// The computed catalog views are resolved before the stored tables, as
+		// PostgreSQL's implicit search_path puts pg_catalog ahead of everything
+		// the user wrote. That is what makes an unqualified `FROM pg_tables`
+		// find the view rather than needing a schema, which is how every tool
+		// that introspects a PostgreSQL database writes it.
+		if v, ok := b.cat.LookupSystemView(te.Table.Schema.Name, te.Table.Name.Name); ok {
+			return b.bindSystemView(v, te, sc), nil
+		}
 		t, err := b.cat.Lookup(te.Table.Schema.Name, te.Table.Name.Name)
 		if err != nil {
 			return nil, at(err, te.Pos())

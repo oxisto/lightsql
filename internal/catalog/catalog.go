@@ -795,6 +795,33 @@ func New(mgr *storage.TxManager) *Catalog {
 
 func key(schema, name string) string { return schema + "." + name }
 
+// checkWritableRelation refuses a schema change aimed at a computed catalog.
+//
+// Without it these report that the relation does not exist, which is both
+// untrue and misleading: it does exist and can be selected from, so being told
+// it is missing sends the reader looking in the wrong place.
+//
+// It must be called with the schema as written, before any defaulting to
+// public. An unqualified name reaches pg_catalog first when it is read -- that
+// is what makes `FROM pg_tables` work -- so defaulting first would let
+// `ALTER TABLE pg_tables` past the guard and then fail to find a table called
+// public.pg_tables, which is the confusing message this exists to prevent.
+func (c *Catalog) checkWritableRelation(schema, name string) error {
+	if v, ok := c.LookupSystemView(schema, name); ok {
+		return deniedError(v.QualifiedName())
+	}
+	if IsSystemSchema(schema) {
+		return deniedError(Qualify(schema, name))
+	}
+	return nil
+}
+
+func deniedError(qualified string) error {
+	return pgerr.Newf(pgerr.InvalidSchemaName,
+		"permission denied to change %q", qualified).
+		WithDetail("System catalog modifications are currently disallowed.")
+}
+
 // Qualify returns the name a table is known by, defaulting an empty schema.
 //
 // It is the counterpart of LookupQualified, and exists so that a caller outside
@@ -811,6 +838,12 @@ func Qualify(schema, name string) string {
 // DuplicateTable error unless ifNotExists is set, in which case an existing
 // table is left alone and created reports false.
 func (c *Catalog) CreateTable(t *Table, ifNotExists bool) (created bool, err error) {
+	// A table in a computed schema would be unreachable: a name there resolves
+	// to the view, so the table could be created and then never selected from.
+	// PostgreSQL refuses for the same reason.
+	if err := c.checkWritableRelation(t.Schema, t.Name); err != nil {
+		return false, err
+	}
 	if t.Schema == "" {
 		t.Schema = DefaultSchema
 	}
@@ -903,6 +936,9 @@ func (c *Catalog) AddColumn(t *Table, col *Column, missing types.Value, check *C
 // so a reference survives the rename without being rewritten. That is the
 // payoff of resolving names once, at bind time.
 func (c *Catalog) RenameTable(schema, from, to string) error {
+	if err := c.checkWritableRelation(schema, from); err != nil {
+		return err
+	}
 	if schema == "" {
 		schema = DefaultSchema
 	}
@@ -933,6 +969,9 @@ func (c *Catalog) RenameTable(schema, from, to string) error {
 // stored row and no constraint needs rewriting -- but the name lookup the binder
 // consults does, or the new name would not resolve.
 func (c *Catalog) RenameColumn(schema, table, from, to string) error {
+	if err := c.checkWritableRelation(schema, table); err != nil {
+		return err
+	}
 	if schema == "" {
 		schema = DefaultSchema
 	}
@@ -985,6 +1024,9 @@ func (c *Catalog) RenameColumn(schema, table, from, to string) error {
 // NULL because it is part of the key, and dropping the flag would leave a
 // constraint that says one thing and a column that says another.
 func (c *Catalog) SetNotNull(tx *storage.Tx, schema, table, column string, notNull bool) error {
+	if err := c.checkWritableRelation(schema, table); err != nil {
+		return err
+	}
 	if schema == "" {
 		schema = DefaultSchema
 	}
@@ -1033,6 +1075,9 @@ func (c *Catalog) SetNotNull(tx *storage.Tx, schema, table, column string, notNu
 // Index names live in one namespace per schema, as in PostgreSQL, so a name
 // already taken on another table is a conflict rather than a shadowing.
 func (c *Catalog) CreateIndex(schema, table string, ix Index, ifNotExists bool) (created bool, err error) {
+	if err := c.checkWritableRelation(schema, table); err != nil {
+		return false, err
+	}
 	if schema == "" {
 		schema = DefaultSchema
 	}
@@ -1108,6 +1153,9 @@ func (c *Catalog) DropTable(names []QualifiedName, ifExists bool) error {
 
 	going := make(map[string]*Table, len(names))
 	for _, n := range names {
+		if err := c.checkWritableRelation(n.Schema, n.Name); err != nil {
+			return err
+		}
 		schema := n.Schema
 		if schema == "" {
 			schema = DefaultSchema

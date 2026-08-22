@@ -428,16 +428,24 @@ var Groups = []Group{
 				Note: "bound once, executed repeatedly"},
 			{Name: "Column type introspection", Parse: Yes, Exec: Yes,
 				Note: "ScanType, DatabaseTypeName and Nullable for ORMs"},
-			// The probe parses today because it is only a schema-qualified
-			// name; what is missing is the views themselves.
-			{Name: "information_schema", Parse: Yes, Exec: Planned,
-				Note: "tables, columns, table_constraints and key_column_usage as read-only views over the catalog; ORMs query these when migrating",
-				SQL:  "SELECT table_name FROM information_schema.tables"},
-			// Like information_schema, the name already parses; only the
-			// views are missing.
-			{Name: "pg_catalog", Parse: Yes, Exec: Planned,
-				Note: "the subset ORMs actually read, such as pg_class and pg_attribute",
-				SQL:  "SELECT relname FROM pg_catalog.pg_class"},
+			{Name: "information_schema", Parse: Yes, Exec: Partial,
+				Note: "tables, columns, table_constraints and key_column_usage, computed from " +
+					"the catalog on read rather than stored. The column lists are a subset of " +
+					"PostgreSQL's -- the ones tools actually read -- and every text column is " +
+					"text rather than a domain such as sql_identifier, since nothing would " +
+					"enforce the domain's constraint. Writing to one is refused rather than " +
+					"ignored. Unqualified names do not reach it, as in PostgreSQL",
+				Setup: probeTable,
+				SQL: "SELECT table_name, column_name, data_type, is_nullable " +
+					"FROM information_schema.columns WHERE table_schema = 'public'"},
+			{Name: "pg_catalog", Parse: Yes, Exec: Partial,
+				Note: "pg_tables, pg_namespace, pg_class and pg_attribute, computed the same " +
+					"way. An unqualified name finds them, as PostgreSQL's implicit search_path " +
+					"does, which is what lets a migration tool ask FROM pg_tables whether its " +
+					"version table exists. oid columns are positions in a sorted list, stable " +
+					"only for as long as the set of tables is",
+				Setup: probeTable,
+				SQL:   "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 't')"},
 			{Name: "Context cancellation", Parse: Yes, Exec: Yes,
 				Note: "checked inside the operator loop, so a running query stops"},
 			{Name: "SQLSTATE on every error", Parse: Yes, Exec: Yes,

@@ -22,6 +22,7 @@ const (
 	UndefinedTable          = "42P01"
 	UndefinedFunction       = "42883"
 	UndefinedObject         = "42704"
+	InvalidSchemaName       = "3F000"
 	AmbiguousColumn         = "42702"
 	GroupingError           = "42803"
 	DuplicateTable          = "42P07"

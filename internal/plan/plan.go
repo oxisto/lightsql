@@ -232,6 +232,22 @@ type Scan struct {
 	Cols []ResultColumn
 }
 
+// SystemScan reads one of the computed catalog views.
+//
+// It is a separate node from Scan because there is nothing to scan: the rows do
+// not exist until they are asked for, and they are derived from the catalog
+// rather than read from a heap. Sharing Scan would have meant giving it a table
+// that has no storage, which every later change to Scan would then have to
+// remember.
+type SystemScan struct {
+	View *catalog.SystemView
+	// Cat is where the rows come from. The node holds it for the same reason
+	// Scan holds a table: a plan is executed many times, and each execution
+	// must see the catalog as it is then, not as it was when it was bound.
+	Cat  *catalog.Catalog
+	Cols []ResultColumn
+}
+
 // Join combines two inputs. The output row is the left row followed by the
 // right one, so a column's ordinal in the joined row is its ordinal within its
 // own side plus the width of everything to the left of it — which is what the
@@ -331,25 +347,27 @@ type Limit struct {
 	Count, Offset Expr
 }
 
-func (n *SingleRow) Result() []ResultColumn { return nil }
-func (n *Scan) Result() []ResultColumn      { return n.Cols }
-func (n *Filter) Result() []ResultColumn    { return n.Input.Result() }
-func (n *Join) Result() []ResultColumn      { return n.Cols }
-func (n *Aggregate) Result() []ResultColumn { return n.Cols }
-func (n *Distinct) Result() []ResultColumn  { return n.Cols }
-func (n *Project) Result() []ResultColumn   { return n.Cols }
-func (n *Sort) Result() []ResultColumn      { return n.Input.Result() }
-func (n *Limit) Result() []ResultColumn     { return n.Input.Result() }
+func (n *SingleRow) Result() []ResultColumn  { return nil }
+func (n *Scan) Result() []ResultColumn       { return n.Cols }
+func (n *SystemScan) Result() []ResultColumn { return n.Cols }
+func (n *Filter) Result() []ResultColumn     { return n.Input.Result() }
+func (n *Join) Result() []ResultColumn       { return n.Cols }
+func (n *Aggregate) Result() []ResultColumn  { return n.Cols }
+func (n *Distinct) Result() []ResultColumn   { return n.Cols }
+func (n *Project) Result() []ResultColumn    { return n.Cols }
+func (n *Sort) Result() []ResultColumn       { return n.Input.Result() }
+func (n *Limit) Result() []ResultColumn      { return n.Input.Result() }
 
-func (*SingleRow) planNode() {}
-func (*Scan) planNode()      {}
-func (*Filter) planNode()    {}
-func (*Join) planNode()      {}
-func (*Aggregate) planNode() {}
-func (*Distinct) planNode()  {}
-func (*Project) planNode()   {}
-func (*Sort) planNode()      {}
-func (*Limit) planNode()     {}
+func (*SingleRow) planNode()  {}
+func (*Scan) planNode()       {}
+func (*SystemScan) planNode() {}
+func (*Filter) planNode()     {}
+func (*Join) planNode()       {}
+func (*Aggregate) planNode()  {}
+func (*Distinct) planNode()   {}
+func (*Project) planNode()    {}
+func (*Sort) planNode()       {}
+func (*Limit) planNode()      {}
 
 // Stmt is a bound statement.
 type Stmt interface {

@@ -15,9 +15,9 @@ import (
 // written and NULL otherwise -- so the value is settled here, once, rather than
 // re-derived per row.
 func (b *Binder) bindAddColumn(s *ast.AlterTableStmt, a *ast.AddColumn) (plan.Stmt, error) {
-	t, err := b.cat.Lookup(s.Table.Schema.Name, s.Table.Name.Name)
+	t, err := b.lookupWritable(s.Table.Schema.Name, s.Table.Name.Name, s.Table.Pos())
 	if err != nil {
-		return nil, at(err, s.Table.Pos())
+		return nil, err
 	}
 
 	cd := a.Column

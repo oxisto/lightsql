@@ -15,9 +15,9 @@ import (
 // than stored bound -- the catalog sits below the binder and cannot hold a plan
 // expression.
 func (b *Binder) bindCreateIndex(s *ast.CreateIndexStmt) (plan.Stmt, error) {
-	t, err := b.cat.Lookup(s.Table.Schema.Name, s.Table.Name.Name)
+	t, err := b.lookupWritable(s.Table.Schema.Name, s.Table.Name.Name, s.Table.Pos())
 	if err != nil {
-		return nil, at(err, s.Table.Pos())
+		return nil, err
 	}
 
 	ix := catalog.Index{Name: s.Name.Name, Unique: s.Unique, Where: s.Where}
