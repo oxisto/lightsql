@@ -347,7 +347,10 @@ var Groups = []Group{
 			// actually store, so a test suite that cannot round-trip a JSONB
 			// column cannot use lightsql at all.
 			{Name: "JSONB", Parse: Yes, Exec: Yes,
-				Note:  "canonicalised on store; scans as []byte",
+				Note: "canonicalised on store the way PostgreSQL canonicalises it: keys " +
+					"ordered by length then bytewise, a space after each colon and comma, " +
+					"and numbers read as numeric so 1e2 becomes 100 while 1.50 keeps its " +
+					"zero. Scans as []byte",
 				Setup: jsonTable,
 				SQL:   `SELECT doc -> 'a', doc ->> 'a' FROM j WHERE doc @> '{"a":1}'`},
 			{Name: "JSON", Parse: Yes, Exec: Yes,
@@ -470,8 +473,9 @@ var Groups = []Group{
 			// No probe: this is a test suite, not a statement.
 			{Name: "PostgreSQL parity suite", Parse: Yes, Exec: Yes,
 				Note: "compat/parity runs the same SQL against lightsql and a real PostgreSQL " +
-					"and compares result sets and SQLSTATEs; a difference that is understood " +
-					"is recorded rather than deleted, and fails if the two ever agree"},
+					"and compares result sets and SQLSTATEs over two hundred cases; a " +
+					"difference that is understood is recorded rather than deleted, and " +
+					"fails if the two ever agree"},
 			{Name: "Command-line shell", Parse: Yes, Exec: Yes,
 				Note: "cmd/lightsql opens a database directory and runs SQL, with table, " +
 					"CSV and JSON output, .tables and .schema over the catalog views, and " +
