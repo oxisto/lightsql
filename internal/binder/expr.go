@@ -295,7 +295,7 @@ func commonKind(what string, values []plan.Expr, pos token.Pos) (types.Kind, err
 // query is processing. Correlated subqueries are not supported yet, and this is
 // what makes one fail with an unresolved column rather than resolve against an
 // ordinal belonging to a row the subplan never sees.
-func subplan(sel *ast.SelectStmt, sc *scope, pos token.Pos) (plan.Node, error) {
+func subplan(sel ast.Query, sc *scope, pos token.Pos) (plan.Node, error) {
 	if sc.b == nil {
 		// The scopes without a binder are the ones where SQL forbids a
 		// subquery: a CHECK constraint and a DEFAULT expression, neither of
@@ -303,7 +303,7 @@ func subplan(sel *ast.SelectStmt, sc *scope, pos token.Pos) (plan.Node, error) {
 		return nil, pgerr.New(pgerr.FeatureNotSupported,
 			"cannot use a subquery in this context").At(pos)
 	}
-	return sc.b.bindSelectNode(sel)
+	return sc.b.bindQueryNode(sel)
 }
 
 // oneColumn rejects a subquery used where a value is expected but which

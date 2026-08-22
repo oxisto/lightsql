@@ -318,6 +318,74 @@ func NewKeySet() *KeySet {
 	return &KeySet{seed: maphash.MakeSeed(), buckets: make(map[uint64][][]types.Value)}
 }
 
+// KeyCounts is a KeySet that remembers how many times it saw each key.
+//
+// INTERSECT ALL and EXCEPT ALL are multiset operations: with three copies of a
+// row on the left and one on the right, INTERSECT ALL yields one and EXCEPT ALL
+// yields two. Presence alone cannot answer either, which is why this exists
+// beside KeySet rather than in place of it -- the distinct forms only ever need
+// presence, and counting for them would be work with no result.
+type KeyCounts struct {
+	seed    maphash.Seed
+	buckets map[uint64][]keyCount
+}
+
+type keyCount struct {
+	key []types.Value
+	n   int
+}
+
+func NewKeyCounts() *KeyCounts {
+	return &KeyCounts{seed: maphash.MakeSeed(), buckets: make(map[uint64][]keyCount)}
+}
+
+// Add records one occurrence of key.
+func (c *KeyCounts) Add(key []types.Value) {
+	sum := c.hash(key)
+	for i := range c.buckets[sum] {
+		if sameKey(c.buckets[sum][i].key, key) {
+			c.buckets[sum][i].n++
+			return
+		}
+	}
+	c.buckets[sum] = append(c.buckets[sum], keyCount{key: slices.Clone(key), n: 1})
+}
+
+// Take removes one occurrence of key, reporting whether there was one.
+//
+// This is what makes the ALL forms multiset operations rather than set ones:
+// each row on the left consumes at most one matching row on the right.
+func (c *KeyCounts) Take(key []types.Value) bool {
+	sum := c.hash(key)
+	for i := range c.buckets[sum] {
+		if sameKey(c.buckets[sum][i].key, key) && c.buckets[sum][i].n > 0 {
+			c.buckets[sum][i].n--
+			return true
+		}
+	}
+	return false
+}
+
+// Has reports whether key was ever recorded, however many times.
+func (c *KeyCounts) Has(key []types.Value) bool {
+	sum := c.hash(key)
+	for i := range c.buckets[sum] {
+		if sameKey(c.buckets[sum][i].key, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *KeyCounts) hash(key []types.Value) uint64 {
+	var h maphash.Hash
+	h.SetSeed(c.seed)
+	for _, v := range key {
+		v.Hash(&h)
+	}
+	return h.Sum64()
+}
+
 // Add records key and reports whether it was not already present. The key is
 // copied, so the caller may reuse the slice for the next row.
 func (s *KeySet) Add(key []types.Value) bool {

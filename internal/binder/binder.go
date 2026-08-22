@@ -156,6 +156,8 @@ func (b *Binder) Bind(stmt ast.Stmt) (plan.Stmt, error) {
 		return b.bindDelete(s)
 	case *ast.SelectStmt:
 		return b.bindSelect(s)
+	case *ast.SetOp:
+		return b.bindSetOpStmt(s)
 	default:
 		return nil, pgerr.Newf(pgerr.FeatureNotSupported,
 			"statement type %T is not supported yet", stmt).At(stmt.Pos())
@@ -834,8 +836,8 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 // That is what keeps the two spellings of INSERT agreeing about types: without
 // it, `INSERT ... VALUES ('7')` and `INSERT ... SELECT '7'` could disagree
 // about whether a text literal may land in an integer column.
-func (b *Binder) insertSource(sel *ast.SelectStmt, t *catalog.Table, targets []int) (plan.Node, error) {
-	src, err := b.bindSelectNode(sel)
+func (b *Binder) insertSource(sel ast.Query, t *catalog.Table, targets []int) (plan.Node, error) {
+	src, err := b.bindQueryNode(sel)
 	if err != nil {
 		return nil, err
 	}
@@ -1079,7 +1081,7 @@ func (b *Binder) bindFrom(te ast.TableExpr, sc *scope) (plan.Node, error) {
 		// the outer scope down would silently make every derived table lateral
 		// — the reference would resolve, against an ordinal describing a row
 		// the subplan never sees.
-		node, err := b.bindSelectNode(te.Select)
+		node, err := b.bindQueryNode(te.Select)
 		if err != nil {
 			return nil, err
 		}
@@ -1204,6 +1206,15 @@ func joinCols(left, right plan.Node) []plan.ResultColumn {
 
 func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 	root, err := b.bindSelectNode(s)
+	if err != nil {
+		return nil, err
+	}
+	return &plan.Query{Root: root}, nil
+}
+
+// bindSetOpStmt wraps a set operation used as a statement in its own right.
+func (b *Binder) bindSetOpStmt(s *ast.SetOp) (plan.Stmt, error) {
+	root, err := b.bindSetOp(s)
 	if err != nil {
 		return nil, err
 	}

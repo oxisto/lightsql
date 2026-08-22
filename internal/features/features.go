@@ -280,8 +280,17 @@ var Groups = []Group{
 					"outer query, and LATERAL, are both rejected rather than mis-resolved",
 				Setup: probeJoin,
 				SQL:   "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)"},
-			{Name: "UNION / INTERSECT / EXCEPT", Parse: Planned, Exec: Planned,
-				SQL: "SELECT a FROM t UNION SELECT b FROM u"},
+			{Name: "UNION / INTERSECT / EXCEPT", Parse: Yes, Exec: Yes,
+				Note: "all three, with ALL. INTERSECT binds tighter than UNION and EXCEPT, " +
+					"which share a precedence and associate left. The ALL forms are multiset " +
+					"operations, so three copies on the left against one on the right give one " +
+					"row from INTERSECT ALL and two from EXCEPT ALL. NULLs match each other, " +
+					"as they do for GROUP BY rather than for =. The trailing ORDER BY, LIMIT " +
+					"and OFFSET apply to the whole operation and may name an output column by " +
+					"name or position; an arm wanting its own must be parenthesised. Column " +
+					"names come from the left arm",
+				Setup: []string{"CREATE TABLE u1 (a INT)", "CREATE TABLE u2 (a INT)"},
+				SQL:   "SELECT a FROM u1 UNION ALL SELECT a FROM u2 ORDER BY 1"},
 			{Name: "Common table expressions", Parse: Planned, Exec: Planned,
 				Note: "WITH, including RECURSIVE",
 				SQL:  "WITH x AS (SELECT 1) SELECT * FROM x"},

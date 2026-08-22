@@ -227,7 +227,7 @@ func (p *parser) parseRange(lhs ast.Expr, negate bool) (ast.Expr, error) {
 		}
 		in := &ast.InExpr{X: lhs, InPos: tok.Pos, Negate: negate}
 		if p.at(token.Select) {
-			sel, err := p.parseSelect()
+			sel, err := p.parseQuery()
 			if err != nil {
 				return nil, err
 			}
@@ -364,7 +364,7 @@ func (p *parser) parseParen() (ast.Expr, error) {
 	p.next()
 
 	if p.at(token.Select) {
-		sel, err := p.parseSelect()
+		sel, err := p.parseQuery()
 		if err != nil {
 			return nil, err
 		}
@@ -384,11 +384,11 @@ func (p *parser) parseParen() (ast.Expr, error) {
 	return &ast.ParenExpr{Lparen: lparen, X: x}, nil
 }
 
-func (p *parser) parseParenSelect() (*ast.SelectStmt, error) {
+func (p *parser) parseParenSelect() (ast.Query, error) {
 	if err := p.expect(token.LParen); err != nil {
 		return nil, err
 	}
-	sel, err := p.parseSelect()
+	sel, err := p.parseQuery()
 	if err != nil {
 		return nil, err
 	}

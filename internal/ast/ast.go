@@ -248,7 +248,7 @@ type InExpr struct {
 	InPos    token.Pos
 	Negate   bool
 	List     []Expr
-	Subquery *SelectStmt
+	Subquery Query
 }
 
 // BetweenExpr is `X BETWEEN Lo AND Hi`.
@@ -280,13 +280,13 @@ func (w *WhenClause) Pos() token.Pos { return w.WhenPos }
 type ExistsExpr struct {
 	ExistsPos token.Pos
 	Negate    bool
-	Subquery  *SelectStmt
+	Subquery  Query
 }
 
 // SubqueryExpr is a scalar subquery used in expression position.
 type SubqueryExpr struct {
 	Lparen token.Pos
-	Select *SelectStmt
+	Select Query
 }
 
 // DefaultExpr is the word DEFAULT written where a value belongs, as in
@@ -440,7 +440,7 @@ type TableRef struct {
 // SubqueryRef is a parenthesised subquery in a FROM clause.
 type SubqueryRef struct {
 	Lparen token.Pos
-	Select *SelectStmt
+	Select Query
 	Alias  Name
 }
 
@@ -536,6 +536,60 @@ type SelectStmt struct {
 
 func (s *SelectStmt) Pos() token.Pos { return s.SelectPos }
 
+// Query is anything that produces rows: a SELECT, or two of them combined by a
+// set operation.
+//
+// It exists because a set operation may appear wherever a SELECT may -- as a
+// statement, in a derived table, inside IN or EXISTS, as the source of an
+// INSERT. Naming the whole family lets every one of those positions accept
+// either without a flag saying which it got.
+type Query interface {
+	// A query is also a statement: it is the one kind of thing that can both
+	// stand alone and appear inside something else.
+	Stmt
+	queryNode()
+}
+
+func (*SelectStmt) queryNode() {}
+func (*SetOp) queryNode()      {}
+
+// SetOpKind is which set operation was written.
+type SetOpKind uint8
+
+const (
+	// SetUnion is every row from either side.
+	SetUnion SetOpKind = iota
+	// SetIntersect is the rows in both.
+	SetIntersect
+	// SetExcept is the rows in the left that are not in the right.
+	SetExcept
+)
+
+var setOpNames = [...]string{SetUnion: "UNION", SetIntersect: "INTERSECT", SetExcept: "EXCEPT"}
+
+func (k SetOpKind) String() string { return setOpNames[k] }
+
+// SetOp combines two queries.
+//
+// The trailing ORDER BY, LIMIT and OFFSET belong here rather than to the arm
+// they follow: `a UNION b ORDER BY 1` orders the combined result, not b. An arm
+// that wants its own has to be parenthesised, which is also PostgreSQL's rule.
+type SetOp struct {
+	OpPos token.Pos
+	Op    SetOpKind
+	// All keeps duplicates. Without it a set operation removes them, which is
+	// the default the word "set" implies and the one people forget.
+	All         bool
+	Left, Right Query
+
+	OrderBy []OrderByItem
+	Limit   Expr
+	Offset  Expr
+}
+
+func (s *SetOp) Pos() token.Pos { return s.Left.Pos() }
+func (*SetOp) stmtNode()        {}
+
 // ---------------------------------------------------------------------------
 // INSERT
 // ---------------------------------------------------------------------------
@@ -548,7 +602,7 @@ type InsertStmt struct {
 	// columns in declaration order.
 	Columns []Name
 	Rows    [][]Expr
-	Select  *SelectStmt
+	Select  Query
 	// OnConflict is the ON CONFLICT clause, or nil.
 	OnConflict *OnConflictClause
 	Returning  []SelectItem
