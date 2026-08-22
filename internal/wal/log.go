@@ -43,6 +43,9 @@ type Log struct {
 
 	mu sync.Mutex
 	f  *os.File
+	// lock is the descriptor whose flock says this process has the directory.
+	// It is held for the life of the log; see lockDir.
+	lock *os.File
 	// replayed guards the ordering below: nothing may be appended until the
 	// existing contents have been read and any partial tail removed, or a good
 	// frame would be written after a bad one and become unreachable.
@@ -64,12 +67,23 @@ func Open(dir string, fsync bool) (*Log, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, pgerr.Newf(pgerr.InternalError, "creating database directory: %v", err)
 	}
+	// Locked before the log is touched. Two processes with the same directory
+	// open do not merely race: a checkpoint in one renames a new file over the
+	// log, and the other goes on writing to an inode that no longer has a name,
+	// losing everything it commits from then on without an error on either
+	// side. Refusing the second open is the only thing that prevents it.
+	lock, err := lockDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
 	f, err := os.OpenFile(filepath.Join(dir, Name), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
+		_ = unlockDir(lock)
 		return nil, pgerr.Newf(pgerr.InternalError, "opening write-ahead log: %v", err)
 	}
 
-	l := &Log{dir: dir, fsync: fsync, f: f}
+	l := &Log{dir: dir, fsync: fsync, f: f, lock: lock}
 	size, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, l.fail("sizing write-ahead log", err)
@@ -83,7 +97,7 @@ func Open(dir string, fsync bool) (*Log, error) {
 
 	var head [len(magic)]byte
 	if _, err := f.ReadAt(head[:], 0); err != nil || head != magic {
-		_ = f.Close()
+		_, _ = f.Close(), unlockDir(lock)
 		return nil, pgerr.Newf(pgerr.DataCorrupted,
 			"%s is not a lightsql database directory", dir)
 	}
@@ -297,13 +311,23 @@ func (l *Log) Close() error {
 	defer l.mu.Unlock()
 
 	if l.f == nil {
-		return nil
+		// Already closed, but the lock may still be held if closing failed
+		// partway. Releasing it twice is harmless; leaking it is not.
+		err := unlockDir(l.lock)
+		l.lock = nil
+		return err
 	}
 	err := l.f.Sync()
 	if cerr := l.f.Close(); err == nil {
 		err = cerr
 	}
 	l.f = nil
+	// The lock goes last, so the directory is never available to another
+	// process while this one still has the log open.
+	if cerr := unlockDir(l.lock); err == nil {
+		err = cerr
+	}
+	l.lock = nil
 	if err != nil {
 		return pgerr.Newf(pgerr.InternalError, "closing write-ahead log: %v", err)
 	}

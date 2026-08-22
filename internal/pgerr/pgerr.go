@@ -23,6 +23,7 @@ const (
 	UndefinedFunction       = "42883"
 	UndefinedObject         = "42704"
 	InvalidSchemaName       = "3F000"
+	ObjectInUse             = "55006"
 	AmbiguousColumn         = "42702"
 	InvalidColumnReference  = "42P10"
 	GroupingError           = "42803"
