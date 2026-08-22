@@ -601,8 +601,58 @@ func (t *Table) checkRow(row []types.Value) error {
 				"null value in column %q of relation %q violates not-null constraint",
 				col.Name, t.Name)
 		}
+		if col.Type.Kind == types.KindNumeric && !row[i].IsNull() {
+			v, err := fitNumeric(row[i], col)
+			if err != nil {
+				return err
+			}
+			row[i] = v
+		}
 	}
 	return nil
+}
+
+// fitNumeric applies a numeric column's declared precision and scale to a value
+// on its way in.
+//
+// This is what makes NUMERIC(10,2) an amount of money rather than a suggestion:
+// the value is rounded to the declared scale, so what is stored is what the
+// column promised, and a value too large for the declared precision is refused
+// rather than silently kept at full width. PostgreSQL does both at assignment,
+// and doing it here rather than in the binder covers every path that writes a
+// row -- insert, update, a DEFAULT, a referential SET DEFAULT -- instead of the
+// ones someone remembered.
+//
+// A numeric declared without precision, plain NUMERIC, constrains nothing and
+// keeps whatever it was given, again as in PostgreSQL.
+func fitNumeric(v types.Value, col *Column) (types.Value, error) {
+	if len(col.Type.Mods) < 2 {
+		return v, nil
+	}
+	precision, scale := col.Type.Mods[0], col.Type.Mods[1]
+
+	d := v.AsDecimal().Round(int32(scale))
+	// The digits left of the point are what the precision limits, so the check
+	// is against precision minus scale rather than against precision.
+	if digitsBefore(d) > precision-scale {
+		return types.Value{}, pgerr.Newf(pgerr.NumericValueOutOfRange,
+			"numeric field overflow").
+			WithDetail("A field with precision %d, scale %d must round to an absolute value less than 10^%d.",
+				precision, scale, precision-scale)
+	}
+	return types.Numeric(d), nil
+}
+
+// digitsBefore counts the digits to the left of the point, which is zero for a
+// value smaller than one.
+func digitsBefore(d *types.Decimal) int {
+	text := d.String()
+	text = strings.TrimPrefix(text, "-")
+	whole, _, _ := strings.Cut(text, ".")
+	if whole == "0" {
+		return 0
+	}
+	return len(whole)
 }
 
 // checkUnique verifies every uniqueness constraint over a whole row set.

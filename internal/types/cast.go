@@ -68,16 +68,45 @@ func Cast(v Value, want Kind) (Value, error) {
 			if i, err := strconv.ParseInt(strings.TrimSpace(v.AsString()), 10, 64); err == nil {
 				return Int(i), nil
 			}
+		case KindNumeric:
+			// Rounded, not truncated: this is the conversion an assignment to
+			// an integer column performs, and PostgreSQL rounds there.
+			if i, ok := v.AsDecimal().Round(0).Int64(); ok {
+				return Int(i), nil
+			}
 		}
 
 	case KindFloat:
 		switch v.Kind() {
 		case KindInt:
 			return Float(float64(v.AsInt())), nil
+		case KindNumeric:
+			return Float(v.AsDecimal().Float64()), nil
 		case KindText:
 			if f, err := strconv.ParseFloat(strings.TrimSpace(v.AsString()), 64); err == nil {
 				return Float(f), nil
 			}
+		}
+
+	case KindNumeric:
+		switch v.Kind() {
+		case KindInt:
+			return Numeric(DecimalFromInt(v.AsInt())), nil
+		case KindFloat:
+			// Through the shortest text that round-trips the float, which is
+			// what PostgreSQL does: the alternative is the exact binary value,
+			// and 0.1::float8::numeric would come out as 0.1000000000000000055.
+			d, err := ParseDecimal(strconv.FormatFloat(v.AsFloat(), 'g', -1, 64))
+			if err != nil {
+				break
+			}
+			return Numeric(d), nil
+		case KindText:
+			d, err := ParseDecimal(v.AsString())
+			if err != nil {
+				break
+			}
+			return Numeric(d), nil
 		}
 
 	case KindBytea:

@@ -32,7 +32,11 @@ func TestAggregatesWithoutGroupBy(t *testing.T) {
 		{"sum skips NULL", `SELECT sum(amount) FROM sales`, "42"},
 		{"min skips NULL", `SELECT min(amount) FROM sales`, "5"},
 		{"max skips NULL", `SELECT max(amount) FROM sales`, "20"},
-		{"avg is float even over integers", `SELECT avg(amount) FROM sales`, "10.5"},
+		// avg over integers is exact, not float: PostgreSQL returns numeric
+		// here, and the sixteen places are its division scale rather than an
+		// arbitrary choice. Truncating to 10 would be a silent wrong answer,
+		// and 10.5 as a float would be a quieter one.
+		{"avg over integers is exact", `SELECT avg(amount) FROM sales`, "10.5000000000000000"},
 		{"sum over floats stays float", `SELECT sum(rate) FROM sales`, "5.5"},
 		{"several aggregates in one row", `SELECT count(*), sum(amount) FROM sales`, "5|42"},
 		// An aggregate over an expression, not just a column.

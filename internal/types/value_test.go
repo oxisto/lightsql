@@ -12,6 +12,12 @@ import (
 // TestValueSize guards the layout. Value is copied for every column of every row
 // that flows through the executor, so growing it is a real cost and should be a
 // deliberate decision rather than a side effect of adding a field.
+//
+// Exact decimals nearly cost it eight bytes. They do not, because a decimal
+// that fits an int64 -- a price, a quantity, a rate -- lives in the payload
+// word with its scale in the padding beside the kind, and only one too large
+// for that keeps its digits in the string field. Arbitrary precision without a
+// pointer, and without every other kind paying for it.
 func TestValueSize(t *testing.T) {
 	const want = 32
 	if got := unsafe.Sizeof(Value{}); got != want {

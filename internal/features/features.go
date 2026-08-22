@@ -397,9 +397,17 @@ var Groups = []Group{
 					"decoded rather than relabelled, and it renders back as hex",
 				Setup: []string{"CREATE TABLE t (a BYTEA)"},
 				SQL:   "INSERT INTO t VALUES ('\\x0102'), ('\\001\\002'), ('abc')"},
-			{Name: "NUMERIC / DECIMAL", Parse: Yes, Exec: Partial,
-				Note: "stored as double precision; exact decimal arithmetic is pending",
-				SQL:  "CREATE TABLE t (a NUMERIC(10, 2))"},
+			{Name: "NUMERIC / DECIMAL", Parse: Yes, Exec: Yes,
+				Note: "exact base-ten arithmetic at arbitrary precision, so 0.1 + 0.2 is 0.3. " +
+					"A literal with a point is numeric rather than double precision, as in " +
+					"PostgreSQL, and a declared scale is applied on assignment -- NUMERIC(10,2) " +
+					"stores two places and refuses a value past its precision. Division picks " +
+					"its scale by PostgreSQL's rule, at least sixteen significant digits and " +
+					"never fewer places than either operand. sum and avg over exact input stay " +
+					"exact. Values reach a caller as text, since database/sql has no exact " +
+					"decimal to hand them back in",
+				Setup: []string{"CREATE TABLE t (a NUMERIC(10, 2))"},
+				SQL:   "INSERT INTO t VALUES (0.1 + 0.2)"},
 			{Name: "UUID", Parse: Yes, Exec: Partial,
 				Note: "accepted and stored as text; no validation",
 				SQL:  "CREATE TABLE t (a UUID)"},

@@ -59,11 +59,12 @@ var typeAliases = map[string]struct {
 	"float8":           {types.KindFloat, "double precision", false},
 	"float":            {types.KindFloat, "double precision", false},
 
-	// Exact numerics currently share the float representation. This is the one
-	// place lightsql knowingly diverges from PostgreSQL, so it is called out in
-	// the compatibility matrix rather than left to be discovered.
-	"numeric": {types.KindFloat, "numeric", false},
-	"decimal": {types.KindFloat, "numeric", false},
+	// Exact numerics. The declared precision and scale are kept in Mods, and a
+	// value assigned to the column is rounded to that scale on the way in --
+	// which is what makes NUMERIC(10,2) a quantity of money rather than a
+	// suggestion.
+	"numeric": {types.KindNumeric, "numeric", false},
+	"decimal": {types.KindNumeric, "numeric", false},
 
 	// Character types.
 	"text":              {types.KindText, "text", false},

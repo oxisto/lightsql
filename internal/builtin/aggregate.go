@@ -59,11 +59,16 @@ var aggregates = map[string]*Aggregate{
 	"avg": {
 		Name:    "avg",
 		Numeric: true,
-		// avg is float even over integers: the average of 1 and 2 is 1.5, and
-		// truncating it to 1 would be a silent wrong answer. PostgreSQL returns
-		// numeric here, which lightsql does not have.
-		Result: func(types.Kind) types.Kind { return types.KindFloat },
-		New:    func() Accumulator { return &avgAgg{} },
+		// avg is never integer: the average of 1 and 2 is 1.5, and truncating
+		// it to 1 would be a silent wrong answer. Over exact inputs the answer
+		// stays exact, as it does in PostgreSQL, where avg(int) is numeric.
+		Result: func(arg types.Kind) types.Kind {
+			if arg == types.KindFloat {
+				return types.KindFloat
+			}
+			return types.KindNumeric
+		},
+		New: func() Accumulator { return &avgAgg{} },
 	},
 	"min": {
 		Name:   "min",
@@ -81,10 +86,17 @@ var aggregates = map[string]*Aggregate{
 // PostgreSQL widens sum(int) to bigint; Value's integer is already 64-bit, so
 // there is nothing to widen to.
 func numericResult(arg types.Kind) types.Kind {
-	if arg == types.KindFloat {
+	switch arg {
+	case types.KindFloat:
 		return types.KindFloat
+	case types.KindNumeric:
+		// An exact input gives an exact total. Summing a column of prices
+		// through float64 is the arithmetic people reach for DECIMAL to escape,
+		// and doing it inside the aggregate would put it right back.
+		return types.KindNumeric
+	default:
+		return types.KindInt
 	}
-	return types.KindInt
 }
 
 func sameResult(arg types.Kind) types.Kind { return arg }
@@ -122,9 +134,17 @@ func (a *countAgg) Add(v types.Value) {
 
 func (a *countAgg) Result() types.Value { return types.Int(a.n) }
 
+// sumAgg totals a column in whichever of the three numeric worlds the input
+// lives in, widening as it goes: integers stay integers until a decimal or a
+// float appears, and a float makes the rest of the sum inexact for good.
+//
+// The order is one-way. Once a total has been through a float it cannot become
+// exact again, so there is no path back from float to decimal.
 type sumAgg struct {
 	i     int64
+	dec   types.Value
 	f     float64
+	exact bool // the running total is in dec rather than i
 	float bool
 	any   bool
 }
@@ -134,21 +154,46 @@ func (a *sumAgg) Add(v types.Value) {
 		return
 	}
 	a.any = true
-	if v.Kind() == types.KindFloat {
-		// The first float makes the whole sum float, and the integer part
+
+	switch {
+	case a.float:
+		a.f += v.AsFloat()
+
+	case v.Kind() == types.KindFloat:
+		// The first float makes the whole sum float, and whatever was
 		// accumulated so far comes along.
-		if !a.float {
-			a.float = true
+		a.float = true
+		if a.exact {
+			a.f = a.dec.AsFloat()
+		} else {
 			a.f = float64(a.i)
 		}
 		a.f += v.AsFloat()
-		return
+
+	case a.exact:
+		a.dec = types.AddNumeric(a.dec, toNumeric(v))
+
+	case v.Kind() == types.KindNumeric:
+		// The first decimal moves the running integer total onto the exact
+		// side, where it is represented without loss.
+		a.exact = true
+		a.dec = types.AddNumeric(toNumeric(types.Int(a.i)), v)
+
+	default:
+		a.i += v.AsInt()
 	}
-	if a.float {
-		a.f += v.AsFloat()
-		return
+}
+
+// toNumeric views an integer as a decimal so the two exact kinds can be added.
+func toNumeric(v types.Value) types.Value {
+	if v.Kind() == types.KindNumeric {
+		return v
 	}
-	a.i += v.AsInt()
+	out, err := types.Cast(v, types.KindNumeric)
+	if err != nil {
+		return types.Numeric(types.DecimalFromInt(0))
+	}
+	return out
 }
 
 func (a *sumAgg) Result() types.Value {
@@ -157,10 +202,14 @@ func (a *sumAgg) Result() types.Value {
 	if !a.any {
 		return types.Null()
 	}
-	if a.float {
+	switch {
+	case a.float:
 		return types.Float(a.f)
+	case a.exact:
+		return a.dec
+	default:
+		return types.Int(a.i)
 	}
-	return types.Int(a.i)
 }
 
 type avgAgg struct {
@@ -180,7 +229,17 @@ func (a *avgAgg) Result() types.Value {
 	if a.n == 0 {
 		return types.Null()
 	}
-	return types.Float(a.sum.Result().AsFloat() / float64(a.n))
+	total := a.sum.Result()
+	if total.Kind() == types.KindFloat {
+		return types.Float(total.AsFloat() / float64(a.n))
+	}
+	// Exact input, exact answer: the division picks its scale by PostgreSQL's
+	// rule, so avg over two prices has enough places to be worth having.
+	q, err := types.DivNumeric(toNumeric(total), toNumeric(types.Int(a.n)))
+	if err != nil {
+		return types.Float(total.AsFloat() / float64(a.n))
+	}
+	return q
 }
 
 type extremeAgg struct {

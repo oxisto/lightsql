@@ -136,6 +136,11 @@ else:
   tag. Scalars do not allocate, `NULL` is a kind rather than a nil interface, and
   comparisons return a three-valued boolean, so `NULL = NULL` is `UNKNOWN` by
   construction rather than by remembering to check.
+- **`NUMERIC` is exact.** `0.1 + 0.2` is `0.3`, a literal with a point is numeric
+  rather than double precision as in PostgreSQL, and totalling a column of prices
+  does not drift. A decimal that fits an `int64` rides in the same word as every
+  other scalar, so the exactness costs nothing until the digits genuinely need
+  more room.
 - **MVCC.** Rows are versioned with creating and deleting transaction ids, and each
   transaction reads from a snapshot. Rollback is marking a transaction aborted, readers
   never block writers, and `sql.TxOptions` isolation levels map onto PostgreSQL's.
@@ -264,7 +269,7 @@ the two.
 | 🟡 | Date and time | ✅ | 🟡 | columns, time.Time arguments and ISO 8601 literals, with either a space or a T separator. A zone offset is honoured by timestamptz and dropped by timestamp, as "without time zone" requires. A bare literal takes its type from the column it is compared or assigned to. INTERVAL is pending, and the non-ISO date styles PostgreSQL accepts are deliberately not, since 01/02/2024 has no reading that is right in both conventions |
 | 🟡 | Current date and time | ✅ | 🟡 | now(), CURRENT_TIMESTAMP, LOCALTIMESTAMP, CURRENT_DATE, CURRENT_TIME and LOCALTIME, all reporting the transaction start so that one transaction cannot disagree with itself. CURRENT_TIME is a plain time rather than PostgreSQL's zoned one, and a precision argument such as CURRENT_TIMESTAMP(0) is refused rather than ignored |
 | ✅ | BYTEA | ✅ | ✅ | written as a string literal in either of PostgreSQL's input formats: \x0102 as hex, or the escape form where a backslash introduces another backslash or three octal digits and every other character stands for itself. The text spells the bytes rather than being them, so it is decoded rather than relabelled, and it renders back as hex |
-| 🟡 | NUMERIC / DECIMAL | ✅ | 🟡 | stored as double precision; exact decimal arithmetic is pending |
+| ✅ | NUMERIC / DECIMAL | ✅ | ✅ | exact base-ten arithmetic at arbitrary precision, so 0.1 + 0.2 is 0.3. A literal with a point is numeric rather than double precision, as in PostgreSQL, and a declared scale is applied on assignment -- NUMERIC(10,2) stores two places and refuses a value past its precision. Division picks its scale by PostgreSQL's rule, at least sixteen significant digits and never fewer places than either operand. sum and avg over exact input stay exact. Values reach a caller as text, since database/sql has no exact decimal to hand them back in |
 | 🟡 | UUID | ✅ | 🟡 | accepted and stored as text; no validation |
 | | **Transactions and sessions** | | | |
 | ✅ | BEGIN / COMMIT / ROLLBACK | ✅ | ✅ | via database/sql Tx; rollback discards inserts, updates and deletes alike |

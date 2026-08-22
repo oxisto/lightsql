@@ -2,6 +2,7 @@ package types
 
 import (
 	"encoding/binary"
+	"math/big"
 
 	"github.com/oxisto/lightsql/internal/pgerr"
 )
@@ -34,6 +35,16 @@ func AppendValue(dst []byte, v Value) []byte {
 	case KindText, KindBytea, KindJSON, KindJSONB:
 		dst = binary.AppendUvarint(dst, uint64(len(v.s)))
 		return append(dst, v.s...)
+	case KindNumeric:
+		// The scale, then the digits as text. Text rather than the big.Int's
+		// own encoding because that encoding is not part of any contract: the
+		// standard library is free to change it, and a log written by one
+		// version of Go has to be readable by the next.
+		d := v.AsDecimal()
+		dst = binary.AppendUvarint(dst, uint64(d.Scale))
+		digits := d.Unscaled.String()
+		dst = binary.AppendUvarint(dst, uint64(len(digits)))
+		return append(dst, digits...)
 	default:
 		return binary.LittleEndian.AppendUint64(dst, v.n)
 	}
@@ -58,6 +69,41 @@ func DecodeValue(src []byte) (Value, []byte, error) {
 	switch k {
 	case KindNull:
 		return Null(), src, nil
+	case KindNumeric:
+		scale, read := binary.Uvarint(src)
+		if read <= 0 || read != uvarintLen(scale) {
+			return Value{}, nil, errTruncated
+		}
+		if scale > maxEncodedLen {
+			return Value{}, nil, pgerr.Newf(pgerr.DataCorrupted, "scale %d is out of range", scale)
+		}
+		src = src[read:]
+		n, read := binary.Uvarint(src)
+		if read <= 0 || read != uvarintLen(n) {
+			return Value{}, nil, errTruncated
+		}
+		src = src[read:]
+		if n > maxEncodedLen {
+			return Value{}, nil, pgerr.Newf(pgerr.DataCorrupted, "value length %d is out of range", n)
+		}
+		if uint64(len(src)) < n {
+			return Value{}, nil, errTruncated
+		}
+		digits := string(src[:n])
+		unscaled, ok := new(big.Int).SetString(digits, 10)
+		if !ok {
+			return Value{}, nil, pgerr.New(pgerr.DataCorrupted, "numeric digits are not a number")
+		}
+		if unscaled.String() != digits {
+			// SetString accepts a leading plus, leading zeros and a negative
+			// zero, all of which spell a number this would then re-encode
+			// differently. Refusing them keeps one value to one encoding, which
+			// is what lets the frame checksum stand for the content rather than
+			// merely for the bytes -- the same reason a length prefix has to be
+			// minimally encoded.
+			return Value{}, nil, pgerr.New(pgerr.DataCorrupted, "numeric digits are not canonical")
+		}
+		return Numeric(NewDecimal(unscaled, int32(scale))), src[n:], nil
 	case KindText, KindBytea, KindJSON, KindJSONB:
 		n, read := binary.Uvarint(src)
 		if read <= 0 {

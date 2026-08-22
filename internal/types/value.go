@@ -32,6 +32,9 @@ const (
 	// canonicalised. Both live in the string payload, so neither grows Value.
 	KindJSON
 	KindJSONB
+	// KindNumeric is an exact base-ten number, the one type here whose payload
+	// does not fit in a word; see Decimal.
+	KindNumeric
 )
 
 // kindNames are the canonical SQL spellings, so that both error messages and
@@ -49,6 +52,7 @@ var kindNames = [...]string{
 	KindTimestamptz: "timestamp with time zone",
 	KindJSON:        "json",
 	KindJSONB:       "jsonb",
+	KindNumeric:     "numeric",
 }
 
 func (k Kind) String() string {
@@ -60,21 +64,33 @@ func (k Kind) String() string {
 
 // IsNumeric reports whether k is an arithmetic type, and therefore whether it
 // participates in numeric promotion during comparison.
-func (k Kind) IsNumeric() bool { return k == KindInt || k == KindFloat }
+func (k Kind) IsNumeric() bool {
+	return k == KindInt || k == KindFloat || k == KindNumeric
+}
+
+// IsExact reports whether arithmetic on this kind is exact, which decides
+// whether an operation mixing two numeric kinds may stay exact or has to fall
+// back to floating point.
+func (k Kind) IsExact() bool { return k == KindInt || k == KindNumeric }
 
 // Value is a single SQL value.
 //
 // It is a struct rather than an `any` so that storing an int or a timestamp does
 // not allocate and box, NULL is unambiguous, and every operator dispatches on a
-// small integer Kind instead of a reflect-based type switch. The layout is
-// 32 bytes: the scalar payload shares one word, and only the string-shaped kinds
-// use the string header.
+// small integer Kind instead of a reflect-based type switch. The scalar payload
+// shares one word, the string-shaped kinds use the string header, and only an
+// exact decimal reaches for the heap.
 type Value struct {
 	k Kind
+	// scale is the number of digits after the point, for KindNumeric only. It
+	// sits here because the seven bytes between the kind and the payload word
+	// are padding either way, so carrying it costs nothing at all.
+	scale uint8
 	// n holds the payload of the scalar kinds: an int64, the bits of a float64,
 	// a bool, a day count, or a microsecond count — whichever k names.
 	n uint64
-	// s holds the payload of the string-shaped kinds: KindText and KindBytea.
+	// s holds the payload of the string-shaped kinds: KindText and KindBytea,
+	// and the digits of a decimal too large to fit in n.
 	s string
 }
 
@@ -98,6 +114,16 @@ func Float(f float64) Value { return Value{k: KindFloat, n: math.Float64bits(f)}
 
 // Text returns a text value.
 func Text(s string) Value { return Value{k: KindText, s: s} }
+
+// exactNumeric views an integer as a numeric so that the two exact kinds meet
+// on one representation, keeping an int-versus-numeric comparison on the fast
+// path rather than building a big.Int for it.
+func (v Value) exactNumeric() Value {
+	if v.k == KindNumeric {
+		return v
+	}
+	return Value{k: KindNumeric, n: v.n}
+}
 
 // Bytea returns a byte string value. The bytes are copied into an immutable
 // string, so the caller may reuse b.
@@ -167,15 +193,31 @@ func (v Value) IsNull() bool { return v.k == KindNull }
 func (v Value) AsBool() bool { return v.n != 0 }
 
 // AsInt returns the integer payload, meaningful for KindInt and the date/time
-// kinds, whose payloads are also integer counts.
-func (v Value) AsInt() int64 { return int64(v.n) }
-
-// AsFloat returns the value as a float64, promoting an integer if needed.
-func (v Value) AsFloat() float64 {
-	if v.k == KindInt {
-		return float64(int64(v.n))
+// kinds, whose payloads are also integer counts. A decimal is truncated towards
+// zero, and one too large to fit reports the truncation as zero rather than
+// wrapping.
+func (v Value) AsInt() int64 {
+	if v.k == KindNumeric {
+		i, _ := v.AsDecimal().Int64()
+		return i
 	}
-	return math.Float64frombits(v.n)
+	return int64(v.n)
+}
+
+// AsFloat returns the value as a float64, promoting an integer or a decimal if
+// needed. Promoting a decimal is lossy, which is why every exact path avoids it.
+func (v Value) AsFloat() float64 {
+	switch v.k {
+	case KindInt:
+		return float64(int64(v.n))
+	case KindNumeric:
+		if unscaled, scale, ok := v.smallDecimal(); ok {
+			return float64(unscaled) / math.Pow(10, float64(scale))
+		}
+		return v.AsDecimal().Float64()
+	default:
+		return math.Float64frombits(v.n)
+	}
 }
 
 // AsString returns the text or bytea payload.
@@ -208,6 +250,8 @@ func (v Value) String() string {
 		return strconv.FormatInt(v.AsInt(), 10)
 	case KindFloat:
 		return strconv.FormatFloat(v.AsFloat(), 'g', -1, 64)
+	case KindNumeric:
+		return v.numericString()
 	case KindBytea:
 		// Rendered as PostgreSQL renders it, which is also the form ParseBytea
 		// reads back. Returning the raw bytes would put unprintable characters
@@ -247,6 +291,13 @@ func Compare(a, b Value) int {
 	}
 	if a.k != b.k {
 		if a.k.IsNumeric() && b.k.IsNumeric() {
+			// Two exact kinds compare exactly. Going through float64 would make
+			// a decimal with more than fifteen significant digits compare equal
+			// to its own neighbours, which is the whole thing a decimal column
+			// was chosen to avoid.
+			if a.k.IsExact() && b.k.IsExact() {
+				return cmpNumeric(a.exactNumeric(), b.exactNumeric())
+			}
 			return cmpFloat(a.AsFloat(), b.AsFloat())
 		}
 		return cmp.Compare(a.k, b.k)
@@ -254,6 +305,8 @@ func Compare(a, b Value) int {
 	switch a.k {
 	case KindBool:
 		return cmp.Compare(a.n, b.n)
+	case KindNumeric:
+		return cmpNumeric(a, b)
 	case KindFloat:
 		return cmpFloat(a.AsFloat(), b.AsFloat())
 	case KindText, KindBytea, KindJSON, KindJSONB:
@@ -341,6 +394,17 @@ func (v Value) Hash(h *maphash.Hash) {
 			return
 		}
 		writeUint64(h, v.n)
+	case KindNumeric:
+		// Whatever an int or a float of the same value would write, so that
+		// Compare finding them equal and Hash disagreeing cannot happen. A
+		// decimal that is a whole number takes the integer path; anything else
+		// takes the float one, bit for bit as KindFloat does.
+		d := v.AsDecimal()
+		if i, ok := d.Int64(); ok && d.Round(0).Cmp(d) == 0 {
+			writeUint64(h, uint64(i))
+			return
+		}
+		writeUint64(h, math.Float64bits(d.Float64()))
 	default:
 		writeUint64(h, v.n)
 	}
