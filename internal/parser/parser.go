@@ -1217,6 +1217,40 @@ func (p *parser) parseTableConstraint(pos token.Pos, name ast.Name) (*ast.TableC
 	return c, nil
 }
 
+// parseIdentity parses the tail of GENERATED { ALWAYS | BY DEFAULT } AS
+// IDENTITY, reporting whether ALWAYS was written.
+func (p *parser) parseIdentity() (always bool, err error) {
+	switch {
+	case p.atWord("always"):
+		p.next()
+		always = true
+	case p.at(token.By):
+		// BY is reserved -- GROUP BY and ORDER BY need it -- so it arrives as a
+		// keyword token rather than as a word, unlike ALWAYS and IDENTITY.
+		p.next()
+		if err := p.expect(token.Default); err != nil {
+			return false, err
+		}
+	default:
+		return false, p.unexpected("ALWAYS or BY DEFAULT")
+	}
+
+	if err := p.expect(token.As); err != nil {
+		return false, err
+	}
+	if err := p.expectWord("identity"); err != nil {
+		return false, err
+	}
+	if p.at(token.LParen) {
+		// A sequence option list such as (START WITH 100) is refused rather
+		// than skipped: silently ignoring START WITH would hand out the wrong
+		// first value, and nothing about the schema would say why.
+		return false, pgerr.New(pgerr.FeatureNotSupported,
+			"sequence options on an identity column are not supported yet").At(p.cur().Pos)
+	}
+	return always, nil
+}
+
 func (p *parser) parseColumnDef() (*ast.ColumnDef, error) {
 	name, err := p.expectName()
 	if err != nil {
@@ -1270,6 +1304,15 @@ func (p *parser) parseColumnDef() (*ast.ColumnDef, error) {
 			if c.Ref, err = p.parseForeignKeyRef(); err != nil {
 				return nil, err
 			}
+		case p.atWord("generated"):
+			// GENERATED, ALWAYS and IDENTITY are unreserved in PostgreSQL, so
+			// they are matched as words. Reserving them would break the far
+			// more common `SELECT x AS identity`.
+			p.next()
+			if c.IdentityAlways, err = p.parseIdentity(); err != nil {
+				return nil, err
+			}
+			c.Kind = ast.ConstraintIdentity
 		default:
 			if !cname.IsEmpty() {
 				return nil, p.unexpected("a constraint")
