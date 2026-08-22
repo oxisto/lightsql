@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"github.com/oxisto/lightsql/internal/types"
 )
@@ -280,4 +281,15 @@ func FuzzNextFrame(f *testing.F) {
 			t.Fatalf("decoding a frame from %d bytes consumed nothing", len(data))
 		}
 	})
+}
+
+// TestRecordSize guards the field order. A record is copied into the pending
+// slice of every transaction that writes a row, and grouping the two small
+// fields is what keeps the padding out; a natural-looking order costs a whole
+// extra word per row and would not otherwise be noticed.
+func TestRecordSize(t *testing.T) {
+	const want = 72
+	if got := unsafe.Sizeof(Record{}); got != want {
+		t.Errorf("unsafe.Sizeof(Record{}) = %d, want %d", got, want)
+	}
 }

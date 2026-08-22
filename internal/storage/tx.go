@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/oxisto/lightsql/internal/pgerr"
+	"github.com/oxisto/lightsql/internal/wal"
 )
 
 // Isolation is the isolation level a transaction runs at.
@@ -58,6 +59,13 @@ type Tx struct {
 	// caller rolls back, rather than letting them build on a broken one.
 	failed bool
 	done   bool
+	// journal is where this transaction's changes go when it commits, or nil
+	// for an in-memory database. It is captured when the transaction begins;
+	// see TxManager.journalOf.
+	journal Journal
+	// pending holds the log records this transaction will write when it
+	// commits; see Tx.Log.
+	pending []wal.Record
 	// started is when the transaction began. now() reports it rather than the
 	// wall clock, so every statement in a transaction agrees about "now" --
 	// which is what PostgreSQL guarantees and what stops two rows inserted by
@@ -67,7 +75,14 @@ type Tx struct {
 
 // Begin starts a transaction at the given isolation level.
 func (m *TxManager) BeginTx(iso Isolation, readOnly bool) *Tx {
-	tx := &Tx{ID: m.Begin(), mgr: m, iso: iso, readOnly: readOnly, started: time.Now().UTC()}
+	tx := &Tx{
+		ID:       m.Begin(),
+		mgr:      m,
+		iso:      iso,
+		readOnly: readOnly,
+		journal:  m.journalOf(),
+		started:  time.Now().UTC(),
+	}
 	tx.snap = m.Take()
 	return tx
 }
@@ -127,12 +142,21 @@ func (t *Tx) Commit() error {
 	if t.done {
 		return pgerr.New(pgerr.InvalidTransactionState, "transaction has already finished")
 	}
-	t.done = true
 	if t.failed {
+		t.done = true
 		t.mgr.Abort(t.ID)
 		return pgerr.New(pgerr.InFailedTransaction,
 			"current transaction is aborted, commands ignored until end of transaction block")
 	}
+	// Durable before visible. The transaction is still in progress while its
+	// records are written, so a failure here rolls it back rather than leaving
+	// a commit that survives in memory and not on disk.
+	if err := t.flush(); err != nil {
+		t.done = true
+		t.mgr.Abort(t.ID)
+		return err
+	}
+	t.done = true
 	t.mgr.Commit(t.ID)
 	return nil
 }
@@ -146,6 +170,7 @@ func (t *Tx) Rollback() error {
 		return nil
 	}
 	t.done = true
+	t.pending = nil
 	t.mgr.Abort(t.ID)
 	return nil
 }
