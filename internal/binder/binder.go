@@ -51,6 +51,15 @@ type scope struct {
 	// expression -- so that rejecting one there is structural rather than an
 	// extra test somebody has to remember to write.
 	b *Binder
+	// parent is the scope of the query containing this one, nil at the top.
+	//
+	// Chaining is what makes a correlated subquery possible: a name the inner
+	// query does not define is looked for outside before it is called missing.
+	parent *scope
+	// correlated records that something in this scope resolved to a column of
+	// an enclosing one. A subquery whose scope is correlated cannot be run once
+	// and reused; it has to be run again for every outer row.
+	correlated bool
 }
 
 type scopeColumn struct {
@@ -103,10 +112,40 @@ func (s *scope) addColumns(cols []plan.ResultColumn, qualifier string) {
 // visible reports whether an unqualified reference may resolve to this column.
 func (c *scopeColumn) visible(qualified bool) bool { return qualified || !c.hidden }
 
-// resolve finds a column by an optionally qualified name. An unqualified name
-// that matches more than one table is ambiguous, which SQL rejects rather than
-// silently picking one.
-func (s *scope) resolve(ref *ast.ColumnRef) (scopeColumn, error) {
+// resolve finds a column by an optionally qualified name, looking outward
+// through the enclosing scopes when the innermost does not have it.
+//
+// The level returned is how many scopes out it was found: 0 for this one, which
+// is the ordinary case, and more for a correlated reference. Every scope passed
+// through on the way is marked correlated, because a subquery that reads a
+// column two levels up is itself correlated to its own parent -- the value has
+// to be carried down through it.
+//
+// An inner name shadows an outer one, which is why the search stops at the
+// first scope that has it rather than gathering candidates from all of them.
+func (s *scope) resolve(ref *ast.ColumnRef) (col scopeColumn, level int, err error) {
+	for cur, depth := s, 0; cur != nil; cur, depth = cur.parent, depth+1 {
+		col, err := cur.lookup(ref)
+		if err != nil {
+			// Ambiguous here is ambiguous, not a reason to keep looking: an
+			// outer scope cannot disambiguate a name this one already has twice.
+			return scopeColumn{}, 0, err
+		}
+		if col.name == "" {
+			continue
+		}
+		for mark, d := s, 0; d < depth; mark, d = mark.parent, d+1 {
+			mark.correlated = true
+		}
+		return col, depth, nil
+	}
+	return scopeColumn{}, 0, pgerr.Newf(pgerr.UndefinedColumn,
+		"column %q does not exist", ref.String()).At(ref.Pos())
+}
+
+// lookup searches one scope. A zero column with a nil error means "not here",
+// which is different from the ambiguity an error reports.
+func (s *scope) lookup(ref *ast.ColumnRef) (scopeColumn, error) {
 	var found scopeColumn
 	n := 0
 	qualified := !ref.Table.IsEmpty()
@@ -125,8 +164,7 @@ func (s *scope) resolve(ref *ast.ColumnRef) (scopeColumn, error) {
 	}
 	switch n {
 	case 0:
-		return scopeColumn{}, pgerr.Newf(pgerr.UndefinedColumn,
-			"column %q does not exist", ref.String()).At(ref.Pos())
+		return scopeColumn{}, nil
 	case 1:
 		return found, nil
 	default:
@@ -837,7 +875,7 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 // it, `INSERT ... VALUES ('7')` and `INSERT ... SELECT '7'` could disagree
 // about whether a text literal may land in an integer column.
 func (b *Binder) insertSource(sel ast.Query, t *catalog.Table, targets []int) (plan.Node, error) {
-	src, err := b.bindQueryNode(sel)
+	src, err := b.bindQueryNode(sel, &scope{b: b})
 	if err != nil {
 		return nil, err
 	}
@@ -1081,7 +1119,7 @@ func (b *Binder) bindFrom(te ast.TableExpr, sc *scope) (plan.Node, error) {
 		// the outer scope down would silently make every derived table lateral
 		// — the reference would resolve, against an ordinal describing a row
 		// the subplan never sees.
-		node, err := b.bindQueryNode(te.Select)
+		node, err := b.bindQueryNode(te.Select, &scope{b: b})
 		if err != nil {
 			return nil, err
 		}
@@ -1205,7 +1243,7 @@ func joinCols(left, right plan.Node) []plan.ResultColumn {
 }
 
 func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
-	root, err := b.bindSelectNode(s)
+	root, err := b.bindSelectNode(s, &scope{b: b})
 	if err != nil {
 		return nil, err
 	}
@@ -1214,7 +1252,7 @@ func (b *Binder) bindSelect(s *ast.SelectStmt) (plan.Stmt, error) {
 
 // bindSetOpStmt wraps a set operation used as a statement in its own right.
 func (b *Binder) bindSetOpStmt(s *ast.SetOp) (plan.Stmt, error) {
-	root, err := b.bindSetOp(s)
+	root, err := b.bindSetOp(s, &scope{b: b})
 	if err != nil {
 		return nil, err
 	}
@@ -1228,8 +1266,7 @@ func (b *Binder) bindSetOpStmt(s *ast.SetOp) (plan.Stmt, error) {
 // position. Those need the node without the plan.Query wrapper, and binding
 // them through the same function is what keeps a subquery's clause handling
 // from drifting away from a top-level query's.
-func (b *Binder) bindSelectNode(s *ast.SelectStmt) (plan.Node, error) {
-	sc := &scope{b: b}
+func (b *Binder) bindSelectNode(s *ast.SelectStmt, sc *scope) (plan.Node, error) {
 	// A SELECT without FROM is evaluated over one empty row, so every node
 	// below always has an input and no consumer needs a nil special case.
 	var node plan.Node = &plan.SingleRow{}

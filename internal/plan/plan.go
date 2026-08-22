@@ -84,6 +84,11 @@ type Cast struct {
 type ScalarSubquery struct {
 	Input Node
 	Kind  types.Kind
+	// Correlated marks a subquery that reads a column of the query containing
+	// it. Such a subquery has a different answer for every outer row, so it
+	// cannot be run once and reused -- which is exactly what the uncorrelated
+	// ones are, and why the two are told apart here rather than per row.
+	Correlated bool
 }
 
 // ExistsSubquery is EXISTS (SELECT ...), or NOT EXISTS when Negate is set.
@@ -95,6 +100,11 @@ type ScalarSubquery struct {
 type ExistsSubquery struct {
 	Input  Node
 	Negate bool
+	// Correlated marks a subquery that reads a column of the query containing
+	// it. Such a subquery has a different answer for every outer row, so it
+	// cannot be run once and reused -- which is exactly what the uncorrelated
+	// ones are, and why the two are told apart here rather than per row.
+	Correlated bool
 }
 
 // InSubquery is X IN (SELECT ...), or NOT IN when Negate is set.
@@ -102,6 +112,11 @@ type InSubquery struct {
 	X      Expr
 	Input  Node
 	Negate bool
+	// Correlated marks a subquery that reads a column of the query containing
+	// it. Such a subquery has a different answer for every outer row, so it
+	// cannot be run once and reused -- which is exactly what the uncorrelated
+	// ones are, and why the two are told apart here rather than per row.
+	Correlated bool
 }
 
 // FuncCall is a call to a scalar function from the builtin registry.
@@ -166,6 +181,8 @@ type InList struct {
 	Negate bool
 }
 
+func (e *OuterRef) Type() types.Kind { return e.Kind }
+
 func (e *Column) Type() types.Kind { return e.Kind }
 func (e *Const) Type() types.Kind  { return e.Val.Kind() }
 func (e *Param) Type() types.Kind  { return e.Kind }
@@ -183,13 +200,14 @@ func (e *FuncCall) Type() types.Kind       { return e.Kind }
 func (e *Coalesce) Type() types.Kind       { return e.Kind }
 func (e *Now) Type() types.Kind            { return e.Kind }
 
-func (*Cast) exprNode()   {}
-func (*Column) exprNode() {}
-func (*Const) exprNode()  {}
-func (*Param) exprNode()  {}
-func (*Binary) exprNode() {}
-func (*Unary) exprNode()  {}
-func (*IsNull) exprNode() {}
+func (*Cast) exprNode()     {}
+func (*OuterRef) exprNode() {}
+func (*Column) exprNode()   {}
+func (*Const) exprNode()    {}
+func (*Param) exprNode()    {}
+func (*Binary) exprNode()   {}
+func (*Unary) exprNode()    {}
+func (*IsNull) exprNode()   {}
 
 func (*ScalarSubquery) exprNode() {}
 func (*ExistsSubquery) exprNode() {}
@@ -259,6 +277,19 @@ type SetOp struct {
 	// see the executor.
 	All  bool
 	Cols []ResultColumn
+}
+
+// OuterRef is a reference from inside a subquery to a column of an enclosing
+// query -- what makes a subquery correlated.
+//
+// Level says how far out: 0 is the query immediately containing this one, 1 the
+// one outside that. It is resolved when the expression is compiled rather than
+// per row, so reading one costs a pointer dereference.
+type OuterRef struct {
+	Level   int
+	Ordinal int
+	Kind    types.Kind
+	Name    string
 }
 
 // Join combines two inputs. The output row is the left row followed by the

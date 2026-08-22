@@ -13,15 +13,19 @@ import (
 // bindQueryNode binds whatever produces rows, which is a SELECT or a set
 // operation over two of them.
 //
+// The scope is provided by the caller rather than made here, so that a subquery
+// in expression position can be given one chained to the query around it while
+// a derived table gets a fresh one.
+//
 // Every position that accepts a query goes through here -- a statement, a
 // derived table, a subquery, the source of an INSERT -- so a set operation
 // works in all of them rather than only where someone remembered to allow it.
-func (b *Binder) bindQueryNode(q ast.Query) (plan.Node, error) {
+func (b *Binder) bindQueryNode(q ast.Query, sc *scope) (plan.Node, error) {
 	switch q := q.(type) {
 	case *ast.SelectStmt:
-		return b.bindSelectNode(q)
+		return b.bindSelectNode(q, sc)
 	case *ast.SetOp:
-		return b.bindSetOp(q)
+		return b.bindSetOp(q, sc)
 	default:
 		return nil, pgerr.Newf(pgerr.FeatureNotSupported,
 			"query type %T is not supported yet", q).At(q.Pos())
@@ -29,12 +33,14 @@ func (b *Binder) bindQueryNode(q ast.Query) (plan.Node, error) {
 }
 
 // bindSetOp binds UNION, INTERSECT or EXCEPT.
-func (b *Binder) bindSetOp(s *ast.SetOp) (plan.Node, error) {
-	left, err := b.bindQueryNode(s.Left)
+// The arms get scopes of their own, sharing this one's parent: they are
+// separate queries, and a name defined in one is not visible in the other.
+func (b *Binder) bindSetOp(s *ast.SetOp, sc *scope) (plan.Node, error) {
+	left, err := b.bindQueryNode(s.Left, &scope{b: b, parent: sc.parent})
 	if err != nil {
 		return nil, err
 	}
-	right, err := b.bindQueryNode(s.Right)
+	right, err := b.bindQueryNode(s.Right, &scope{b: b, parent: sc.parent})
 	if err != nil {
 		return nil, err
 	}

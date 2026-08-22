@@ -23,7 +23,7 @@ type conflictHandler struct {
 	width  int
 }
 
-func compileConflict(ins *plan.Insert, tx *storage.Tx) (*conflictHandler, error) {
+func compileConflict(ins *plan.Insert, ev env) (*conflictHandler, error) {
 	c := ins.OnConflict
 	if c == nil {
 		return nil, nil
@@ -37,14 +37,14 @@ func compileConflict(ins *plan.Insert, tx *storage.Tx) (*conflictHandler, error)
 		joined:    make(Row, 2*width),
 	}
 	for _, a := range c.Assignments {
-		eval, err := Compile(a.Value, tx)
+		eval, err := compile(a.Value, ev)
 		if err != nil {
 			return nil, err
 		}
 		h.assign = append(h.assign, eval)
 		h.targets = append(h.targets, a.Ordinal)
 	}
-	pred, err := compilePredicate(c.Where, tx)
+	pred, err := compilePredicate(c.Where, ev)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +56,7 @@ func compileConflict(ins *plan.Insert, tx *storage.Tx) (*conflictHandler, error)
 //
 // With no arbiter -- a bare DO NOTHING -- every uniqueness constraint is
 // consulted, because the clause yields to whichever one would have fired.
-func (h *conflictHandler) find(tx *storage.Tx, t *catalog.Table, row Row) *storage.Version {
+func (h *conflictHandler) find(ev env, t *catalog.Table, row Row) *storage.Version {
 	keys := [][]int{h.arbiter}
 	if len(h.arbiter) == 0 {
 		keys = keys[:0]
@@ -79,7 +79,7 @@ func (h *conflictHandler) find(tx *storage.Tx, t *catalog.Table, row Row) *stora
 		if anyNullAt(row, cols) {
 			continue
 		}
-		for _, v := range t.Scan(tx) {
+		for _, v := range t.Scan(ev.tx) {
 			vals := t.Values(v)
 			if anyNullAt(vals, cols) {
 				continue
@@ -95,7 +95,7 @@ func (h *conflictHandler) find(tx *storage.Tx, t *catalog.Table, row Row) *stora
 // resolve applies the clause to a collision that find located.
 func (h *conflictHandler) resolve(
 	ctx context.Context,
-	tx *storage.Tx,
+	ev env,
 	t *catalog.Table,
 	existing *storage.Version,
 	proposed Row,
@@ -137,7 +137,7 @@ func (h *conflictHandler) resolve(
 	if err := runChecks(ctx, checks, args, next, t.Name); err != nil {
 		return err
 	}
-	if err := t.Update(tx, existing, next); err != nil {
+	if err := t.Update(ev.tx, existing, next); err != nil {
 		return err
 	}
 	res.Affected++

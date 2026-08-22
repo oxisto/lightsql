@@ -23,8 +23,7 @@ directory for a small file-backed deployment.
 > and survives a restart.
 > `information_schema` and `pg_catalog` are exposed as read-only views computed
 > from the catalog, so a migration tool can ask what is there.
-> Still missing: correlated subqueries, common table expressions, views, and
-> `INTERVAL` arithmetic.
+> Still missing: common table expressions, views, and `INTERVAL` arithmetic.
 > Do not take this paragraph's word for any of it. The compatibility matrix below
 > is generated from the code, and every row is backed by a probe that is actually
 > run — see [Compatibility](#compatibility).
@@ -305,7 +304,7 @@ the two.
 | 🟡 | Aggregate functions | ✅ | 🟡 | count, sum, avg, min and max, each with DISTINCT; count is 0 over no rows and the rest are NULL. Other aggregates are pending |
 | ✅ | ORDER BY | ✅ | ✅ | ASC/DESC, NULLS FIRST/LAST, output aliases, select-list positions, and expressions over unselected columns |
 | ✅ | DISTINCT / DISTINCT ON | ✅ | ✅ | compares the output row, and treats NULLs as equal; DISTINCT ON keeps the first row per key, so ORDER BY decides which. Unlike PostgreSQL, ORDER BY on an unselected column is accepted rather than rejected |
-| 🟡 | Subqueries | ✅ | 🟡 | scalar, IN, EXISTS and derived tables, which must have an alias. A scalar subquery is NULL over no rows and an error over more than one. Only uncorrelated subqueries are supported: one that references the outer query, and LATERAL, are both rejected rather than mis-resolved |
+| 🟡 | Subqueries | ✅ | 🟡 | scalar, IN, EXISTS and derived tables, which must have an alias. A scalar subquery is NULL over no rows and an error over more than one. A correlated subquery works in all three expression forms, at any depth, and is re-run for each outer row; an inner name shadows an outer one, so a subquery means the same thing whether or not the query around it shares a column. LATERAL is not supported, so a derived table in FROM is bound in a scope of its own and cannot see the query containing it |
 | ✅ | UNION / INTERSECT / EXCEPT | ✅ | ✅ | all three, with ALL. INTERSECT binds tighter than UNION and EXCEPT, which share a precedence and associate left. The ALL forms are multiset operations, so three copies on the left against one on the right give one row from INTERSECT ALL and two from EXCEPT ALL. NULLs match each other, as they do for GROUP BY rather than for =. The trailing ORDER BY, LIMIT and OFFSET apply to the whole operation and may name an output column by name or position; an arm wanting its own must be parenthesised. Column names come from the left arm |
 | ⬜ | Common table expressions | ⬜ | ⬜ | WITH, including RECURSIVE |
 | ❌ | Window functions | ❌ | ❌ | out of scope for v1 |

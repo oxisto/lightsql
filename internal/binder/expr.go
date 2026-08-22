@@ -39,9 +39,17 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 		return &plan.Param{Ord: e.Ord, Kind: types.KindNull}, nil
 
 	case *ast.ColumnRef:
-		c, err := sc.resolve(e)
+		c, level, err := sc.resolve(e)
 		if err != nil {
 			return nil, err
+		}
+		if level > 0 {
+			// A column of an enclosing query. It is read from that query's
+			// current row rather than from this one, which is what makes the
+			// subquery correlated and what stops it being run once and reused.
+			return &plan.OuterRef{
+				Level: level - 1, Ordinal: c.ordinal, Kind: c.typ.Kind, Name: c.name,
+			}, nil
 		}
 		// Reaching here in a grouped query means the column is neither a group
 		// key nor inside an aggregate, so there is no single value to report
@@ -295,15 +303,27 @@ func commonKind(what string, values []plan.Expr, pos token.Pos) (types.Kind, err
 // query is processing. Correlated subqueries are not supported yet, and this is
 // what makes one fail with an unresolved column rather than resolve against an
 // ordinal belonging to a row the subplan never sees.
-func subplan(sel ast.Query, sc *scope, pos token.Pos) (plan.Node, error) {
+// subplan binds a subquery in expression position, chained to the scope around
+// it so that a name it does not define is looked for outside.
+//
+// It reports whether the subquery turned out to be correlated. Only expression
+// position chains: a derived table in FROM may reference the query it sits in
+// only with LATERAL, which lightsql does not have, so those are bound in a
+// scope of their own and a stray reference is the missing column it looks like.
+func subplan(sel ast.Query, sc *scope, pos token.Pos) (plan.Node, bool, error) {
 	if sc.b == nil {
 		// The scopes without a binder are the ones where SQL forbids a
 		// subquery: a CHECK constraint and a DEFAULT expression, neither of
 		// which has a row to run one against.
-		return nil, pgerr.New(pgerr.FeatureNotSupported,
+		return nil, false, pgerr.New(pgerr.FeatureNotSupported,
 			"cannot use a subquery in this context").At(pos)
 	}
-	return sc.b.bindQueryNode(sel)
+	inner := &scope{b: sc.b, parent: sc}
+	node, err := sc.b.bindQueryNode(sel, inner)
+	if err != nil {
+		return nil, false, err
+	}
+	return node, inner.correlated, nil
 }
 
 // oneColumn rejects a subquery used where a value is expected but which
@@ -317,14 +337,14 @@ func oneColumn(n plan.Node, pos token.Pos) error {
 }
 
 func bindScalarSubquery(e *ast.SubqueryExpr, sc *scope) (plan.Expr, error) {
-	node, err := subplan(e.Select, sc, e.Pos())
+	node, correlated, err := subplan(e.Select, sc, e.Pos())
 	if err != nil {
 		return nil, err
 	}
 	if err := oneColumn(node, e.Pos()); err != nil {
 		return nil, err
 	}
-	return &plan.ScalarSubquery{Input: node, Kind: node.Result()[0].Type.Kind}, nil
+	return &plan.ScalarSubquery{Input: node, Kind: node.Result()[0].Type.Kind, Correlated: correlated}, nil
 }
 
 // currentTimeType gives each datetime value function the type PostgreSQL gives
@@ -344,13 +364,13 @@ func currentTimeType(k ast.CurrentTimeKind) types.Kind {
 }
 
 func bindExists(e *ast.ExistsExpr, sc *scope) (plan.Expr, error) {
-	node, err := subplan(e.Subquery, sc, e.Pos())
+	node, correlated, err := subplan(e.Subquery, sc, e.Pos())
 	if err != nil {
 		return nil, err
 	}
 	// EXISTS asks only whether a row is there, so its select list is not
 	// constrained: SELECT *, SELECT 1 and SELECT a, b all mean the same to it.
-	return &plan.ExistsSubquery{Input: node, Negate: e.Negate}, nil
+	return &plan.ExistsSubquery{Input: node, Negate: e.Negate, Correlated: correlated}, nil
 }
 
 func bindIn(e *ast.InExpr, sc *scope) (plan.Expr, error) {
@@ -360,7 +380,7 @@ func bindIn(e *ast.InExpr, sc *scope) (plan.Expr, error) {
 	}
 
 	if e.Subquery != nil {
-		node, err := subplan(e.Subquery, sc, e.Pos())
+		node, correlated, err := subplan(e.Subquery, sc, e.Pos())
 		if err != nil {
 			return nil, err
 		}
@@ -370,7 +390,7 @@ func bindIn(e *ast.InExpr, sc *scope) (plan.Expr, error) {
 		if x, err = coerce(x, node.Result()[0].Type.Kind, e.X.Pos()); err != nil {
 			return nil, err
 		}
-		return &plan.InSubquery{X: x, Input: node, Negate: e.Negate}, nil
+		return &plan.InSubquery{X: x, Input: node, Negate: e.Negate, Correlated: correlated}, nil
 	}
 
 	// The list is checked against the left operand's type here rather than at
