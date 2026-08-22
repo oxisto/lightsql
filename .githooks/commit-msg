@@ -56,7 +56,11 @@ area=${subject%%:*}
 rest=${subject#*: }
 
 # One or more lowercase package names, comma-separated: "parser" or "scanner, parser".
-if ! printf '%s' "$area" | grep -Eq '^[a-z][a-z0-9]*(, [a-z][a-z0-9]*)*$'; then
+# A command keeps its cmd/ prefix, as the Go project writes cmd/go: -- without it a
+# commit to cmd/lightsql would be indistinguishable from one to the root package,
+# which is also called lightsql.
+pkg='([a-z][a-z0-9]*|cmd/[a-z][a-z0-9]*)'
+if ! printf '%s' "$area" | grep -Eq "^${pkg}(, ${pkg})*\$"; then
 	fail "'$area' is not a package list; use lowercase names separated by ', '"
 fi
 

@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-70_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-71_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -54,6 +54,44 @@ not a path to anything shared. That is what you want for tests, where it means
 one line of setup and no cleanup. For anything that has to outlive one process,
 or be reached from more than one, point the name at a directory instead:
 `sql.Open("lightsql", "file:./demo.db")`.
+
+## A shell
+
+`cmd/lightsql` is a shell for looking at a database directly, in the shape of the
+`sqlite3` and `psql` ones. An embedded database that can only be reached from inside
+the program that wrote it is hard to trust; being able to open the directory afterwards
+and ask what is actually in there is the difference between believing the tests and
+knowing.
+
+```sh
+go install github.com/oxisto/lightsql/cmd/lightsql@latest
+
+lightsql ./demo.db                 # open a directory and start a shell
+lightsql                           # the same, in memory, discarded on exit
+lightsql -c 'SELECT 1' ./demo.db   # run one statement and exit
+lightsql -f setup.sql ./demo.db    # run a file
+echo 'SELECT 1' | lightsql         # read from a pipe
+```
+
+```
+lightsql> SELECT id, name, balance FROM users ORDER BY id;
+id | name   | balance
+---+--------+--------
+ 1 | Alice  |   120.5
+ 2 | Bob    |      -3
+ 3 | Ondřej | NULL
+(3 rows)
+```
+
+`.tables` and `.schema` read the catalog views, `.mode csv|json` switches to output meant
+for a pipe — JSON keeps the types, so a number stays a number and NULL becomes `null` —
+and `.begin` / `.commit` / `.rollback` are shell commands rather than SQL, because
+lightsql has no `BEGIN` statement: a transaction is taken through the driver, which is
+what lets it honour the isolation level asked for instead of parsing one out of a
+statement. `.help` lists the rest.
+
+It links only the standard library and lightsql itself, so installing it pulls in nothing
+else — the same promise the library makes.
 
 ## Why
 
@@ -244,6 +282,7 @@ the two.
 | 🟡 | information_schema | ✅ | 🟡 | tables, columns, table_constraints and key_column_usage, computed from the catalog on read rather than stored. The column lists are a subset of PostgreSQL's -- the ones tools actually read -- and every text column is text rather than a domain such as sql_identifier, since nothing would enforce the domain's constraint. Writing to one is refused rather than ignored. Unqualified names do not reach it, as in PostgreSQL |
 | 🟡 | pg_catalog | ✅ | 🟡 | pg_tables, pg_namespace, pg_class and pg_attribute, computed the same way. An unqualified name finds them, as PostgreSQL's implicit search_path does, which is what lets a migration tool ask FROM pg_tables whether its version table exists. oid columns are positions in a sorted list, stable only for as long as the set of tables is |
 | ✅ | Context cancellation | ✅ | ✅ | checked inside the operator loop, so a running query stops |
+| ✅ | Command-line shell | ✅ | ✅ | cmd/lightsql opens a database directory and runs SQL, with table, CSV and JSON output, .tables and .schema over the catalog views, and transactions as shell commands since the engine has no BEGIN statement |
 | ✅ | SQLSTATE on every error | ✅ | ✅ | errors satisfy interface{ SQLState() string }, as pgx and lib/pq do |
 | 🟡 | File-backed storage | ✅ | 🟡 | write-ahead log, fsync on commit, compacted at close; open with file:./demo.db |
 | | **Lexical** | | | |
