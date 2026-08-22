@@ -42,6 +42,13 @@ type Engine struct {
 	// recovering is set while the log is being replayed. It is not guarded,
 	// because recovery finishes before the engine is handed to anyone.
 	recovering bool
+	// stopAfter limits how many schema statements a replay applies, or
+	// allSchema for all of them; applied counts them as it goes. See OpenAt.
+	stopAfter int
+	applied   int
+	// readOnly marks a database opened to look at the past, which must not be
+	// written to and must not checkpoint.
+	readOnly bool
 }
 
 // New returns an empty in-memory engine.
@@ -81,7 +88,11 @@ func New() *Engine {
 
 // BeginTx starts an explicit transaction.
 func (e *Engine) BeginTx(iso storage.Isolation, readOnly bool) *storage.Tx {
-	return e.mgr.BeginTx(iso, readOnly)
+	// A database opened to look at the past refuses writes however the caller
+	// asks. Detaching the journal alone was not enough: the write still
+	// happened in memory and still reported how many rows it had changed, which
+	// is a statement claiming work that nothing will remember.
+	return e.mgr.BeginTx(iso, readOnly || e.readOnly)
 }
 
 // implicitTx wraps a single statement in its own transaction.
@@ -90,7 +101,7 @@ func (e *Engine) BeginTx(iso storage.Isolation, readOnly bool) *storage.Tx {
 // than two, which is what stops the two from drifting apart in their handling
 // of visibility or constraint checking.
 func (e *Engine) implicitTx() *storage.Tx {
-	return e.mgr.BeginTx(storage.ReadCommitted, false)
+	return e.mgr.BeginTx(storage.ReadCommitted, e.readOnly)
 }
 
 // run executes fn inside tx when one is given, or inside a fresh implicit

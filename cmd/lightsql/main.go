@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	lightsqldriver "github.com/oxisto/lightsql/driver"
+	"github.com/oxisto/lightsql/internal/engine"
 )
 
 func main() {
@@ -49,6 +50,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		file    = fs.String("f", "", "run the statements in a file and exit")
 		mode    = fs.String("format", "table", "output format: table, csv or json")
 		fsyncOn = fs.Bool("fsync", true, "flush each commit to disk; off is faster and loses the guarantee")
+		history = fs.Bool("history", false, "list the schema statements in the log and exit")
+		at      = fs.Int("at", 0, "open replaying only the first N schema statements, read-only")
 	)
 	fs.Usage = func() {
 		_, _ = fmt.Fprint(stderr, usage)
@@ -66,6 +69,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	dsn, err := dataSource(fs.Args(), *fsyncOn)
 	if err != nil {
 		return err
+	}
+
+	if *history || *at > 0 {
+		dir, ok := strings.CutPrefix(dsn, "file:")
+		if !ok {
+			return errors.New("-history and -at need a directory, not an in-memory name")
+		}
+		// The query string is a data source concern; these read the directory.
+		dir, _, _ = strings.Cut(dir, "?")
+		if *history {
+			return printHistory(stdout, dir)
+		}
+		return recoverAt(dir, *at, stdin, stdout, stderr, format, *command, *file)
 	}
 
 	db, err := sql.Open("lightsql", dsn)
@@ -107,6 +123,58 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 }
 
+// printHistory lists the schema statements a log holds, numbered.
+//
+// The number is what -at takes. Someone recovering from a mistaken DROP TABLE
+// reads this to find the statement that did it, and opens at the one before.
+func printHistory(out io.Writer, dir string) error {
+	stmts, err := engine.SchemaHistory(dir)
+	if err != nil {
+		return err
+	}
+	for i, s := range stmts {
+		_, _ = fmt.Fprintf(out, "%3d  %s\n", i+1, strings.Join(strings.Fields(s), " "))
+	}
+	if len(stmts) == 0 {
+		_, _ = fmt.Fprintln(out, "(the log holds no schema statements)")
+	}
+	return nil
+}
+
+// recoverAt opens a database as it was after the first n schema statements.
+//
+// It never writes and never compacts, so looking at the past cannot become the
+// present. Copy the directory first anyway: the point of being here is that
+// something has already gone wrong once.
+func recoverAt(dir string, n int, stdin io.Reader, stdout, stderr io.Writer,
+	format format, command, file string) error {
+	eng, err := engine.OpenAt(dir, n)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = eng.Close() }()
+
+	db := sql.OpenDB(lightsqldriver.NewEngineConnector(eng))
+	defer func() { _ = db.Close() }()
+
+	_, _ = fmt.Fprintf(stderr,
+		"opened %s as it was after %d schema statements; read-only, nothing is written\n", dir, n)
+
+	sh := &shell{db: db, out: stdout, err: stderr, format: format, dsn: dir}
+	switch {
+	case command != "":
+		return sh.repl(strings.NewReader(command), false)
+	case file != "":
+		src, err := os.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		return sh.repl(strings.NewReader(string(src)), false)
+	default:
+		return sh.repl(stdin, isTerminal(stdin))
+	}
+}
+
 const usage = `lightsql is a shell for a lightsql database.
 
 Usage:
@@ -114,6 +182,15 @@ Usage:
 
 The path is a directory holding a database, created if it does not exist. With
 no path the database is in memory and goes away when the shell exits.
+
+To recover from a mistaken schema change, copy the log a compaction replaced
+into a directory of its own and open it before the statement that did the
+damage. Copy again for each attempt: opening a rescue directory the ordinary
+way compacts it on close.
+
+  cp demo.db/wal.old /tmp/rescue.db/wal
+  lightsql -history /tmp/rescue.db     # what happened, numbered
+  lightsql -at 2 /tmp/rescue.db        # as it was after the first two
 
 Flags:
 `

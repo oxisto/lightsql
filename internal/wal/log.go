@@ -15,6 +15,19 @@ import (
 // Name is the file the log lives in, inside the database directory.
 const Name = "wal"
 
+// PreviousName is the log as it was before the last checkpoint.
+//
+// A checkpoint rewrites the log as the database's current state, which throws
+// away the history that produced it. That is the point of a checkpoint, and it
+// is also unrecoverable: a table dropped by mistake takes its rows with it the
+// moment the database is closed, because closing checkpoints. Keeping one
+// generation makes the operation undoable for exactly as long as it takes
+// someone to notice, which is the window that matters.
+//
+// It is a whole log, so reading it is a matter of copying it into a directory
+// of its own under the name above and opening that.
+const PreviousName = Name + ".old"
+
 // magic identifies the file and its format version. A file that does not start
 // with it is refused rather than treated as an empty log, so pointing lightsql
 // at the wrong path reports an error instead of appearing to work and then
@@ -54,6 +67,9 @@ type Log struct {
 	// the file in one call, so a partially encoded transaction never reaches
 	// the disk.
 	buf []byte
+	// dirty records that something has been appended since the log was last
+	// compacted, which is what makes compacting it again worth doing.
+	dirty bool
 }
 
 // Open opens the log in dir, creating the directory and the file if they do not
@@ -217,6 +233,7 @@ func (l *Log) Write(recs []Record) error {
 	if _, err := l.f.Write(l.encode(recs)); err != nil {
 		return l.fail("appending to write-ahead log", err)
 	}
+	l.dirty = true
 	if l.fsync {
 		if err := l.f.Sync(); err != nil {
 			return l.fail("flushing write-ahead log", err)
@@ -247,12 +264,27 @@ func (l *Log) encode(recs []Record) []byte {
 // them. The replacement is written to a second file and renamed over the first,
 // so a crash during a checkpoint leaves the old log intact: at no point is
 // there a moment where neither file describes a complete database.
+//
+// The log it replaces is kept as PreviousName rather than unlinked. Compacting
+// is otherwise a one-way door: a table dropped by mistake is recoverable from
+// the log right up until the database is closed, and closing is what
+// checkpoints -- so a clean shutdown destroyed more than a crash would have.
+// One generation is enough to survive noticing.
 func (l *Log) Checkpoint(recs []Record) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if !l.replayed {
 		return pgerr.New(pgerr.InternalError, "write-ahead log has not been replayed")
+	}
+	if !l.dirty {
+		// Nothing has been written since this log was last compacted, so
+		// compacting it again would produce the same file and cost the kept
+		// generation. That matters more than it sounds: the first thing anyone
+		// does after a mistake is open the database to look at it, and closing
+		// that would otherwise replace the history they came for with the state
+		// they already have.
+		return nil
 	}
 
 	tmp := filepath.Join(l.dir, Name+".tmp")
@@ -268,6 +300,26 @@ func (l *Log) Checkpoint(recs []Record) error {
 		_ = os.Remove(tmp)
 		return pgerr.Newf(pgerr.InternalError, "closing checkpoint: %v", err)
 	}
+	// The outgoing log is given a second name before the new one takes its
+	// place, so that the rename below replaces a name rather than the only name
+	// an inode has. A hard link rather than a rename because it leaves no
+	// moment when the log is missing: if this process dies between the two
+	// calls, the directory still has a complete wal and the next checkpoint
+	// simply redoes it.
+	previous := filepath.Join(l.dir, PreviousName)
+	if err := os.Remove(previous); err != nil && !os.IsNotExist(err) {
+		_ = os.Remove(tmp)
+		return pgerr.Newf(pgerr.InternalError, "replacing the previous log: %v", err)
+	}
+	if err := os.Link(filepath.Join(l.dir, Name), previous); err != nil {
+		// A filesystem without hard links cannot keep the generation, so the
+		// checkpoint is abandoned rather than made unrecoverable. Nothing is
+		// lost by that: the log stays as it is, which is history, and the only
+		// cost is that it is longer than it needs to be.
+		_ = os.Remove(tmp)
+		return nil
+	}
+
 	if err := os.Rename(tmp, filepath.Join(l.dir, Name)); err != nil {
 		_ = os.Remove(tmp)
 		return pgerr.Newf(pgerr.InternalError, "installing checkpoint: %v", err)
@@ -285,6 +337,7 @@ func (l *Log) Checkpoint(recs []Record) error {
 	if err != nil {
 		return pgerr.Newf(pgerr.InternalError, "reopening write-ahead log: %v", err)
 	}
+	l.dirty = false
 	return nil
 }
 
