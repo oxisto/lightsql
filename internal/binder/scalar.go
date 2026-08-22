@@ -90,6 +90,9 @@ func checkArgTypes(fn *builtin.Scalar, kinds []types.Kind, fc *ast.FuncCall) err
 			return argTypeError(fn.Name, kinds, fc)
 		}
 		if i < len(fn.Args) && fn.Args[i] != types.KindNull && fn.Args[i] != k {
+			if i < len(fn.AltArgs) && fn.AltArgs[i] == k {
+				continue
+			}
 			return argTypeError(fn.Name, kinds, fc)
 		}
 	}

@@ -5,9 +5,11 @@ import (
 	"strings"
 )
 
-// ErrCast reports a conversion that SQL does not permit. It is a plain sentinel
-// rather than a pgerr value because types must not depend on pgerr; callers
-// wrap it with the SQLSTATE and position appropriate to their context.
+// ErrCast reports a conversion that SQL does not permit. It is a plain error
+// rather than a pgerr value because the caller is the one that knows where the
+// value was written and which SQLSTATE its context calls for; it wraps this
+// with both. Returning a pgerr here instead gets it wrapped twice, which reads
+// as "ERROR: ERROR: ..." with the SQLSTATE printed at each end.
 type ErrCast struct {
 	From, To Kind
 	Val      string
@@ -80,7 +82,9 @@ func Cast(v Value, want Kind) (Value, error) {
 
 	case KindBytea:
 		if v.Kind() == KindText {
-			return Value{k: KindBytea, s: v.AsString()}, nil
+			// Decoded, not relabelled: the text of a bytea literal spells the
+			// bytes rather than being them. See ParseBytea.
+			return ParseBytea(v.AsString())
 		}
 
 	case KindTimestamp, KindTimestamptz:

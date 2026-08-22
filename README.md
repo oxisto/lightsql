@@ -252,7 +252,7 @@ the two.
 | ✅ | BETWEEN / IN / LIKE | ✅ | ✅ | including the negated forms. BETWEEN is inclusive and rewritten to a pair of comparisons; LIKE supports % and _ with backslash escaping, and is anchored, so it matches the whole string. IN follows SQL's three-valued rule: without a match, a NULL among the candidates makes the answer unknown rather than false, so NOT IN over a NULL returns no rows. ILIKE and an explicit ESCAPE clause are not supported |
 | ✅ | CASE | ✅ | ✅ | simple and searched forms; the simple form is rewritten to the searched one, so both take one path. Only a true condition fires an arm, no match without ELSE is NULL, and the branches must share a type so a result column cannot change type from row to row |
 | ✅ | CAST | ✅ | ✅ | both CAST(x AS t) and x::t |
-| 🟡 | Scalar functions | ✅ | 🟡 | coalesce, nullif, now, lower, upper, length, trim, abs and round. NULL propagates for all but coalesce and nullif, and coalesce stops at the first argument that answers. Argument types are checked at bind time, so lower(1) is rejected rather than reading an integer as text. The library is small and grows on demand |
+| 🟡 | Scalar functions | ✅ | 🟡 | coalesce, nullif, now, lower, upper, length, octet_length, trim, abs and round. length counts characters of text and bytes of bytea, as PostgreSQL does for each, while octet_length always counts bytes. NULL propagates for all but coalesce and nullif, and coalesce stops at the first argument that answers. Argument types are checked at bind time, so lower(1) is rejected rather than reading an integer as text. The library is small and grows on demand |
 | ❌ | Arrays | ❌ | ❌ | out of scope for v1 |
 | ✅ | JSONB | ✅ | ✅ | canonicalised on store; scans as []byte |
 | ✅ | JSON | ✅ | ✅ | kept exactly as written, unlike jsonb |
@@ -263,7 +263,7 @@ the two.
 | ✅ | BOOLEAN | ✅ | ✅ |  |
 | 🟡 | Date and time | ✅ | 🟡 | columns, time.Time arguments and ISO 8601 literals, with either a space or a T separator. A zone offset is honoured by timestamptz and dropped by timestamp, as "without time zone" requires. A bare literal takes its type from the column it is compared or assigned to. INTERVAL is pending, and the non-ISO date styles PostgreSQL accepts are deliberately not, since 01/02/2024 has no reading that is right in both conventions |
 | 🟡 | Current date and time | ✅ | 🟡 | now(), CURRENT_TIMESTAMP, LOCALTIMESTAMP, CURRENT_DATE, CURRENT_TIME and LOCALTIME, all reporting the transaction start so that one transaction cannot disagree with itself. CURRENT_TIME is a plain time rather than PostgreSQL's zoned one, and a precision argument such as CURRENT_TIMESTAMP(0) is refused rather than ignored |
-| ✅ | BYTEA | ✅ | ✅ |  |
+| ✅ | BYTEA | ✅ | ✅ | written as a string literal in either of PostgreSQL's input formats: \x0102 as hex, or the escape form where a backslash introduces another backslash or three octal digits and every other character stands for itself. The text spells the bytes rather than being them, so it is decoded rather than relabelled, and it renders back as hex |
 | 🟡 | NUMERIC / DECIMAL | ✅ | 🟡 | stored as double precision; exact decimal arithmetic is pending |
 | 🟡 | UUID | ✅ | 🟡 | accepted and stored as text; no validation |
 | | **Transactions and sessions** | | | |

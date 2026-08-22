@@ -208,7 +208,13 @@ func (v Value) String() string {
 		return strconv.FormatInt(v.AsInt(), 10)
 	case KindFloat:
 		return strconv.FormatFloat(v.AsFloat(), 'g', -1, 64)
-	case KindText, KindBytea, KindJSON, KindJSONB:
+	case KindBytea:
+		// Rendered as PostgreSQL renders it, which is also the form ParseBytea
+		// reads back. Returning the raw bytes would put unprintable characters
+		// into error messages, and casting bytea to text would produce
+		// something that could not be cast back.
+		return EncodeBytea(v.s)
+	case KindText, KindJSON, KindJSONB:
 		return v.s
 	case KindDate:
 		return v.AsTime().Format("2006-01-02")

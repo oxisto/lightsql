@@ -20,6 +20,15 @@ type Scalar struct {
 	// returns "" -- a confident wrong answer of exactly the sort sum(text) gave
 	// before it was rejected.
 	Args []types.Kind
+	// AltArgs is a second kind each parameter will also accept, or KindNull
+	// where there is none.
+	//
+	// PostgreSQL solves this with overloading: length(text) and length(bytea)
+	// are two functions that happen to share a name. This registry is keyed by
+	// name alone and cannot express that, and one alternative covers every
+	// function here that needs one -- both of them count something in a string
+	// that may be either characters or bytes.
+	AltArgs []types.Kind
 	// Numeric marks a function whose arguments must be numbers, where any of
 	// the numeric kinds will do.
 	Numeric bool
@@ -53,12 +62,31 @@ var scalars = map[string]*Scalar{
 		},
 	},
 	"length": {
-		Name: "length", Min: 1, Max: 1, Strict: true, Args: []types.Kind{types.KindText},
-		Result: constKind(types.KindInt),
+		Name: "length", Min: 1, Max: 1, Strict: true,
+		Args:    []types.Kind{types.KindText},
+		AltArgs: []types.Kind{types.KindBytea},
+		Result:  constKind(types.KindInt),
 		Fn: func(a []types.Value) (types.Value, error) {
-			// Characters, not bytes: PostgreSQL's length() counts characters,
-			// and counting bytes would make length('é') report 2.
+			// Characters for text, bytes for bytea, as PostgreSQL does for
+			// each. Counting bytes for text would make length('é') report 2;
+			// counting characters for bytea would decode arbitrary bytes as
+			// UTF-8 and report whatever that happened to produce.
+			if a[0].Kind() == types.KindBytea {
+				return types.Int(int64(len(a[0].AsString()))), nil
+			}
 			return types.Int(int64(len([]rune(a[0].AsString())))), nil
+		},
+	},
+	"octet_length": {
+		Name: "octet_length", Min: 1, Max: 1, Strict: true,
+		Args:    []types.Kind{types.KindText},
+		AltArgs: []types.Kind{types.KindBytea},
+		Result:  constKind(types.KindInt),
+		Fn: func(a []types.Value) (types.Value, error) {
+			// Always bytes, which for text is the length of its UTF-8. This is
+			// the function to reach for when the answer has to be a size rather
+			// than a count of characters.
+			return types.Int(int64(len(a[0].AsString()))), nil
 		},
 	},
 	"trim": {
