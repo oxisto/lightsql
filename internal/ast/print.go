@@ -522,6 +522,10 @@ func (p *printer) node(n Node) {
 		p.node(n.Select)
 		p.close()
 
+	case *DefaultExpr:
+		p.open("default")
+		p.close()
+
 	case *CurrentTimeExpr:
 		// The keyword itself is the whole node, so it prints as one atom rather
 		// than as a head with no children.

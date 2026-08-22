@@ -467,6 +467,11 @@ var Groups = []Group{
 				Note: "checked inside the operator loop, so a running query stops"},
 			// No probe: the shell is a program, not a statement, and its own
 			// tests drive it end to end.
+			// No probe: this is a test suite, not a statement.
+			{Name: "PostgreSQL parity suite", Parse: Yes, Exec: Yes,
+				Note: "compat/parity runs the same SQL against lightsql and a real PostgreSQL " +
+					"and compares result sets and SQLSTATEs; a difference that is understood " +
+					"is recorded rather than deleted, and fails if the two ever agree"},
 			{Name: "Command-line shell", Parse: Yes, Exec: Yes,
 				Note: "cmd/lightsql opens a database directory and runs SQL, with table, " +
 					"CSV and JSON output, .tables and .schema over the catalog views, and " +

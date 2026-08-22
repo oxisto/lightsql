@@ -1,8 +1,11 @@
 package types
 
 import (
+	"errors"
 	"strconv"
 	"strings"
+
+	"github.com/oxisto/lightsql/internal/pgerr"
 )
 
 // ErrCast reports a conversion that SQL does not permit. It is a plain error
@@ -17,6 +20,27 @@ type ErrCast struct {
 
 func (e *ErrCast) Error() string {
 	return "invalid input syntax for type " + e.To.String() + ": " + strconv.Quote(e.Val)
+}
+
+// CastState reports the SQLSTATE PostgreSQL uses for a failed conversion, which
+// depends on what was being converted to: a malformed date is a datetime format
+// error and everything else is an invalid text representation.
+//
+// It lives here rather than at the call sites because the binder and the
+// executor both wrap conversion failures, and the two must not disagree about
+// the code -- which is the kind of difference nobody notices until a caller
+// switches on it.
+func CastState(err error) string {
+	var e *ErrCast
+	if !errors.As(err, &e) {
+		return pgerr.InvalidTextForType
+	}
+	switch e.To {
+	case KindDate, KindTime, KindTimestamp, KindTimestamptz:
+		return pgerr.InvalidDatetimeFormat
+	default:
+		return pgerr.InvalidTextForType
+	}
 }
 
 // Cast converts a value to the requested kind, applying only the conversions
@@ -41,13 +65,19 @@ func Cast(v Value, want Kind) (Value, error) {
 		return Text(v.String()), nil
 
 	case KindBool:
-		if v.Kind() == KindText {
+		switch v.Kind() {
+		case KindText:
 			switch strings.ToLower(strings.TrimSpace(v.AsString())) {
 			case "t", "true", "yes", "on", "1":
 				return Bool(true), nil
 			case "f", "false", "no", "off", "0":
 				return Bool(false), nil
 			}
+		case KindInt:
+			// Zero is false and everything else is true, which is what
+			// PostgreSQL's integer-to-boolean cast does. Only the integer
+			// types have this cast there; a float or a numeric does not.
+			return Bool(v.AsInt() != 0), nil
 		}
 
 	case KindInt:

@@ -289,6 +289,20 @@ type SubqueryExpr struct {
 	Select *SelectStmt
 }
 
+// DefaultExpr is the word DEFAULT written where a value belongs, as in
+// `UPDATE t SET c = DEFAULT`.
+//
+// It is a node rather than a flag on Assignment because it is an expression
+// position in the grammar and will be one in more places than this: PostgreSQL
+// also accepts it inside INSERT ... VALUES. What it resolves to depends on the
+// column it is assigned to, so the binder is where it stops being a placeholder.
+type DefaultExpr struct {
+	DefaultPos token.Pos
+}
+
+func (e *DefaultExpr) Pos() token.Pos { return e.DefaultPos }
+func (*DefaultExpr) exprNode()        {}
+
 // CurrentTimeKind names which datetime value function was written.
 type CurrentTimeKind uint8
 

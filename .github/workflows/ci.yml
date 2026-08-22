@@ -39,6 +39,41 @@ jobs:
       - name: Test with the race detector
         run: go test ./... -race -count=1 -timeout 10m
 
+  # The parity suite is the one check that compares lightsql against a real
+  # PostgreSQL rather than against someone's reading of the documentation. It
+  # needs a database, so it is its own job with a service container rather than
+  # something the other jobs carry.
+  parity:
+    name: parity
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: parity
+          POSTGRES_DB: parity
+        ports:
+          - 5432:5432
+        # Without this the job races the database's first start.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Parity against PostgreSQL
+        working-directory: compat
+        env:
+          LIGHTSQL_PARITY_DSN: postgres://postgres:parity@localhost:5432/parity?sslmode=disable
+        run: go test -tags parity ./parity/... -count=1 -timeout 5m
+
   lint:
     name: lint
     runs-on: ubuntu-latest
