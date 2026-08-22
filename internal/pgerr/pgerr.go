@@ -36,6 +36,7 @@ const (
 	ForeignKeyViolation     = "23503"
 	UniqueViolation         = "23505"
 	CheckViolation          = "23514"
+	GeneratedAlways         = "428C9"
 	SerializationFailure    = "40001"
 	InvalidTransactionState = "25000"
 	InFailedTransaction     = "25P02"

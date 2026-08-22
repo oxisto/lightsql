@@ -252,6 +252,24 @@ func (b *Binder) bindCreateTable(s *ast.CreateTableStmt) (plan.Stmt, error) {
 				refs = append(refs, refSpec{
 					name: c.Name.Name, cols: []int{ordinal}, ref: c.Ref, pos: c.Pos(),
 				})
+			case ast.ConstraintIdentity:
+				// An identity column is a sequence-backed integer, which is
+				// what SERIAL already is, so it reuses that machinery rather
+				// than adding a second path to the same place.
+				if typ.Kind != types.KindInt {
+					return nil, pgerr.Newf(pgerr.DatatypeMismatch,
+						"identity column type must be smallint, integer or bigint, not %s",
+						typ.Name).At(c.Pos())
+				}
+				col.Type.Serial = true
+				// An identity column is NOT NULL by definition, as in
+				// PostgreSQL: there is always a value, since the sequence
+				// supplies one when the statement does not.
+				col.NotNull = true
+				col.Identity = catalog.IdentityByDefault
+				if c.IdentityAlways {
+					col.Identity = catalog.IdentityAlways
+				}
 			case ast.ConstraintNull:
 				// Explicit NULL is the default and carries no information.
 			default:
@@ -648,6 +666,25 @@ func columnOrdinals(t *catalog.Table, names []ast.Name) ([]int, error) {
 	return cols, nil
 }
 
+// checkIdentityWrite refuses a statement that supplies its own value for a
+// GENERATED ALWAYS identity column.
+//
+// The point of ALWAYS is that the sequence is the only source of the value.
+// Accepting one anyway would work -- the column is an ordinary integer
+// underneath -- and would quietly hand back a table whose keys came from two
+// places, which is exactly what the declaration ruled out.
+func checkIdentityWrite(t *catalog.Table, ordinal int, pos token.Pos) error {
+	if t.Columns[ordinal].Identity != catalog.IdentityAlways {
+		return nil
+	}
+	name := t.Columns[ordinal].Name
+	return pgerr.Newf(pgerr.GeneratedAlways,
+		"cannot insert a non-DEFAULT value into column %q", name).
+		WithDetail("Column %q is an identity column defined as GENERATED ALWAYS.", name).
+		WithHint("Use OVERRIDING SYSTEM VALUE to override.").
+		At(pos)
+}
+
 func indexOfColumn(cols []catalog.Column, name string) int {
 	for i := range cols {
 		if cols[i].Name == name {
@@ -687,7 +724,22 @@ func (b *Binder) bindInsert(s *ast.InsertStmt) (plan.Stmt, error) {
 					"column %q specified more than once", name.Name).At(name.Pos())
 			}
 			seen[i] = true
+			if err := checkIdentityWrite(t, i, name.Pos()); err != nil {
+				return nil, err
+			}
 			targets = append(targets, i)
+		}
+	}
+
+	if len(s.Columns) == 0 {
+		// Without a column list every column is a target, so a GENERATED
+		// ALWAYS column is one too. PostgreSQL refuses this rather than
+		// quietly skipping the column, and so does this: naming the columns
+		// is how a statement says which ones it means to supply.
+		for i := range t.Columns {
+			if err := checkIdentityWrite(t, i, s.Table.Pos()); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -824,6 +876,13 @@ func (b *Binder) bindUpdate(s *ast.UpdateStmt) (plan.Stmt, error) {
 				"multiple assignments to same column %q", a.Column.Name).At(a.Column.Pos())
 		}
 		seen[i] = true
+		if t.Columns[i].Identity == catalog.IdentityAlways {
+			return nil, pgerr.Newf(pgerr.GeneratedAlways,
+				"column %q can only be updated to DEFAULT", a.Column.Name).
+				WithDetail("Column %q is an identity column defined as GENERATED ALWAYS.",
+					a.Column.Name).
+				At(a.Column.Pos())
+		}
 
 		// The right-hand side is bound in the table's scope, so an assignment
 		// may read the row it is updating: SET n = n + 1 sees the old value.

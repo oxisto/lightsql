@@ -173,6 +173,30 @@ func TestSequencesDoNotRestart(t *testing.T) {
 		[]string{"1", "2", "3", "4"})
 }
 
+// TestIdentitySurvivesARestart covers an identity column across a restart. It
+// leans on two separate things being right: the schema statement replaying with
+// its constraint intact, and the sequence being derived from the rows rather
+// than restarting at one and colliding with a key that is already there.
+func TestIdentitySurvivesARestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "demo.db")
+
+	db, shut := onDisk(t, dir)
+	mustExec(t, db, `CREATE TABLE t (id INT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, nm TEXT)`)
+	mustExec(t, db, `INSERT INTO t (nm) VALUES ('a'), ('b')`)
+	shut()
+
+	again, _ := onDisk(t, dir)
+	mustExec(t, again, `INSERT INTO t (nm) VALUES ('c')`)
+	assertRows(t, scanStrings(t, again, `SELECT id FROM t ORDER BY id`),
+		[]string{"1", "2", "3"})
+
+	// The constraint came back with it, rather than the column degrading into
+	// an ordinary integer that happens to have a sequence behind it.
+	if _, err := again.Exec(`INSERT INTO t (id, nm) VALUES (9, 'd')`); err == nil {
+		t.Error("GENERATED ALWAYS accepted a value after a restart")
+	}
+}
+
 // TestAddedColumnKeepsItsMissingValue covers a row that is narrower than its
 // table. ADD COLUMN does not rewrite the rows already stored, so the ones
 // written before it read the value the column records for them -- and that has
