@@ -67,6 +67,16 @@ func TestExprPrecedence(t *testing.T) {
 		// And tighter than concatenation, so the arrow wins over the pipes.
 		{"a ->> 'k' || 'x'", `(|| (->> (col a) (lit "k")) (lit "x"))`},
 
+		// A datetime value function is a keyword standing for a value, so it
+		// composes like any other operand rather than needing a call.
+		{"current_timestamp", "(current_timestamp)"},
+		{"current_date", "(current_date)"},
+		{"current_time", "(current_time)"},
+		{"localtimestamp", "(localtimestamp)"},
+		{"localtime", "(localtime)"},
+		{"ts < current_timestamp", "(< (col ts) (current_timestamp))"},
+		{"current_date = d", "(= (current_date) (col d))"},
+
 		// A minus directly against an identifier must not be folded into a
 		// negative literal by the scanner.
 		{"a-1", "(- (col a) (lit 1))"},
@@ -542,6 +552,14 @@ func TestParseErrors(t *testing.T) {
 		// An UPDATE alias must be introduced with AS, so a bare identifier here
 		// is reported against the missing SET rather than silently accepted.
 		{"update bare alias", "UPDATE t x SET a = 1", 9, "SET"},
+		// The datetime value functions are reserved, so they cannot be an
+		// alias -- which is the whole reason they are keywords rather than
+		// identifiers matched by name.
+		{"reserved as alias", "SELECT 1 AS current_timestamp", 12, `at or near "CURRENT_TIMESTAMP"`},
+		// PostgreSQL accepts a precision, e.g. CURRENT_TIMESTAMP(0). lightsql
+		// stores microseconds and has nothing to round to, so the form is
+		// refused rather than silently ignored.
+		{"precision is not accepted", "SELECT current_timestamp(0)", 24, `at or near "("`},
 	}
 
 	for _, tt := range tests {

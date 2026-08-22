@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-66_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-67_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -205,7 +205,8 @@ the two.
 | ✅ | Floating point | ✅ | ✅ | REAL and DOUBLE PRECISION stored as float64 |
 | ✅ | Character types | ✅ | ✅ | TEXT, VARCHAR(n), CHARACTER VARYING(n), CHAR; length is recorded but not enforced |
 | ✅ | BOOLEAN | ✅ | ✅ |  |
-| 🟡 | Date and time | ✅ | 🟡 | columns, time.Time arguments and ISO 8601 literals, with either a space or a T separator. A zone offset is honoured by timestamptz and dropped by timestamp, as "without time zone" requires. A bare literal takes its type from the column it is compared or assigned to. now(), CURRENT_TIMESTAMP and INTERVAL are pending, and the non-ISO date styles PostgreSQL accepts are deliberately not, since 01/02/2024 has no reading that is right in both conventions |
+| 🟡 | Date and time | ✅ | 🟡 | columns, time.Time arguments and ISO 8601 literals, with either a space or a T separator. A zone offset is honoured by timestamptz and dropped by timestamp, as "without time zone" requires. A bare literal takes its type from the column it is compared or assigned to. INTERVAL is pending, and the non-ISO date styles PostgreSQL accepts are deliberately not, since 01/02/2024 has no reading that is right in both conventions |
+| 🟡 | Current date and time | ✅ | 🟡 | now(), CURRENT_TIMESTAMP, LOCALTIMESTAMP, CURRENT_DATE, CURRENT_TIME and LOCALTIME, all reporting the transaction start so that one transaction cannot disagree with itself. CURRENT_TIME is a plain time rather than PostgreSQL's zoned one, and a precision argument such as CURRENT_TIMESTAMP(0) is refused rather than ignored |
 | ✅ | BYTEA | ✅ | ✅ |  |
 | 🟡 | NUMERIC / DECIMAL | ✅ | 🟡 | stored as double precision; exact decimal arithmetic is pending |
 | 🟡 | UUID | ✅ | 🟡 | accepted and stored as text; no validation |

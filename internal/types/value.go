@@ -118,10 +118,43 @@ func Timestamp(micros int64) Value { return Value{k: KindTimestamp, n: uint64(mi
 // absolute instant and is rendered in the session zone.
 func Timestamptz(micros int64) Value { return Value{k: KindTimestamptz, n: uint64(micros)} }
 
-// TimeValue returns a timestamp value from a time.Time, truncated to
-// microseconds, which is PostgreSQL's resolution.
+// TimeValue returns a date, time or timestamp value from a time.Time, truncated
+// to microseconds, which is PostgreSQL's resolution.
+//
+// The payload each kind expects is different -- days for a date, microseconds
+// since midnight for a time, microseconds since the epoch for a timestamp -- and
+// they all live in the same field. Writing microseconds into a date would not
+// fail; it would produce a date some three billion years hence, which is exactly
+// the kind of confident wrong answer the Value layout makes possible if the kind
+// is not consulted.
 func TimeValue(t time.Time, k Kind) Value {
-	return Value{k: k, n: uint64(t.UnixMicro())}
+	switch k {
+	case KindDate:
+		return Date(unixDay(t))
+	case KindTime:
+		return Time(t.UnixMicro() - unixDay(t)*microsPerDay)
+	default:
+		return Value{k: k, n: uint64(t.UnixMicro())}
+	}
+}
+
+// microsPerDay is the length of a day in microseconds. Leap seconds do not
+// appear in Unix time, so a day is always exactly this long.
+const microsPerDay = 24 * 60 * 60 * 1e6
+
+// unixDay returns the number of whole days between the epoch and t, rounding
+// towards the past.
+//
+// Go's integer division truncates towards zero, which for a date before 1970
+// would land on the following midnight and make the time of day negative. Every
+// date in a test suite is after 1970 and would never show it.
+func unixDay(t time.Time) int64 {
+	micros := t.UnixMicro()
+	days := micros / microsPerDay
+	if micros < 0 && micros%microsPerDay != 0 {
+		days--
+	}
+	return days
 }
 
 // Kind returns the value's type.

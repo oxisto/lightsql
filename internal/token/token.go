@@ -85,6 +85,9 @@ const (
 	Constraint
 	Create
 	Cross
+	CurrentDate
+	CurrentTime
+	CurrentTimestamp
 	Default
 	Delete
 	Desc
@@ -111,6 +114,8 @@ const (
 	Left
 	Like
 	Limit
+	LocalTime
+	LocalTimestamp
 	Not
 	Null
 	Offset
@@ -190,14 +195,21 @@ var keywords = map[string]Kind{
 	"all": All, "and": And, "as": As, "asc": Asc, "between": Between,
 	"by": By, "case": Case, "cast": Cast, "check": Check,
 	"constraint": Constraint, "create": Create, "cross": Cross,
-	"default": Default,
-	"delete":  Delete, "desc": Desc, "distinct": Distinct, "drop": Drop,
+	// The datetime value functions are reserved, as they are in PostgreSQL.
+	// Leaving them unreserved would let `SELECT ts AS current_timestamp` shadow
+	// the keyword, and an alias is legal in exactly the position the keyword
+	// would otherwise be read in.
+	"current_date": CurrentDate, "current_time": CurrentTime,
+	"current_timestamp": CurrentTimestamp,
+	"default":           Default,
+	"delete":            Delete, "desc": Desc, "distinct": Distinct, "drop": Drop,
 	"else": Else, "end": End, "exists": Exists, "false": False,
 	"foreign": Foreign, "from": From,
 	"full": Full, "group": Group, "having": Having, "if": If, "in": In,
 	"inner": Inner, "insert": Insert, "intersect": Intersect, "into": Into,
 	"is": Is, "join": Join, "key": Key, "left": Left, "like": Like,
-	"limit": Limit, "not": Not, "null": Null, "offset": Offset, "on": On,
+	"limit": Limit, "localtime": LocalTime, "localtimestamp": LocalTimestamp,
+	"not": Not, "null": Null, "offset": Offset, "on": On,
 	"or": Or, "order": Order, "outer": Outer, "primary": Primary,
 	"references": References, "returning": Returning, "right": Right,
 	"select": Select, "set": Set, "table": Table, "then": Then, "true": True,

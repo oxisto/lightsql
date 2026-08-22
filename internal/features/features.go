@@ -359,11 +359,21 @@ var Groups = []Group{
 					"space or a T separator. A zone offset is honoured by timestamptz and " +
 					"dropped by timestamp, as \"without time zone\" requires. A bare literal " +
 					"takes its type from the column it is compared or assigned to. " +
-					"now(), CURRENT_TIMESTAMP and INTERVAL are pending, and the non-ISO date " +
+					"INTERVAL is pending, and the non-ISO date " +
 					"styles PostgreSQL accepts are deliberately not, since 01/02/2024 has no " +
 					"reading that is right in both conventions",
 				Setup: []string{"CREATE TABLE t (a DATE, b TIMESTAMP WITH TIME ZONE, c TIMESTAMP)"},
 				SQL:   "INSERT INTO t VALUES ('2024-01-02', '2024-01-02T12:30:00+02:00', '2024-01-02 12:30:00')"},
+			// Split from the row above, which used to say now() was pending
+			// long after it worked. A note is the one part of this registry the
+			// probes cannot check, so it is the part that goes stale.
+			{Name: "Current date and time", Parse: Yes, Exec: Partial,
+				Note: "now(), CURRENT_TIMESTAMP, LOCALTIMESTAMP, CURRENT_DATE, CURRENT_TIME " +
+					"and LOCALTIME, all reporting the transaction start so that one " +
+					"transaction cannot disagree with itself. CURRENT_TIME is a plain time " +
+					"rather than PostgreSQL's zoned one, and a precision argument such as " +
+					"CURRENT_TIMESTAMP(0) is refused rather than ignored",
+				SQL: "SELECT now(), CURRENT_TIMESTAMP, LOCALTIMESTAMP, CURRENT_DATE, CURRENT_TIME, LOCALTIME"},
 			{Name: "BYTEA", Parse: Yes, Exec: Yes, SQL: "CREATE TABLE t (a BYTEA)"},
 			{Name: "NUMERIC / DECIMAL", Parse: Yes, Exec: Partial,
 				Note: "stored as double precision; exact decimal arithmetic is pending",
