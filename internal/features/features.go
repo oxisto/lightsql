@@ -448,6 +448,12 @@ var Groups = []Group{
 				SQL:   "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 't')"},
 			{Name: "Context cancellation", Parse: Yes, Exec: Yes,
 				Note: "checked inside the operator loop, so a running query stops"},
+			// No probe: the shell is a program, not a statement, and its own
+			// tests drive it end to end.
+			{Name: "Command-line shell", Parse: Yes, Exec: Yes,
+				Note: "cmd/lightsql opens a database directory and runs SQL, with table, " +
+					"CSV and JSON output, .tables and .schema over the catalog views, and " +
+					"transactions as shell commands since the engine has no BEGIN statement"},
 			{Name: "SQLSTATE on every error", Parse: Yes, Exec: Yes,
 				Note: "errors satisfy interface{ SQLState() string }, as pgx and lib/pq do"},
 			// Partial rather than yes: what is on disk is correct and a crash
