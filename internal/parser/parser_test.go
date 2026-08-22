@@ -404,6 +404,22 @@ func TestParseCreateTable(t *testing.T) {
 			want: "(alter-table t (rename-column a b))",
 		},
 		{
+			name: "alter column set not null",
+			sql:  "ALTER TABLE t ALTER COLUMN a SET NOT NULL",
+			want: "(alter-table t (set-not-null a))",
+		},
+		{
+			name: "alter column drop not null",
+			sql:  "ALTER TABLE t ALTER COLUMN a DROP NOT NULL",
+			want: "(alter-table t (drop-not-null a))",
+		},
+		{
+			// COLUMN is optional here as it is after RENAME.
+			name: "alter column without the keyword",
+			sql:  "ALTER TABLE t ALTER a SET NOT NULL",
+			want: "(alter-table t (set-not-null a))",
+		},
+		{
 			// alter is unreserved, so it stays usable as a column name.
 			name: "alter is not a reserved word",
 			sql:  "SELECT alter FROM t",
@@ -556,6 +572,8 @@ func TestParseErrors(t *testing.T) {
 		// alias -- which is the whole reason they are keywords rather than
 		// identifiers matched by name.
 		{"reserved as alias", "SELECT 1 AS current_timestamp", 12, `at or near "CURRENT_TIMESTAMP"`},
+		{"alter column with no action", "ALTER TABLE t ALTER COLUMN a", 28, "SET NOT NULL or DROP NOT NULL"},
+		{"alter column set without not null", "ALTER TABLE t ALTER a SET NULL", 26, "expected NOT"},
 		// PostgreSQL accepts a precision, e.g. CURRENT_TIMESTAMP(0). lightsql
 		// stores microseconds and has nothing to round to, so the form is
 		// refused rather than silently ignored.
@@ -574,6 +592,52 @@ func TestParseErrors(t *testing.T) {
 			}
 			if e.Code != pgerr.SyntaxError {
 				t.Errorf("SQLSTATE = %s, want %s", e.Code, pgerr.SyntaxError)
+			}
+			if !strings.Contains(e.Message, tt.wantMsg) {
+				t.Errorf("message = %q, want it to contain %q", e.Message, tt.wantMsg)
+			}
+			if e.Pos != tt.wantPos {
+				t.Errorf("position = %d, want %d (message: %s)", e.Pos, tt.wantPos, e.Message)
+			}
+		})
+	}
+}
+
+// TestParseRefusals covers the forms the parser understands and declines,
+// which are a different thing from the ones it cannot read.
+//
+// They carry feature_not_supported rather than a syntax error, and they name
+// the construct: a reader who writes DROP COLUMN has written valid SQL and is
+// owed a reason, not a complaint about the token after it.
+func TestParseRefusals(t *testing.T) {
+	tests := []struct {
+		name    string
+		sql     string
+		wantPos token.Pos
+		wantMsg string
+	}{
+		{"drop column", "ALTER TABLE t DROP COLUMN a", 14,
+			"DROP COLUMN is not supported"},
+		{"alter column type", "ALTER TABLE t ALTER COLUMN a TYPE INT", 29,
+			"TYPE is not supported"},
+		{"alter column set default", "ALTER TABLE t ALTER COLUMN a SET DEFAULT 1", 33,
+			"SET or DROP DEFAULT"},
+		{"alter column drop default", "ALTER TABLE t ALTER COLUMN a DROP DEFAULT", 34,
+			"SET or DROP DEFAULT"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse(tt.sql)
+			if err == nil {
+				t.Fatalf("Parse(%q) succeeded, want a refusal", tt.sql)
+			}
+			var e *pgerr.Error
+			if !errors.As(err, &e) {
+				t.Fatalf("error %v is not a *pgerr.Error", err)
+			}
+			if e.Code != pgerr.FeatureNotSupported {
+				t.Errorf("SQLSTATE = %s, want %s", e.Code, pgerr.FeatureNotSupported)
 			}
 			if !strings.Contains(e.Message, tt.wantMsg) {
 				t.Errorf("message = %q, want it to contain %q", e.Message, tt.wantMsg)

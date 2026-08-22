@@ -741,12 +741,26 @@ type RenameColumn struct {
 	From, To  Name
 }
 
-func (a *RenameTable) Pos() token.Pos  { return a.RenamePos }
-func (a *RenameColumn) Pos() token.Pos { return a.RenamePos }
+// AlterColumnNotNull is ALTER TABLE ... ALTER COLUMN ... SET NOT NULL, or DROP
+// NOT NULL when NotNull is false.
+//
+// The two are one node because they are one action with opposite polarity, in
+// the way ExistsExpr and InExpr carry a Negate rather than being doubled. What
+// differs between them is a check, not a shape.
+type AlterColumnNotNull struct {
+	AlterPos token.Pos
+	Column   Name
+	NotNull  bool
+}
 
-func (*AddColumn) alterActionNode()    {}
-func (*RenameTable) alterActionNode()  {}
-func (*RenameColumn) alterActionNode() {}
+func (a *RenameTable) Pos() token.Pos        { return a.RenamePos }
+func (a *RenameColumn) Pos() token.Pos       { return a.RenamePos }
+func (a *AlterColumnNotNull) Pos() token.Pos { return a.AlterPos }
+
+func (*AddColumn) alterActionNode()          {}
+func (*RenameTable) alterActionNode()        {}
+func (*RenameColumn) alterActionNode()       {}
+func (*AlterColumnNotNull) alterActionNode() {}
 
 // CreateIndexStmt is CREATE INDEX.
 //

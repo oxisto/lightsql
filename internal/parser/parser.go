@@ -245,10 +245,60 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 
 // parseAlterTable parses ALTER TABLE.
 //
-// Only the rename forms are parsed. ADD COLUMN and DROP COLUMN both change the
-// shape of every stored row, which is a storage question rather than a syntax
-// one, so they are refused where they are read rather than parsed into a plan
-// nothing can carry out.
+// DROP COLUMN and a type change are refused here rather than parsed into a plan
+// nothing can carry out. Both rewrite every stored row, which is a storage
+// question rather than a syntax one.
+// parseAlterColumn parses ALTER TABLE ... ALTER COLUMN.
+//
+// Only the nullability actions are accepted. A type change is named rather than
+// left to a bare syntax error, since it is a form a reader will try, and unlike
+// nullability it cannot be a check over the rows already there: it changes what
+// is stored.
+func (p *parser) parseAlterColumn(stmt *ast.AlterTableStmt) (ast.Stmt, error) {
+	alterPos := p.cur().Pos
+	p.next()
+	// COLUMN is optional here as it is after RENAME, so anything that is not
+	// the word COLUMN is already the column name.
+	if p.atWord("column") {
+		p.next()
+	}
+	name, err := p.expectName()
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case p.at(token.Set) || p.at(token.Drop):
+		notNull := p.at(token.Set)
+		p.next()
+		if p.at(token.Default) {
+			// SET DEFAULT and DROP DEFAULT are the other half of what SET
+			// follows, and a reader who has just used SET NOT NULL will try
+			// them. Neither is hard -- the catalog already stores a DEFAULT as
+			// syntax -- so this says "yet" and means it.
+			return nil, pgerr.New(pgerr.FeatureNotSupported,
+				"ALTER TABLE ... ALTER COLUMN ... SET or DROP DEFAULT is not "+
+					"supported yet; write the DEFAULT in CREATE TABLE").At(p.cur().Pos)
+		}
+		if err := p.expect(token.Not); err != nil {
+			return nil, err
+		}
+		if err := p.expect(token.Null); err != nil {
+			return nil, err
+		}
+		stmt.Action = &ast.AlterColumnNotNull{AlterPos: alterPos, Column: name, NotNull: notNull}
+		return stmt, nil
+
+	case p.atWord("type"):
+		return nil, pgerr.New(pgerr.FeatureNotSupported,
+			"ALTER TABLE ... ALTER COLUMN ... TYPE is not supported; changing a "+
+				"column's type would rewrite every stored row").At(p.cur().Pos)
+
+	default:
+		return nil, p.unexpected("SET NOT NULL or DROP NOT NULL")
+	}
+}
+
 func (p *parser) parseAlterTable() (ast.Stmt, error) {
 	stmt := &ast.AlterTableStmt{AlterPos: p.cur().Pos}
 	p.next()
@@ -265,18 +315,22 @@ func (p *parser) parseAlterTable() (ast.Stmt, error) {
 		return p.parseAddColumn(stmt)
 	}
 
+	if p.atWord("alter") {
+		return p.parseAlterColumn(stmt)
+	}
+
 	renamePos := p.cur().Pos
 	if !p.atWord("rename") {
-		// DROP COLUMN and a type change are named rather than left to a bare
-		// syntax error, since both are forms a reader will try. Neither can be
-		// served by a missing value the way ADD COLUMN is: dropping shifts every
-		// later column's ordinal, and retyping changes what is already stored.
-		if p.at(token.Drop) || p.atWord("alter") {
+		// DROP COLUMN is named rather than left to a bare syntax error, since
+		// it is a form a reader will try. It cannot be served by a missing
+		// value the way ADD COLUMN is: dropping shifts every later column's
+		// ordinal, so every stored row would have to be rewritten.
+		if p.at(token.Drop) {
 			return nil, pgerr.New(pgerr.FeatureNotSupported,
-				"only ALTER TABLE ... ADD COLUMN and RENAME are supported; dropping "+
-					"or retyping a column would rewrite every stored row").At(p.cur().Pos)
+				"ALTER TABLE ... DROP COLUMN is not supported; it would shift the "+
+					"ordinal of every later column and rewrite every stored row").At(p.cur().Pos)
 		}
-		return nil, p.unexpected("ADD or RENAME")
+		return nil, p.unexpected("ADD, ALTER or RENAME")
 	}
 	p.next()
 

@@ -283,3 +283,129 @@ func TestAlterTableAddColumnErrors(t *testing.T) {
 		t.Error("expected PRIMARY KEY on ADD COLUMN to be rejected")
 	}
 }
+
+// TestAlterColumnSetNotNull covers the migration the feature exists for: add a
+// nullable column, backfill it from another one, then tighten it.
+//
+// ADD COLUMN ... NOT NULL DEFAULT already worked, but it only covers the case
+// where every row gets the same constant. A value derived per row -- copied
+// from another column, looked up elsewhere -- has nowhere to go without this.
+func TestAlterColumnSetNotNull(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE persons (id TEXT PRIMARY KEY)`,
+		`CREATE TABLE portfolios (id TEXT PRIMARY KEY, user_id TEXT NOT NULL)`,
+		`INSERT INTO persons VALUES ('u1'), ('u2')`,
+		`INSERT INTO portfolios VALUES ('p1', 'u1'), ('p2', 'u2')`,
+		`ALTER TABLE portfolios ADD COLUMN person_id TEXT REFERENCES persons(id)`,
+	)
+
+	// Tightening before the backfill has to fail, or the constraint would be
+	// promised about rows that already break it.
+	err := queryErr(db, `ALTER TABLE portfolios ALTER COLUMN person_id SET NOT NULL`)
+	if err == nil {
+		t.Fatal("SET NOT NULL succeeded while the column still held nulls")
+	}
+	if !strings.Contains(err.Error(), "contains null values") {
+		t.Errorf("got %v, want it to name the nulls", err)
+	}
+
+	mustExecAll(t, db,
+		`UPDATE portfolios SET person_id = user_id`,
+		`ALTER TABLE portfolios ALTER COLUMN person_id SET NOT NULL`,
+	)
+
+	// The constraint now applies to what comes next.
+	err = queryErr(db, `INSERT INTO portfolios (id, user_id) VALUES ('p3', 'u1')`)
+	if err == nil {
+		t.Fatal("an insert omitting a NOT NULL column succeeded")
+	}
+	if !strings.Contains(err.Error(), "not-null constraint") {
+		t.Errorf("got %v, want a not-null violation", err)
+	}
+
+	// And DROP NOT NULL puts it back.
+	mustExecAll(t, db,
+		`ALTER TABLE portfolios ALTER COLUMN person_id DROP NOT NULL`,
+		`INSERT INTO portfolios (id, user_id) VALUES ('p3', 'u1')`,
+	)
+	if got := rowsOf(t, db, `SELECT count(*) FROM portfolios`); !slices.Equal(got, []string{"3"}) {
+		t.Errorf("count = %v, want 3", got)
+	}
+}
+
+// TestAlterColumnNotNullChecksShortRows covers a row written before an ADD
+// COLUMN, which is narrower than the table and reads the value the column
+// records for it. That value is as much subject to the constraint as any other,
+// and a check that only looked at stored values would miss it entirely.
+func TestAlterColumnNotNullChecksShortRows(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE t (a INT)`,
+		`INSERT INTO t VALUES (1)`,
+		// No DEFAULT, so the row already there reads NULL for the new column.
+		`ALTER TABLE t ADD COLUMN b INT`,
+	)
+
+	err := queryErr(db, `ALTER TABLE t ALTER COLUMN b SET NOT NULL`)
+	if err == nil {
+		t.Fatal("SET NOT NULL succeeded although a row predating the column reads null")
+	}
+	if !strings.Contains(err.Error(), "contains null values") {
+		t.Errorf("got %v, want it to name the nulls", err)
+	}
+
+	// A column added with a DEFAULT gives those rows a real value, so the same
+	// statement is fine.
+	mustExecAll(t, db,
+		`ALTER TABLE t ADD COLUMN c INT DEFAULT 7`,
+		`ALTER TABLE t ALTER COLUMN c SET NOT NULL`,
+	)
+}
+
+// TestAlterColumnNotNullErrors covers the refusals, including the one that is
+// easy to get wrong: a primary key column is NOT NULL because it is part of the
+// key, so dropping the flag would leave the constraint and the column
+// disagreeing.
+func TestAlterColumnNotNullErrors(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db, `CREATE TABLE t (id INT PRIMARY KEY, nm TEXT)`)
+
+	tests := []struct {
+		name string
+		stmt string
+		want string
+	}{
+		{"unknown table", `ALTER TABLE nope ALTER COLUMN a SET NOT NULL`, "does not exist"},
+		{"unknown column", `ALTER TABLE t ALTER COLUMN nope SET NOT NULL`, "does not exist"},
+		{"primary key column", `ALTER TABLE t ALTER COLUMN id DROP NOT NULL`, "is in a primary key"},
+		{"type change", `ALTER TABLE t ALTER COLUMN nm TYPE INT`, "rewrite every stored row"},
+		{"set default", `ALTER TABLE t ALTER COLUMN nm SET DEFAULT 'x'`, "SET or DROP DEFAULT"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := queryErr(db, tt.stmt)
+			if err == nil {
+				t.Fatalf("%s: expected an error", tt.stmt)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("%s\n got: %v\nwant it to contain: %q", tt.stmt, err, tt.want)
+			}
+		})
+	}
+}
+
+// TestAlterColumnNotNullIsIdempotent pins that setting what is already set is a
+// no-op rather than an error, which is what lets a migration be re-run after it
+// failed partway.
+func TestAlterColumnNotNullIsIdempotent(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE t (a INT NOT NULL)`,
+		`ALTER TABLE t ALTER COLUMN a SET NOT NULL`,
+		`ALTER TABLE t ALTER COLUMN a DROP NOT NULL`,
+		`ALTER TABLE t ALTER COLUMN a DROP NOT NULL`,
+	)
+	mustExecAll(t, db, `INSERT INTO t VALUES (NULL)`)
+}

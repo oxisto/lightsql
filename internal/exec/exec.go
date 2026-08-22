@@ -1049,6 +1049,15 @@ func ExecRenameTable(cat *catalog.Catalog, rt *plan.RenameTable) error {
 	return cat.RenameTable(rt.Schema, rt.From, rt.To)
 }
 
+// ExecSetNotNull runs ALTER TABLE ... ALTER COLUMN ... SET or DROP NOT NULL.
+//
+// It takes the transaction because adding the constraint is checked against the
+// rows already stored, and which rows those are is a question only a snapshot
+// can answer.
+func ExecSetNotNull(cat *catalog.Catalog, tx *storage.Tx, sn *plan.SetNotNull) error {
+	return cat.SetNotNull(tx, sn.Schema, sn.Table, sn.Column, sn.NotNull)
+}
+
 // ExecRenameColumn runs ALTER TABLE ... RENAME COLUMN.
 func ExecRenameColumn(cat *catalog.Catalog, rc *plan.RenameColumn) error {
 	return cat.RenameColumn(rc.Schema, rc.Table, rc.From, rc.To)

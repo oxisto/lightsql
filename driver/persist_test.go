@@ -219,6 +219,29 @@ func TestSchemaChangesSurvive(t *testing.T) {
 	}
 }
 
+// TestTightenedColumnStaysTightened covers SET NOT NULL across a restart. It is
+// worth its own test because of how recovery orders things: every schema
+// statement is replayed before a single row is placed, so the check this
+// statement performs runs against an empty table. That is the right answer
+// rather than a lucky one -- the rows being replayed were checked when they
+// were first written -- but it is only right by construction.
+func TestTightenedColumnStaysTightened(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "demo.db")
+
+	db, shut := onDisk(t, dir)
+	mustExec(t, db, `CREATE TABLE t (id INT PRIMARY KEY, label TEXT)`)
+	mustExec(t, db, `INSERT INTO t VALUES (1, NULL)`)
+	mustExec(t, db, `UPDATE t SET label = 'one'`)
+	mustExec(t, db, `ALTER TABLE t ALTER COLUMN label SET NOT NULL`)
+	shut()
+
+	again, _ := onDisk(t, dir)
+	assertRows(t, scanStrings(t, again, `SELECT label FROM t`), []string{"one"})
+	if _, err := again.Exec(`INSERT INTO t (id) VALUES (2)`); err == nil {
+		t.Error("a column tightened before the restart accepted a null after it")
+	}
+}
+
 // TestRenameAfterWritingInOneTransaction is the case that decided how a record
 // names its table. The rename reaches the log first, because DDL is written as
 // it runs while rows wait for the commit -- so by the time recovery reaches the

@@ -247,6 +247,15 @@ func (p *printer) node(n Node) {
 		p.name(n.To)
 		p.close()
 
+	case *AlterColumnNotNull:
+		if n.NotNull {
+			p.open("set-not-null")
+		} else {
+			p.open("drop-not-null")
+		}
+		p.name(n.Column)
+		p.close()
+
 	case *CreateIndexStmt:
 		p.open("create-index")
 		p.atom("%s", n.Name.Name)
