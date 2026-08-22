@@ -200,3 +200,166 @@ func TestTemporalCrossKind(t *testing.T) {
 		}
 	})
 }
+
+// TestDatetimeValueFunctions covers the keyword forms of "what time is it".
+//
+// Each one names a different part of the transaction's start, and they share a
+// payload field, so the risk is not that one of them fails but that one of them
+// answers with another's units. CURRENT_DATE reading microseconds as a day
+// count is a date three billion years hence, which no assertion on "did it
+// return a time" would notice.
+func TestDatetimeValueFunctions(t *testing.T) {
+	db := open(t)
+
+	begin := time.Now().UTC().Add(-time.Second)
+
+	tests := []struct {
+		name  string
+		query string
+		check func(t *testing.T, got time.Time)
+	}{
+		{
+			name:  "CURRENT_TIMESTAMP is now",
+			query: `SELECT CURRENT_TIMESTAMP`,
+			check: func(t *testing.T, got time.Time) { assertRecent(t, got, begin) },
+		},
+		{
+			name:  "LOCALTIMESTAMP is now",
+			query: `SELECT LOCALTIMESTAMP`,
+			check: func(t *testing.T, got time.Time) { assertRecent(t, got, begin) },
+		},
+		{
+			name:  "CURRENT_DATE is today at midnight",
+			query: `SELECT CURRENT_DATE`,
+			check: func(t *testing.T, got time.Time) {
+				if h, m, s := got.Clock(); h != 0 || m != 0 || s != 0 {
+					t.Errorf("CURRENT_DATE = %s, want a midnight", got.Format(time.RFC3339Nano))
+				}
+				wantY, wantM, wantD := time.Now().UTC().Date()
+				if y, mo, d := got.Date(); y != wantY || mo != wantM || d != wantD {
+					t.Errorf("CURRENT_DATE = %s, want %04d-%02d-%02d",
+						got.Format(time.RFC3339), wantY, wantM, wantD)
+				}
+			},
+		},
+		{
+			name:  "CURRENT_TIME is a time of day",
+			query: `SELECT CURRENT_TIME`,
+			check: assertTimeOfDay,
+		},
+		{
+			name:  "LOCALTIME is a time of day",
+			query: `SELECT LOCALTIME`,
+			check: assertTimeOfDay,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got time.Time
+			if err := db.QueryRow(tt.query).Scan(&got); err != nil {
+				t.Fatalf("%s: %v", tt.query, err)
+			}
+			tt.check(t, got.UTC())
+		})
+	}
+}
+
+// assertRecent checks that a timestamp is between the moment the test started
+// and a moment after it, which is as tight as an assertion about "now" can be.
+func assertRecent(t *testing.T, got, begin time.Time) {
+	t.Helper()
+	end := time.Now().UTC().Add(time.Second)
+	if got.Before(begin) || got.After(end) {
+		t.Errorf("got %s, want something between %s and %s",
+			got.Format(time.RFC3339Nano), begin.Format(time.RFC3339Nano),
+			end.Format(time.RFC3339Nano))
+	}
+}
+
+// assertTimeOfDay checks that a time carries no date, which is how lightsql
+// stores one: microseconds since midnight, rendered on the epoch day.
+func assertTimeOfDay(t *testing.T, got time.Time) {
+	t.Helper()
+	if y, m, d := got.Date(); y != 1970 || m != time.January || d != 1 {
+		t.Errorf("got %s, want a time of day on the epoch date",
+			got.Format(time.RFC3339Nano))
+	}
+	wantHour := time.Now().UTC().Hour()
+	if h := got.Hour(); h != wantHour {
+		t.Errorf("got hour %d, want %d", h, wantHour)
+	}
+}
+
+// TestDatetimeValueFunctionsAgreeWithinATransaction pins the property that
+// makes these usable in a migration: every statement in one transaction sees
+// the same "now", so two rows inserted together cannot disagree about when they
+// were written. PostgreSQL guarantees exactly this.
+func TestDatetimeValueFunctionsAgreeWithinATransaction(t *testing.T) {
+	db := open(t)
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	var first, viaNow, second time.Time
+	if err := tx.QueryRow(`SELECT CURRENT_TIMESTAMP`).Scan(&first); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if err := tx.QueryRow(`SELECT now()`).Scan(&viaNow); err != nil {
+		t.Fatalf("now(): %v", err)
+	}
+	if err := tx.QueryRow(`SELECT CURRENT_TIMESTAMP`).Scan(&second); err != nil {
+		t.Fatalf("second: %v", err)
+	}
+
+	if !first.Equal(second) {
+		t.Errorf("CURRENT_TIMESTAMP moved within a transaction: %s then %s",
+			first.Format(time.RFC3339Nano), second.Format(time.RFC3339Nano))
+	}
+	// The two spellings must also agree with each other, or a schema mixing
+	// them would record two different times for one transaction.
+	if !first.Equal(viaNow) {
+		t.Errorf("CURRENT_TIMESTAMP is %s but now() is %s",
+			first.Format(time.RFC3339Nano), viaNow.Format(time.RFC3339Nano))
+	}
+}
+
+// TestCurrentTimestampAsDefault is the form the issue that prompted this was
+// actually about: a column that stamps itself, written the way a schema ported
+// from another dialect writes it.
+func TestCurrentTimestampAsDefault(t *testing.T) {
+	db := open(t)
+
+	if _, err := db.Exec(`CREATE TABLE sessions (
+		id         TEXT PRIMARY KEY,
+		created    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		created_on DATE      NOT NULL DEFAULT CURRENT_DATE
+	)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sessions (id) VALUES ('a')`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	var created, createdOn time.Time
+	err := db.QueryRow(`SELECT created, created_on FROM sessions`).Scan(&created, &createdOn)
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	assertRecent(t, created.UTC(), time.Now().UTC().Add(-time.Minute))
+	if h, m, s := createdOn.UTC().Clock(); h != 0 || m != 0 || s != 0 {
+		t.Errorf("a DATE default kept a time of day: %s", createdOn.Format(time.RFC3339Nano))
+	}
+
+	// The comparison a session table actually runs.
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM sessions WHERE created <= CURRENT_TIMESTAMP`).Scan(&n); err != nil {
+		t.Fatalf("comparison: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("comparing against CURRENT_TIMESTAMP matched %d rows, want 1", n)
+	}
+}

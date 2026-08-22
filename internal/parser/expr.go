@@ -317,11 +317,34 @@ func (p *parser) parsePrefix() (ast.Expr, error) {
 	case token.Cast:
 		return p.parseCastCall()
 
+	case token.CurrentTimestamp, token.LocalTimestamp, token.CurrentDate,
+		token.CurrentTime, token.LocalTime:
+		p.next()
+		return &ast.CurrentTimeExpr{KeywordPos: tok.Pos, Which: currentTimeKind(tok.Kind)}, nil
+
 	case token.Ident, token.QuotedIdent:
 		return p.parseIdentExpr()
 	}
 
 	return nil, p.unexpected("an expression")
+}
+
+// currentTimeKind maps a datetime value function keyword to its AST kind. A
+// table rather than a switch at the call site keeps the two lists together, so
+// adding a keyword without handling it does not compile.
+func currentTimeKind(k token.Kind) ast.CurrentTimeKind {
+	switch k {
+	case token.LocalTimestamp:
+		return ast.LocalTimestamp
+	case token.CurrentDate:
+		return ast.CurrentDate
+	case token.CurrentTime:
+		return ast.CurrentTime
+	case token.LocalTime:
+		return ast.LocalTime
+	default:
+		return ast.CurrentTimestamp
+	}
 }
 
 func (p *parser) boolLiteral() *ast.Literal {

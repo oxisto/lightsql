@@ -5,6 +5,7 @@ import (
 	"hash/maphash"
 	"math"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -257,4 +258,50 @@ func BenchmarkValueNoAlloc(b *testing.B) {
 		sink = Int(int64(i))
 	}
 	_ = sink
+}
+
+// TestTimeValueRespectsTheKind covers the trap the Value layout sets: a date
+// counts days, a time counts microseconds since midnight, and a timestamp
+// counts microseconds since the epoch, but all three live in the same field.
+// Writing the wrong unit does not fail, it produces a confident wrong answer --
+// microseconds read as days is a date some three billion years hence.
+func TestTimeValueRespectsTheKind(t *testing.T) {
+	// 2026-08-22T10:30:45.123456Z, and the same instant before the epoch.
+	at := time.Date(2026, 8, 22, 10, 30, 45, 123456000, time.UTC)
+	before := time.Date(1969, 3, 4, 5, 6, 7, 0, time.UTC)
+
+	tests := []struct {
+		name string
+		in   time.Time
+		kind Kind
+		want time.Time
+	}{
+		{"timestamp keeps the instant", at, KindTimestamp, at},
+		{"timestamptz keeps the instant", at, KindTimestamptz, at},
+		{"date drops the time of day", at, KindDate, at.Truncate(24 * time.Hour)},
+		{"time drops the date", at, KindTime,
+			time.Date(1970, 1, 1, 10, 30, 45, 123456000, time.UTC)},
+
+		// Before the epoch the counts go negative, and Go's integer division
+		// truncates towards zero. A date that rounded the wrong way would land
+		// on the following midnight, which no test dated after 1970 would show.
+		{"a date before the epoch rounds towards the past", before, KindDate,
+			time.Date(1969, 3, 4, 0, 0, 0, 0, time.UTC)},
+		{"a time before the epoch is still a time of day", before, KindTime,
+			time.Date(1970, 1, 1, 5, 6, 7, 0, time.UTC)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := TimeValue(tt.in, tt.kind)
+			if v.Kind() != tt.kind {
+				t.Fatalf("kind = %s, want %s", v.Kind(), tt.kind)
+			}
+			if got := v.AsTime(); !got.Equal(tt.want) {
+				t.Errorf("TimeValue(%s, %s).AsTime() = %s, want %s",
+					tt.in.Format(time.RFC3339Nano), tt.kind,
+					got.Format(time.RFC3339Nano), tt.want.Format(time.RFC3339Nano))
+			}
+		})
+	}
 }

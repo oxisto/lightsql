@@ -17,7 +17,11 @@
 //     once and executed many times.
 package ast
 
-import "github.com/oxisto/lightsql/internal/token"
+import (
+	"strconv"
+
+	"github.com/oxisto/lightsql/internal/token"
+)
 
 // Node is the interface implemented by all AST nodes.
 type Node interface {
@@ -285,21 +289,71 @@ type SubqueryExpr struct {
 	Select *SelectStmt
 }
 
-func (e *Literal) Pos() token.Pos      { return e.ValuePos }
-func (e *Param) Pos() token.Pos        { return e.ParamPos }
-func (e *ColumnRef) Pos() token.Pos    { return e.first().NamePos }
-func (e *Star) Pos() token.Pos         { return e.StarPos }
-func (e *BinaryExpr) Pos() token.Pos   { return e.X.Pos() }
-func (e *UnaryExpr) Pos() token.Pos    { return e.OpPos }
-func (e *ParenExpr) Pos() token.Pos    { return e.Lparen }
-func (e *IsNullExpr) Pos() token.Pos   { return e.X.Pos() }
-func (e *CastExpr) Pos() token.Pos     { return e.CastPos }
-func (e *FuncCall) Pos() token.Pos     { return e.Name.NamePos }
-func (e *InExpr) Pos() token.Pos       { return e.X.Pos() }
-func (e *BetweenExpr) Pos() token.Pos  { return e.X.Pos() }
-func (e *CaseExpr) Pos() token.Pos     { return e.CasePos }
-func (e *ExistsExpr) Pos() token.Pos   { return e.ExistsPos }
-func (e *SubqueryExpr) Pos() token.Pos { return e.Lparen }
+// CurrentTimeKind names which datetime value function was written.
+type CurrentTimeKind uint8
+
+const (
+	// CurrentTimestamp is CURRENT_TIMESTAMP: the transaction's start as an
+	// absolute instant, with a time zone.
+	CurrentTimestamp CurrentTimeKind = iota
+	// LocalTimestamp is LOCALTIMESTAMP: the same instant without a zone.
+	LocalTimestamp
+	// CurrentDate is CURRENT_DATE: the day the transaction started.
+	CurrentDate
+	// CurrentTime is CURRENT_TIME, and LocalTime is LOCALTIME: the time of day
+	// the transaction started. PostgreSQL gives the first a zone and the second
+	// none; lightsql has no zoned time type, so the two are one node here and
+	// the compatibility matrix says so.
+	CurrentTime
+	LocalTime
+)
+
+var currentTimeNames = [...]string{
+	CurrentTimestamp: "current_timestamp",
+	LocalTimestamp:   "localtimestamp",
+	CurrentDate:      "current_date",
+	CurrentTime:      "current_time",
+	LocalTime:        "localtime",
+}
+
+// String returns the keyword as written, lower cased.
+func (k CurrentTimeKind) String() string {
+	if int(k) < len(currentTimeNames) {
+		return currentTimeNames[k]
+	}
+	return "CurrentTimeKind(" + strconv.Itoa(int(k)) + ")"
+}
+
+// CurrentTimeExpr is one of SQL's datetime value functions: CURRENT_TIMESTAMP,
+// LOCALTIMESTAMP, CURRENT_DATE, CURRENT_TIME or LOCALTIME.
+//
+// They are one node with a kind rather than five nodes because they are one
+// production: a keyword that stands for a value, differing only in which part
+// of the transaction's start time it names. PostgreSQL models them the same
+// way. They are deliberately not rewritten into a call to now() during parsing,
+// which would work but would make an error message name a function the author
+// never wrote.
+type CurrentTimeExpr struct {
+	KeywordPos token.Pos
+	Which      CurrentTimeKind
+}
+
+func (e *Literal) Pos() token.Pos         { return e.ValuePos }
+func (e *Param) Pos() token.Pos           { return e.ParamPos }
+func (e *ColumnRef) Pos() token.Pos       { return e.first().NamePos }
+func (e *Star) Pos() token.Pos            { return e.StarPos }
+func (e *BinaryExpr) Pos() token.Pos      { return e.X.Pos() }
+func (e *UnaryExpr) Pos() token.Pos       { return e.OpPos }
+func (e *ParenExpr) Pos() token.Pos       { return e.Lparen }
+func (e *IsNullExpr) Pos() token.Pos      { return e.X.Pos() }
+func (e *CastExpr) Pos() token.Pos        { return e.CastPos }
+func (e *FuncCall) Pos() token.Pos        { return e.Name.NamePos }
+func (e *InExpr) Pos() token.Pos          { return e.X.Pos() }
+func (e *BetweenExpr) Pos() token.Pos     { return e.X.Pos() }
+func (e *CaseExpr) Pos() token.Pos        { return e.CasePos }
+func (e *ExistsExpr) Pos() token.Pos      { return e.ExistsPos }
+func (e *SubqueryExpr) Pos() token.Pos    { return e.Lparen }
+func (e *CurrentTimeExpr) Pos() token.Pos { return e.KeywordPos }
 
 // first returns the leftmost written component of a column reference.
 func (e *ColumnRef) first() Name {
@@ -324,21 +378,22 @@ func (e *ColumnRef) String() string {
 	return s
 }
 
-func (*Literal) exprNode()      {}
-func (*Param) exprNode()        {}
-func (*ColumnRef) exprNode()    {}
-func (*Star) exprNode()         {}
-func (*BinaryExpr) exprNode()   {}
-func (*UnaryExpr) exprNode()    {}
-func (*ParenExpr) exprNode()    {}
-func (*IsNullExpr) exprNode()   {}
-func (*CastExpr) exprNode()     {}
-func (*FuncCall) exprNode()     {}
-func (*InExpr) exprNode()       {}
-func (*BetweenExpr) exprNode()  {}
-func (*CaseExpr) exprNode()     {}
-func (*ExistsExpr) exprNode()   {}
-func (*SubqueryExpr) exprNode() {}
+func (*Literal) exprNode()         {}
+func (*Param) exprNode()           {}
+func (*ColumnRef) exprNode()       {}
+func (*Star) exprNode()            {}
+func (*CurrentTimeExpr) exprNode() {}
+func (*BinaryExpr) exprNode()      {}
+func (*UnaryExpr) exprNode()       {}
+func (*ParenExpr) exprNode()       {}
+func (*IsNullExpr) exprNode()      {}
+func (*CastExpr) exprNode()        {}
+func (*FuncCall) exprNode()        {}
+func (*InExpr) exprNode()          {}
+func (*BetweenExpr) exprNode()     {}
+func (*CaseExpr) exprNode()        {}
+func (*ExistsExpr) exprNode()      {}
+func (*SubqueryExpr) exprNode()    {}
 
 // ---------------------------------------------------------------------------
 // Types

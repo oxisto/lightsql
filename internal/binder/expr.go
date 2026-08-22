@@ -88,6 +88,9 @@ func bindExpr(e ast.Expr, sc *scope) (plan.Expr, error) {
 	case *ast.FuncCall:
 		return bindFuncCall(e, sc)
 
+	case *ast.CurrentTimeExpr:
+		return &plan.Now{Kind: currentTimeType(e.Which)}, nil
+
 	case *ast.Star:
 		return nil, pgerr.New(pgerr.SyntaxError,
 			"* is not valid in this context").At(e.Pos())
@@ -322,6 +325,22 @@ func bindScalarSubquery(e *ast.SubqueryExpr, sc *scope) (plan.Expr, error) {
 		return nil, err
 	}
 	return &plan.ScalarSubquery{Input: node, Kind: node.Result()[0].Type.Kind}, nil
+}
+
+// currentTimeType gives each datetime value function the type PostgreSQL gives
+// it, except that CURRENT_TIME is a plain time rather than a zoned one, because
+// lightsql has no zoned time kind.
+func currentTimeType(k ast.CurrentTimeKind) types.Kind {
+	switch k {
+	case ast.LocalTimestamp:
+		return types.KindTimestamp
+	case ast.CurrentDate:
+		return types.KindDate
+	case ast.CurrentTime, ast.LocalTime:
+		return types.KindTime
+	default:
+		return types.KindTimestamptz
+	}
 }
 
 func bindExists(e *ast.ExistsExpr, sc *scope) (plan.Expr, error) {
