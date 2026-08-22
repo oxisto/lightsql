@@ -136,21 +136,8 @@ func (p *printer) node(n Node) {
 		p.field("where", n.Where)
 		p.exprList("group-by", n.GroupBy)
 		p.field("having", n.Having)
-		if len(n.OrderBy) > 0 {
-			p.open("order-by")
-			for _, o := range n.OrderBy {
-				p.open("term")
-				p.atom("%s", strings.ToLower(sortDirName(o.Dir)))
-				if o.Nulls != NullsDefault {
-					p.atom("%s", strings.ToLower(nullsOrderName(o.Nulls)))
-				}
-				p.node(o.Expr)
-				p.close()
-			}
-			p.close()
-		}
-		p.field("limit", n.Limit)
-		p.field("offset", n.Offset)
+		p.orderBy(n.OrderBy)
+		p.limit(n.Limit, n.Offset)
 		p.close()
 
 	case *InsertStmt:
@@ -522,6 +509,18 @@ func (p *printer) node(n Node) {
 		p.node(n.Select)
 		p.close()
 
+	case *SetOp:
+		head := strings.ToLower(n.Op.String())
+		if n.All {
+			head += "-all"
+		}
+		p.open(head)
+		p.node(n.Left)
+		p.node(n.Right)
+		p.orderBy(n.OrderBy)
+		p.limit(n.Limit, n.Offset)
+		p.close()
+
 	case *DefaultExpr:
 		p.open("default")
 		p.close()
@@ -588,4 +587,27 @@ func nullsOrderName(n NullsOrder) string {
 		return "NULLS-FIRST"
 	}
 	return "NULLS-LAST"
+}
+
+// orderBy prints an ORDER BY list, shared by the two nodes that can carry one.
+func (p *printer) orderBy(items []OrderByItem) {
+	if len(items) == 0 {
+		return
+	}
+	p.open("order-by")
+	for _, o := range items {
+		p.open("term")
+		p.atom("%s", strings.ToLower(sortDirName(o.Dir)))
+		if o.Nulls != NullsDefault {
+			p.atom("%s", strings.ToLower(nullsOrderName(o.Nulls)))
+		}
+		p.node(o.Expr)
+		p.close()
+	}
+	p.close()
+}
+
+func (p *printer) limit(limit, offset Expr) {
+	p.field("limit", limit)
+	p.field("offset", offset)
 }

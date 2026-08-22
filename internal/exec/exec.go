@@ -132,6 +132,18 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		}
 		return op, nil
 
+	case *plan.SetOp:
+		left, err := Build(ctx, n.Left, tx, args)
+		if err != nil {
+			return nil, err
+		}
+		right, err := Build(ctx, n.Right, tx, args)
+		if err != nil {
+			_ = left.Close()
+			return nil, err
+		}
+		return newSetOp(left, right, n), nil
+
 	case *plan.Distinct:
 		input, err := Build(ctx, n.Input, tx, args)
 		if err != nil {

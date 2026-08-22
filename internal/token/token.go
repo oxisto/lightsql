@@ -95,6 +95,7 @@ const (
 	Drop
 	Else
 	End
+	Except
 	Exists
 	False
 	Foreign
@@ -203,7 +204,7 @@ var keywords = map[string]Kind{
 	"current_timestamp": CurrentTimestamp,
 	"default":           Default,
 	"delete":            Delete, "desc": Desc, "distinct": Distinct, "drop": Drop,
-	"else": Else, "end": End, "exists": Exists, "false": False,
+	"else": Else, "end": End, "except": Except, "exists": Exists, "false": False,
 	"foreign": Foreign, "from": From,
 	"full": Full, "group": Group, "having": Having, "if": If, "in": In,
 	"inner": Inner, "insert": Insert, "intersect": Intersect, "into": Into,

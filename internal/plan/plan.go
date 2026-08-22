@@ -248,6 +248,19 @@ type SystemScan struct {
 	Cols []ResultColumn
 }
 
+// SetOp combines two inputs by UNION, INTERSECT or EXCEPT.
+//
+// Both sides produce the same number of columns, unified to a common type by
+// the binder, so nothing below here has to reconcile shapes per row.
+type SetOp struct {
+	Left, Right Node
+	Op          ast.SetOpKind
+	// All keeps duplicates, which for INTERSECT and EXCEPT means counting them:
+	// see the executor.
+	All  bool
+	Cols []ResultColumn
+}
+
 // Join combines two inputs. The output row is the left row followed by the
 // right one, so a column's ordinal in the joined row is its ordinal within its
 // own side plus the width of everything to the left of it — which is what the
@@ -349,6 +362,7 @@ type Limit struct {
 
 func (n *SingleRow) Result() []ResultColumn  { return nil }
 func (n *Scan) Result() []ResultColumn       { return n.Cols }
+func (n *SetOp) Result() []ResultColumn      { return n.Cols }
 func (n *SystemScan) Result() []ResultColumn { return n.Cols }
 func (n *Filter) Result() []ResultColumn     { return n.Input.Result() }
 func (n *Join) Result() []ResultColumn       { return n.Cols }
@@ -360,6 +374,7 @@ func (n *Limit) Result() []ResultColumn      { return n.Input.Result() }
 
 func (*SingleRow) planNode()  {}
 func (*Scan) planNode()       {}
+func (*SetOp) planNode()      {}
 func (*SystemScan) planNode() {}
 func (*Filter) planNode()     {}
 func (*Join) planNode()       {}

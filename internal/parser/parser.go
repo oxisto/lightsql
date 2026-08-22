@@ -222,7 +222,11 @@ func (p *parser) text(tok token.Token) string {
 func (p *parser) parseStmt() (ast.Stmt, error) {
 	switch p.cur().Kind {
 	case token.Select:
-		return p.parseSelect()
+		return p.parseQuery()
+	case token.LParen:
+		// A statement may begin with a parenthesised arm, as in
+		// `(SELECT 1) UNION (SELECT 2)`.
+		return p.parseQuery()
 	case token.Insert:
 		return p.parseInsert()
 	case token.Update:
@@ -612,39 +616,158 @@ func (p *parser) parseSelect() (*ast.SelectStmt, error) {
 		}
 	}
 
+	return sel, nil
+}
+
+// queryTail is the ORDER BY, LIMIT and OFFSET that follow a query.
+//
+// They are parsed apart from the SELECT because in a set operation they belong
+// to the whole thing rather than to the arm they happen to follow: `a UNION b
+// ORDER BY 1` orders the combined result. Leaving them inside parseSelect would
+// attach them to b, which is a different and usually wrong query.
+type queryTail struct {
+	orderBy []ast.OrderByItem
+	limit   ast.Expr
+	offset  ast.Expr
+}
+
+func (p *parser) parseQueryTail() (tail queryTail, err error) {
 	if p.accept(token.Order) {
 		if err := p.expect(token.By); err != nil {
-			return nil, err
+			return tail, err
 		}
-		if sel.OrderBy, err = p.parseOrderBy(); err != nil {
-			return nil, err
+		if tail.orderBy, err = p.parseOrderBy(); err != nil {
+			return tail, err
 		}
 	}
 
 	// LIMIT and OFFSET may be written in either order.
 	for {
 		switch {
-		case p.at(token.Limit) && sel.Limit == nil:
+		case p.at(token.Limit) && tail.limit == nil:
 			p.next()
 			if p.accept(token.All) {
 				continue // LIMIT ALL means no limit.
 			}
-			if sel.Limit, err = p.parseExpr(bpNone); err != nil {
-				return nil, err
+			if tail.limit, err = p.parseExpr(bpNone); err != nil {
+				return tail, err
 			}
-		case p.at(token.Offset) && sel.Offset == nil:
+		case p.at(token.Offset) && tail.offset == nil:
 			p.next()
-			if sel.Offset, err = p.parseExpr(bpNone); err != nil {
-				return nil, err
+			if tail.offset, err = p.parseExpr(bpNone); err != nil {
+				return tail, err
 			}
 			// PostgreSQL allows a noise word after the count.
 			if p.atWord("row") || p.atWord("rows") {
 				p.next()
 			}
 		default:
-			return sel, nil
+			return tail, nil
 		}
 	}
+}
+
+// parseQuery parses a SELECT or several combined by set operations, together
+// with the trailing clauses that apply to the result.
+//
+// UNION and EXCEPT are left associative and share a precedence; INTERSECT binds
+// tighter, so `a UNION b INTERSECT c` is `a UNION (b INTERSECT c)`. That is
+// PostgreSQL's grammar and the standard's, and it is not what reading the words
+// left to right suggests -- which is why the two levels are separate functions
+// rather than one loop with a precedence table.
+func (p *parser) parseQuery() (ast.Query, error) {
+	left, err := p.parseIntersection()
+	if err != nil {
+		return nil, err
+	}
+
+	for p.at(token.Union) || p.at(token.Except) {
+		op := ast.SetUnion
+		if p.at(token.Except) {
+			op = ast.SetExcept
+		}
+		pos := p.cur().Pos
+		p.next()
+		all := p.accept(token.All)
+		// DISTINCT is the default and may be written out.
+		if !all {
+			p.accept(token.Distinct)
+		}
+
+		right, err := p.parseIntersection()
+		if err != nil {
+			return nil, err
+		}
+		left = &ast.SetOp{OpPos: pos, Op: op, All: all, Left: left, Right: right}
+	}
+
+	tail, err := p.parseQueryTail()
+	if err != nil {
+		return nil, err
+	}
+	return withTail(left, tail), nil
+}
+
+// parseIntersection parses the tighter-binding level.
+func (p *parser) parseIntersection() (ast.Query, error) {
+	left, err := p.parseQueryPrimary()
+	if err != nil {
+		return nil, err
+	}
+
+	for p.at(token.Intersect) {
+		pos := p.cur().Pos
+		p.next()
+		all := p.accept(token.All)
+		if !all {
+			p.accept(token.Distinct)
+		}
+
+		right, err := p.parseQueryPrimary()
+		if err != nil {
+			return nil, err
+		}
+		left = &ast.SetOp{OpPos: pos, Op: ast.SetIntersect, All: all, Left: left, Right: right}
+	}
+	return left, nil
+}
+
+// parseQueryPrimary parses one arm: a SELECT, or a parenthesised query.
+//
+// The parentheses are what let an arm carry its own ORDER BY or LIMIT, since
+// without them those clauses belong to the whole operation.
+func (p *parser) parseQueryPrimary() (ast.Query, error) {
+	if p.at(token.LParen) {
+		p.next()
+		q, err := p.parseQuery()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(token.RParen); err != nil {
+			return nil, err
+		}
+		return q, nil
+	}
+	return p.parseSelect()
+}
+
+// withTail attaches trailing clauses to whichever kind of query is underneath.
+func withTail(q ast.Query, tail queryTail) ast.Query {
+	switch q := q.(type) {
+	case *ast.SelectStmt:
+		if tail.orderBy != nil {
+			q.OrderBy = tail.orderBy
+		}
+		if tail.limit != nil {
+			q.Limit = tail.limit
+		}
+		if tail.offset != nil {
+			q.Offset = tail.offset
+		}
+	case *ast.SetOp:
+		q.OrderBy, q.Limit, q.Offset = tail.orderBy, tail.limit, tail.offset
+	}
+	return q
 }
 
 func (p *parser) parseSelectItems() ([]ast.SelectItem, error) {
@@ -786,7 +909,7 @@ func (p *parser) parseTableFactor() (ast.TableExpr, error) {
 	if p.at(token.LParen) {
 		lparen := p.cur().Pos
 		p.next()
-		sel, err := p.parseSelect()
+		sel, err := p.parseQuery()
 		if err != nil {
 			return nil, err
 		}
@@ -890,8 +1013,8 @@ func (p *parser) parseInsert() (*ast.InsertStmt, error) {
 				break
 			}
 		}
-	case p.at(token.Select):
-		sel, err := p.parseSelect()
+	case p.at(token.Select), p.at(token.LParen):
+		sel, err := p.parseQuery()
 		if err != nil {
 			return nil, err
 		}
