@@ -68,6 +68,9 @@ type TxManager struct {
 	// separately from status because taking a snapshot needs exactly this set
 	// and nothing else.
 	active map[TxID]bool
+	// journal is where a committing transaction's changes are made durable, or
+	// nil for an in-memory database. See SetJournal.
+	journal Journal
 }
 
 // NewTxManager returns a manager whose first transaction will be id 1.

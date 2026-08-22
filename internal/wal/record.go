@@ -59,16 +59,21 @@ func (k RecordKind) String() string {
 // The fields a record uses depend on its kind, which is why they are one struct
 // rather than an interface: the set is small, closed, and decoded in a loop
 // that would otherwise allocate per record.
+//
+// The two small fields are declared next to each other so that they share a
+// word. A record is passed by value into the pending slice of every transaction
+// that writes a row, and the padding a natural-looking order introduces is a
+// whole extra word per row.
 type Record struct {
 	Kind RecordKind
+	// Column is the ordinal the Missing value belongs to.
+	Column uint32
+	// Row identifies the row within its table, for Insert and Delete.
+	Row uint64
 	// SQL is the statement text, for DDL.
 	SQL string
 	// Table is the schema-qualified table name, for the row kinds and Missing.
 	Table string
-	// Row identifies the row within its table, for Insert and Delete.
-	Row uint64
-	// Column is the ordinal the Missing value belongs to.
-	Column uint32
 	// Vals is the row, for Insert, or the single missing value, for Missing.
 	Vals []types.Value
 }

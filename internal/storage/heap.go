@@ -6,12 +6,26 @@ import (
 	"github.com/oxisto/lightsql/internal/types"
 )
 
+// RowID identifies a row within its table, for as long as the row exists.
+//
+// It is needed because the write-ahead log has to name the row a record deletes,
+// and it cannot do that with a pointer or a slice index: a pointer means nothing
+// after a restart, and an index shifts when Vacuum compacts the slice. The id is
+// allocated once and never reused, so a log record always refers to the row it
+// was written for.
+type RowID uint64
+
 // Version is one version of a row.
 //
 // A row is never overwritten in place. An update writes a new version and stamps
 // the old one as deleted by the updating transaction, so a reader holding an
 // older snapshot keeps seeing the version that was current when it started.
 type Version struct {
+	// ID identifies the row this version belongs to. An update allocates a new
+	// id rather than keeping the old one, because the log records it as a delete
+	// of one row and an insert of another -- which is exactly what the heap
+	// does in memory.
+	ID RowID
 	// XMin is the transaction that created this version.
 	XMin TxID
 	// XMax is the transaction that deleted it, or InvalidTxID while it is live.
@@ -61,19 +75,42 @@ type Heap struct {
 
 	mu       sync.RWMutex
 	versions []*Version
+	// nextRow is the id the next row written into this heap will take. It is
+	// per heap rather than global so that a log record only has to be unique
+	// within the table it names.
+	nextRow RowID
 }
 
 // NewHeap returns an empty heap whose visibility is judged by mgr.
-func NewHeap(mgr *TxManager) *Heap { return &Heap{mgr: mgr} }
+func NewHeap(mgr *TxManager) *Heap { return &Heap{mgr: mgr, nextRow: 1} }
 
 // Insert adds a new row created by tx.
 func (h *Heap) Insert(tx TxID, vals []types.Value) *Version {
-	v := &Version{XMin: tx, Vals: vals}
-
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	v := &Version{ID: h.nextRow, XMin: tx, Vals: vals}
+	h.nextRow++
 	h.versions = append(h.versions, v)
 	return v
+}
+
+// Load places a row that was read back from the log, with the id it had when it
+// was written.
+//
+// It is not Insert with an extra argument, because the two have opposite
+// obligations: Insert allocates an id and its caller logs the result, while Load
+// takes the id as given and must not be logged at all -- recovery replays the
+// log, and writing what it reads back into the same log would double it on every
+// restart.
+func (h *Heap) Load(tx TxID, id RowID, vals []types.Value) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.versions = append(h.versions, &Version{ID: id, XMin: tx, Vals: vals})
+	if id >= h.nextRow {
+		h.nextRow = id + 1
+	}
 }
 
 // Delete marks a version deleted by tx.
