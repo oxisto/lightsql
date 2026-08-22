@@ -609,3 +609,58 @@ func FuzzParse(f *testing.F) {
 		_, _ = Parse(src)
 	})
 }
+
+// TestParseAllKeepsStatementText covers what the write-ahead log records for a
+// DDL statement. The text has to be the statement and nothing else: a trailing
+// separator or a comment belonging to the next statement would be replayed as
+// part of this one.
+func TestParseAllKeepsStatementText(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{
+			name: "one statement, no separator",
+			src:  "select 1",
+			want: []string{"select 1"},
+		},
+		{
+			name: "a trailing semicolon is not part of the statement",
+			src:  "select 1;",
+			want: []string{"select 1"},
+		},
+		{
+			name: "a comment between statements belongs to neither",
+			src:  "create table t (a int); -- why\n\ninsert into t values (1);",
+			want: []string{"create table t (a int)", "insert into t values (1)"},
+		},
+		{
+			name: "a semicolon inside a literal does not split",
+			src:  "insert into t values ('a;b'); select 2",
+			want: []string{"insert into t values ('a;b')", "select 2"},
+		},
+		{
+			name: "empty statements between separators are skipped",
+			src:  ";; select 1 ;; select 2 ;;",
+			want: []string{"select 1", "select 2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseAll(tt.src)
+			if err != nil {
+				t.Fatalf("ParseAll: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("parsed %d statements, want %d", len(got), len(tt.want))
+			}
+			for i, want := range tt.want {
+				if got[i].Text != want {
+					t.Errorf("statement %d text = %q, want %q", i, got[i].Text, want)
+				}
+			}
+		})
+	}
+}

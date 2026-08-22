@@ -8,6 +8,7 @@ package engine
 
 import (
 	"context"
+	"sync"
 
 	"github.com/oxisto/lightsql/internal/ast"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/oxisto/lightsql/internal/plan"
 	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
+	"github.com/oxisto/lightsql/internal/wal"
 )
 
 // Engine is one database instance.
@@ -26,6 +28,20 @@ type Engine struct {
 	mgr *storage.TxManager
 	cat *catalog.Catalog
 	bnd *binder.Binder
+
+	// log is the write-ahead log, or nil for an in-memory database.
+	log *wal.Log
+	// schema is every DDL record this instance has applied, in order, whether
+	// executed or replayed. A checkpoint rewrites the log as the state rather
+	// than the history it came from, and the state of the schema is exactly
+	// the statements that built it -- the catalog holds DEFAULT expressions
+	// and CHECK predicates as syntax, so there is nothing else to write it
+	// back out from.
+	schemaMu sync.Mutex
+	schema   []wal.Record
+	// recovering is set while the log is being replayed. It is not guarded,
+	// because recovery finishes before the engine is handed to anyone.
+	recovering bool
 }
 
 // New returns an empty in-memory engine.
@@ -110,6 +126,9 @@ type Prepared struct {
 	// Params is the number of placeholders the statement expects.
 	Params int
 	stmt   plan.Stmt
+	// sql is the statement as written. A DDL statement is logged as its text,
+	// because replaying it rebuilds the catalog exactly; see internal/wal.
+	sql string
 }
 
 // Prepare parses and binds a single statement.
@@ -122,7 +141,7 @@ func (e *Engine) Prepare(sql string) (*Prepared, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Prepared{eng: e, Params: countParams(sql), stmt: bound}, nil
+	return &Prepared{eng: e, Params: countParams(sql), stmt: bound, sql: sql}, nil
 }
 
 // ReturnsRows reports whether executing the statement produces a result set,
@@ -203,45 +222,10 @@ func (p *Prepared) run(ctx context.Context, tx *storage.Tx, args []types.Value) 
 		ret *plan.Returning
 	)
 	err := p.eng.withTx(tx, func(t *storage.Tx) error {
+		if handled, err := p.execDDL(t); handled {
+			return err
+		}
 		switch s := p.stmt.(type) {
-		case *plan.CreateTable:
-			// DDL is a write too. Leaving it out let a read-only transaction
-			// reshape the catalog, which contradicts what ReadOnly promises.
-			if err := t.CheckWritable(); err != nil {
-				return err
-			}
-			return exec.ExecCreateTable(p.eng.cat, s)
-		case *plan.AddColumn:
-			if err := t.CheckWritable(); err != nil {
-				return err
-			}
-			return exec.ExecAddColumn(p.eng.cat, s)
-		case *plan.RenameTable:
-			if err := t.CheckWritable(); err != nil {
-				return err
-			}
-			return exec.ExecRenameTable(p.eng.cat, s)
-		case *plan.RenameColumn:
-			if err := t.CheckWritable(); err != nil {
-				return err
-			}
-			return exec.ExecRenameColumn(p.eng.cat, s)
-		case *plan.CreateIndex:
-			if err := t.CheckWritable(); err != nil {
-				return err
-			}
-			return exec.ExecCreateIndex(p.eng.cat, s)
-		case *plan.DropIndex:
-			if err := t.CheckWritable(); err != nil {
-				return err
-			}
-			return exec.ExecDropIndex(p.eng.cat, s)
-		case *plan.DropTable:
-			// DDL is a write, so a read-only transaction may not do it.
-			if err := t.CheckWritable(); err != nil {
-				return err
-			}
-			return exec.ExecDropTable(p.eng.cat, s)
 		case *plan.Insert:
 			if err := t.CheckWritable(); err != nil {
 				return err
@@ -277,18 +261,18 @@ func (p *Prepared) run(ctx context.Context, tx *storage.Tx, args []types.Value) 
 // rows affected by the last one. It exists because test suites routinely set up
 // a fixture with a single multi-statement Exec.
 func (e *Engine) ExecBatch(ctx context.Context, tx *storage.Tx, sql string, args []types.Value) (int64, error) {
-	trees, err := parser.Parse(sql)
+	stmts, err := parser.ParseAll(sql)
 	if err != nil {
 		return 0, err
 	}
 
 	var affected int64
-	for _, tree := range trees {
-		bound, err := e.bnd.Bind(tree)
+	for _, st := range stmts {
+		bound, err := e.bnd.Bind(st.Stmt)
 		if err != nil {
 			return 0, err
 		}
-		p := &Prepared{eng: e, stmt: bound}
+		p := &Prepared{eng: e, stmt: bound, sql: st.Text}
 		// Only a genuine query is drained for its rows. A data-modifying
 		// statement goes through Exec even when it has a RETURNING clause, so
 		// that it still reports how many rows it changed.

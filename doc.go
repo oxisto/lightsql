@@ -16,6 +16,10 @@
 //	db, err := sql.Open("lightsql", "mytest")
 //	db, err := sql.Open("lightsql", "file:./demo.db")
 //
+// A directory-backed database appends every committed transaction to a
+// write-ahead log before reporting the commit, and rebuilds itself from that log
+// when it is opened again.
+//
 // The public API is still being built out; today this package only carries the
 // module's documentation and the invariants enforced by its tests.
 package lightsql

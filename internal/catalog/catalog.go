@@ -20,6 +20,7 @@ import (
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
+	"github.com/oxisto/lightsql/internal/wal"
 )
 
 // DefaultSchema is the schema a name resolves to when written unqualified.
@@ -253,8 +254,22 @@ func (t *Table) Insert(tx *storage.Tx, row []types.Value) error {
 	if err := t.checkRow(row); err != nil {
 		return err
 	}
-	t.heap.Insert(tx.ID, row)
+	v := t.heap.Insert(tx.ID, row)
+	// The row is logged rather than copied first because a version's values are
+	// never mutated once it is linked in, which is the same property that lets
+	// a reader hold one without copying.
+	tx.Log(wal.InsertRecord(t.QualifiedName(), uint64(v.ID), row))
 	return nil
+}
+
+// Load places a row read back from the log, with the id it was written under.
+//
+// Recovery uses this instead of Insert: the id is given rather than allocated,
+// the constraints were checked when the row was first written, and nothing is
+// logged -- writing back what was just read would double the log on every
+// restart.
+func (t *Table) Load(tx *storage.Tx, id storage.RowID, row []types.Value) {
+	t.heap.Load(tx.ID, id, row)
 }
 
 // Scan returns the row versions visible to a transaction.
@@ -309,13 +324,68 @@ func (t *Table) Update(tx *storage.Tx, old *storage.Version, vals []types.Value)
 	if err := t.heap.Delete(tx.ID, old); err != nil {
 		return err
 	}
-	t.heap.Insert(tx.ID, vals)
+	v := t.heap.Insert(tx.ID, vals)
+	name := t.QualifiedName()
+	tx.Log(wal.DeleteRecord(name, uint64(old.ID)))
+	tx.Log(wal.InsertRecord(name, uint64(v.ID), vals))
 	return nil
 }
 
 // Delete removes a row version.
 func (t *Table) Delete(tx *storage.Tx, v *storage.Version) error {
-	return t.heap.Delete(tx.ID, v)
+	if err := t.heap.Delete(tx.ID, v); err != nil {
+		return err
+	}
+	tx.Log(wal.DeleteRecord(t.QualifiedName(), uint64(v.ID)))
+	return nil
+}
+
+// SetMissing fixes the value short rows take for a column, when recovery reads
+// it back from the log.
+//
+// ADD COLUMN evaluates the column's DEFAULT once, at the moment it runs. While
+// only a constant DEFAULT is accepted, replaying the statement recomputes the
+// same value and this changes nothing; see wal.Missing for why the log records
+// it regardless.
+func (t *Table) SetMissing(ordinal int, v types.Value) error {
+	if ordinal < 0 || ordinal >= len(t.Columns) {
+		return pgerr.Newf(pgerr.DataCorrupted,
+			"table %q has no column %d to restore a missing value for", t.QualifiedName(), ordinal)
+	}
+	t.Columns[ordinal].Missing = v
+	return nil
+}
+
+// RestoreSequences sets each serial column's counter past the largest value the
+// table holds.
+//
+// A sequence is not itself logged: it sits outside the transaction, so logging
+// each allocation would mean writing a record for a statement that then rolls
+// back. Deriving it from the rows on restart gives the one property that
+// matters, which is that the next value allocated collides with nothing. It can
+// hand back a number that a deleted row once used, which PostgreSQL would not
+// do; the gap-free alternative is a record per allocation.
+func (t *Table) RestoreSequences(tx *storage.Tx) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for ord := range t.Columns {
+		if !t.Columns[ord].Type.Serial {
+			continue
+		}
+		var high int64
+		for _, row := range t.Rows(tx) {
+			if v := row[ord]; v.Kind() == types.KindInt && v.AsInt() > high {
+				high = v.AsInt()
+			}
+		}
+		if high > 0 {
+			if t.nextSerial == nil {
+				t.nextSerial = make(map[int]int64)
+			}
+			t.nextSerial[ord] = high + 1
+		}
+	}
 }
 
 // EvalDefault produces a column's DEFAULT value.
@@ -704,6 +774,18 @@ func New(mgr *storage.TxManager) *Catalog {
 
 func key(schema, name string) string { return schema + "." + name }
 
+// Qualify returns the name a table is known by, defaulting an empty schema.
+//
+// It is the counterpart of LookupQualified, and exists so that a caller outside
+// the catalog cannot build the string a different way: a log record and the map
+// it will be looked up in have to agree exactly.
+func Qualify(schema, name string) string {
+	if schema == "" {
+		schema = DefaultSchema
+	}
+	return key(schema, name)
+}
+
 // CreateTable registers a new table. It reports a duplicate as a
 // DuplicateTable error unless ifNotExists is set, in which case an existing
 // table is left alone and created reports false.
@@ -1017,6 +1099,23 @@ func (t *Table) removeReferencing(child *Table) {
 	t.referencedBy = slices.DeleteFunc(t.referencedBy, func(r Referencing) bool {
 		return r.Child == child
 	})
+}
+
+// LookupQualified finds a table by the name QualifiedName produces.
+//
+// Recovery needs it because a log record names a table with that string, and
+// splitting it back into two parts would be guesswork: both halves are
+// identifiers and either may contain a dot when it was written quoted. The
+// catalog is keyed on the same string, so no splitting is required.
+func (c *Catalog) LookupQualified(name string) (*Table, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	t, ok := c.tables[name]
+	if !ok {
+		return nil, pgerr.Newf(pgerr.UndefinedTable, "relation %q does not exist", name)
+	}
+	return t, nil
 }
 
 // Lookup finds a table. An empty schema means the default schema.

@@ -37,11 +37,14 @@ const (
 	// Missing records the value that rows written before an ADD COLUMN take for
 	// the new column. It follows the DDL record for the ALTER statement.
 	//
-	// It has to be logged rather than recomputed, because ADD COLUMN evaluates
-	// the column's DEFAULT once at the moment it runs. Replaying
-	// `ADD COLUMN c timestamp DEFAULT now()` would evaluate now() again and
-	// give every old row a value from recovery time instead of from the day the
-	// column was added.
+	// Today it is redundant: ADD COLUMN accepts only a constant DEFAULT, so
+	// replaying the statement recomputes the same value. It is written anyway
+	// because that restriction lives in the binder and is the natural one to
+	// relax -- and the day `ADD COLUMN c timestamp DEFAULT now()` is allowed,
+	// a log without this record would date every pre-existing row from the
+	// restart rather than from the day the column was added, silently, in
+	// data that is already on disk. A log format is the last thing worth
+	// changing later.
 	Missing
 )
 
