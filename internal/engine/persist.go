@@ -193,7 +193,7 @@ func (e *Engine) apply(ctx context.Context, tx *storage.Tx, rec *wal.Record, row
 func isDDL(s plan.Stmt) bool {
 	switch s.(type) {
 	case *plan.CreateTable, *plan.AddColumn, *plan.RenameTable, *plan.RenameColumn,
-		*plan.CreateIndex, *plan.DropIndex, *plan.DropTable:
+		*plan.SetNotNull, *plan.CreateIndex, *plan.DropIndex, *plan.DropTable:
 		return true
 	default:
 		return false
@@ -242,6 +242,13 @@ func (p *Prepared) execDDL(t *storage.Tx) (handled bool, err error) {
 
 	case *plan.RenameColumn:
 		err = exec.ExecRenameColumn(cat, s)
+
+	case *plan.SetNotNull:
+		// Replayed from the log this always runs against an empty table, since
+		// recovery applies every schema statement before it places a single
+		// row. That is the right answer rather than a lucky one: the rows being
+		// replayed were checked when they were first written.
+		err = exec.ExecSetNotNull(cat, t, s)
 
 	case *plan.CreateIndex:
 		err = exec.ExecCreateIndex(cat, s)

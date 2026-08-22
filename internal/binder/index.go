@@ -74,6 +74,13 @@ func (b *Binder) bindAlterTable(s *ast.AlterTableStmt) (plan.Stmt, error) {
 			From:   s.Table.Name.Name,
 			To:     a.To.Name,
 		}, nil
+	case *ast.AlterColumnNotNull:
+		return &plan.SetNotNull{
+			Schema:  s.Table.Schema.Name,
+			Table:   s.Table.Name.Name,
+			Column:  a.Column.Name,
+			NotNull: a.NotNull,
+		}, nil
 	case *ast.RenameColumn:
 		return &plan.RenameColumn{
 			Schema: s.Table.Schema.Name,

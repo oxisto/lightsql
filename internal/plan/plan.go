@@ -388,6 +388,17 @@ type RenameColumn struct {
 	Schema, Table, From, To string
 }
 
+// SetNotNull adds or removes a column's NOT NULL constraint.
+//
+// Like the rename actions, it carries names rather than a resolved column: the
+// catalog decides existence under the same lock that performs the change, so a
+// concurrent drop cannot slip between the check and the act.
+type SetNotNull struct {
+	Schema, Table, Column string
+	// NotNull is true for SET NOT NULL and false for DROP NOT NULL.
+	NotNull bool
+}
+
 // CreateIndex adds an index to a table.
 type CreateIndex struct {
 	Table       *catalog.Table
@@ -513,6 +524,7 @@ func (*CreateIndex) stmtNode()  {}
 func (*AddColumn) stmtNode()    {}
 func (*RenameTable) stmtNode()  {}
 func (*RenameColumn) stmtNode() {}
+func (*SetNotNull) stmtNode()   {}
 func (*DropIndex) stmtNode()    {}
 func (*Insert) stmtNode()       {}
 func (*Update) stmtNode()       {}

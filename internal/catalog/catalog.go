@@ -952,6 +952,61 @@ func (c *Catalog) RenameColumn(schema, table, from, to string) error {
 	return nil
 }
 
+// SetNotNull adds or removes a column's NOT NULL constraint.
+//
+// Adding one is checked against the rows the transaction can see, because the
+// constraint has to be true of what is already stored before it can be promised
+// about what comes next. This is the half of the "add nullable, backfill,
+// tighten" migration that ADD COLUMN ... NOT NULL DEFAULT cannot do, since that
+// gives every row the same constant.
+//
+// Removing one needs no check, with one exception: a primary key column is NOT
+// NULL because it is part of the key, and dropping the flag would leave a
+// constraint that says one thing and a column that says another.
+func (c *Catalog) SetNotNull(tx *storage.Tx, schema, table, column string, notNull bool) error {
+	if schema == "" {
+		schema = DefaultSchema
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	t, ok := c.tables[key(schema, table)]
+	if !ok {
+		return pgerr.Newf(pgerr.UndefinedTable, "relation %q does not exist", table)
+	}
+	ord, ok := t.byName[column]
+	if !ok {
+		return pgerr.Newf(pgerr.UndefinedColumn,
+			"column %q of relation %q does not exist", column, table)
+	}
+	if t.Columns[ord].NotNull == notNull {
+		return nil
+	}
+
+	if !notNull {
+		if t.Columns[ord].PrimaryKey {
+			return pgerr.Newf(pgerr.InvalidTableDefinition,
+				"column %q is in a primary key", column)
+		}
+		t.Columns[ord].NotNull = false
+		return nil
+	}
+
+	// Every row is checked, including the ones shorter than the table: Values
+	// pads them with what the column records for rows written before it
+	// existed, and that value is as much subject to the constraint as any
+	// other.
+	for _, v := range t.Scan(tx) {
+		if t.Values(v)[ord].IsNull() {
+			return pgerr.Newf(pgerr.NotNullViolation,
+				"column %q of relation %q contains null values", column, table)
+		}
+	}
+	t.Columns[ord].NotNull = true
+	return nil
+}
+
 // CreateIndex adds an index to a table.
 //
 // Index names live in one namespace per schema, as in PostgreSQL, so a name

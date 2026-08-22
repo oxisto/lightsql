@@ -27,6 +27,7 @@ const (
 	DuplicateTable          = "42P07"
 	DuplicateColumn         = "42701"
 	DatatypeMismatch        = "42804"
+	InvalidTableDefinition  = "42P16"
 	InvalidTextForType      = "22P02"
 	NumericValueOutOfRange  = "22003"
 	DivisionByZero          = "22012"
