@@ -181,3 +181,89 @@ func TestNow(t *testing.T) {
 		t.Errorf("now() = %v, which is not close to the present", at)
 	}
 }
+
+// TestByteaLiterals covers writing binary through SQL, which is the only way a
+// statement can: bytea is written as a string literal, so the text spells the
+// bytes rather than being them.
+//
+// Storing the text as-is would not fail. The column would simply hold three
+// times the bytes it was meant to, comparisons against a real byte string would
+// never match, and length would report the wrong number -- which is why this
+// asserts on the byte count rather than only on the round trip.
+func TestByteaLiterals(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE b (id INT PRIMARY KEY, raw BYTEA)`,
+		// The hex form, the escape form, plain text and the empty string.
+		`INSERT INTO b VALUES (1, '\x0102'), (2, '\001\002\377'), (3, 'abc'), (4, '')`,
+	)
+
+	got := rowsOf(t, db, `SELECT id, length(raw), octet_length(raw) FROM b ORDER BY id`)
+	want := []string{"1|2|2", "2|3|3", "3|3|3", "4|0|0"}
+	if !slices.Equal(got, want) {
+		t.Errorf("lengths = %v, want %v", got, want)
+	}
+
+	// The bytes come back as bytes, not as the text that spelled them.
+	var raw []byte
+	if err := db.QueryRow(`SELECT raw FROM b WHERE id = 2`).Scan(&raw); err != nil {
+		t.Fatalf("scanning bytea: %v", err)
+	}
+	if want := []byte{1, 2, 255}; !slices.Equal(raw, want) {
+		t.Errorf("scanned %v, want %v", raw, want)
+	}
+
+	// And a parameter holding real bytes matches the literal that spells them,
+	// which it could not if one side were text.
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM b WHERE raw = $1`, []byte{1, 2}).Scan(&n); err != nil {
+		t.Fatalf("comparing against a parameter: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("a bytea parameter matched %d rows, want 1", n)
+	}
+}
+
+// TestByteaLiteralErrors covers the text that is refused. Accepting any of it
+// would store something other than what was written, without saying so.
+func TestByteaLiteralErrors(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db, `CREATE TABLE b (raw BYTEA)`)
+
+	tests := []struct {
+		name string
+		stmt string
+		want string
+	}{
+		{"odd hex digits", `INSERT INTO b VALUES ('\x010')`, "odd number"},
+		{"not a hex digit", `INSERT INTO b VALUES ('\xZZ')`, "hexadecimal digit"},
+		{"bad escape", `INSERT INTO b VALUES ('\1')`, "three octal digits"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := queryErr(db, tt.stmt)
+			if err == nil {
+				t.Fatalf("%s: expected an error", tt.stmt)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("got %v, want it to mention %q", err, tt.want)
+			}
+			// Wrapped once. A nested pgerr reads as "ERROR: ERROR: ..." with
+			// the SQLSTATE at both ends, which is how this was noticed.
+			if strings.Count(err.Error(), "SQLSTATE") != 1 {
+				t.Errorf("error is wrapped more than once: %v", err)
+			}
+		})
+	}
+}
+
+// TestOctetLengthCountsBytes pins the difference between the two, which only
+// shows up outside ASCII: length counts characters and octet_length counts the
+// bytes they take.
+func TestOctetLengthCountsBytes(t *testing.T) {
+	db := open(t)
+	got := rowsOf(t, db, `SELECT length('héllo'), octet_length('héllo')`)
+	if want := []string{"5|6"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}

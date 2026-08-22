@@ -333,7 +333,9 @@ var Groups = []Group{
 				Setup: probeTable,
 				SQL:   "SELECT CAST(a AS TEXT) FROM t"},
 			{Name: "Scalar functions", Parse: Yes, Exec: Partial,
-				Note: "coalesce, nullif, now, lower, upper, length, trim, abs and round. " +
+				Note: "coalesce, nullif, now, lower, upper, length, octet_length, trim, abs " +
+					"and round. length counts characters of text and bytes of bytea, as " +
+					"PostgreSQL does for each, while octet_length always counts bytes. " +
 					"NULL propagates for all but coalesce and nullif, and coalesce stops at " +
 					"the first argument that answers. Argument types are checked at bind " +
 					"time, so lower(1) is rejected rather than reading an integer as text. " +
@@ -387,7 +389,14 @@ var Groups = []Group{
 					"rather than PostgreSQL's zoned one, and a precision argument such as " +
 					"CURRENT_TIMESTAMP(0) is refused rather than ignored",
 				SQL: "SELECT now(), CURRENT_TIMESTAMP, LOCALTIMESTAMP, CURRENT_DATE, CURRENT_TIME, LOCALTIME"},
-			{Name: "BYTEA", Parse: Yes, Exec: Yes, SQL: "CREATE TABLE t (a BYTEA)"},
+			{Name: "BYTEA", Parse: Yes, Exec: Yes,
+				Note: "written as a string literal in either of PostgreSQL's input formats: " +
+					"\\x0102 as hex, or the escape form where a backslash introduces another " +
+					"backslash or three octal digits and every other character stands for " +
+					"itself. The text spells the bytes rather than being them, so it is " +
+					"decoded rather than relabelled, and it renders back as hex",
+				Setup: []string{"CREATE TABLE t (a BYTEA)"},
+				SQL:   "INSERT INTO t VALUES ('\\x0102'), ('\\001\\002'), ('abc')"},
 			{Name: "NUMERIC / DECIMAL", Parse: Yes, Exec: Partial,
 				Note: "stored as double precision; exact decimal arithmetic is pending",
 				SQL:  "CREATE TABLE t (a NUMERIC(10, 2))"},
