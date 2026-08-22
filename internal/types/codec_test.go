@@ -35,7 +35,10 @@ func TestValueCodecRoundTrip(t *testing.T) {
 		{"timestamp", Timestamp(1_700_000_000_000_000)},
 		{"timestamptz", Timestamptz(-1)},
 		{"json", Value{k: KindJSON, s: `{"a": 1}`}},
-		{"jsonb", Value{k: KindJSONB, s: `{"a":1}`}},
+		// Canonical form, because that is the only form a jsonb is ever stored
+		// in -- and because decoding canonicalises, a fixture written any other
+		// way would be asserting that the upgrade above does not happen.
+		{"jsonb", Value{k: KindJSONB, s: `{"a": 1}`}},
 	}
 
 	for _, tt := range tests {
@@ -119,11 +122,82 @@ func FuzzDecodeValue(f *testing.F) {
 		if len(rest) > len(data) {
 			t.Fatalf("decoder returned %d bytes of remainder from %d bytes of input", len(rest), len(data))
 		}
-		// A value that decodes must re-encode to the same bytes, which rules
-		// out a decoder that silently drops part of what it read.
-		if again := AppendValue(nil, v); len(again) != len(data)-len(rest) {
+		again := AppendValue(nil, v)
+
+		// Encoding is a fixed point: whatever comes out decodes to the same
+		// value and encodes to the same bytes a second time. This is the
+		// property that holds for every kind, and it is what rules out a
+		// decoder that silently drops part of what it read.
+		twice, rest2, err := DecodeValue(again)
+		if err != nil {
+			t.Fatalf("re-decoding a %s this package encoded: %v", v.Kind(), err)
+		}
+		if len(rest2) != 0 {
+			t.Fatalf("re-decoding a %s left %d bytes over", v.Kind(), len(rest2))
+		}
+		if twice.Kind() != v.Kind() || twice.AsString() != v.AsString() || twice.n != v.n {
+			t.Fatalf("a %s did not survive a second round trip", v.Kind())
+		}
+
+		// For every kind but one, those bytes are also the bytes it came from.
+		// A jsonb is canonicalised as it is decoded, on purpose: a document
+		// written by a version that canonicalised differently has to start
+		// matching the same document written today, so decoding it is allowed
+		// to change its spelling. See TestJSONBDecodesCanonically.
+		if v.Kind() != KindJSONB && len(again) != len(data)-len(rest) {
 			t.Fatalf("re-encoding %s produced %d bytes, want the %d it was decoded from",
 				v.Kind(), len(again), len(data)-len(rest))
 		}
 	})
+}
+
+// TestJSONBDecodesCanonically pins that a document read back from the log is
+// canonicalised again rather than trusted.
+//
+// A jsonb is stored as its canonical text and compared as that text, so a value
+// written by a version that canonicalised differently silently stops matching a
+// literal written today: `WHERE doc = '{"a":1}'` returns nothing while the row
+// sits there in plain sight. That is not hypothetical -- the spacing and key
+// order changed once already, and every jsonb written before it would have
+// stopped matching.
+func TestJSONBDecodesCanonically(t *testing.T) {
+	// The form an older version wrote: no spaces, and keys ordered bytewise
+	// rather than by length then bytes.
+	stale := Value{k: KindJSONB, s: `{"a":2,"bb":1,"z":3}`}
+
+	got, _, err := DecodeValue(AppendValue(nil, stale))
+	if err != nil {
+		t.Fatalf("DecodeValue: %v", err)
+	}
+	want := `{"a": 2, "z": 3, "bb": 1}`
+	if got.AsString() != want {
+		t.Errorf("decoded %q, want it canonicalised to %q", got.AsString(), want)
+	}
+
+	// And it now compares equal to the same document written today, which is
+	// the whole point.
+	fresh, err := ParseJSONB(`{"z":3,"a":2,"bb":1}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Compare(got, fresh) != 0 {
+		t.Errorf("a document from an older log does not equal the same document written now:\n  %s\n  %s",
+			got.AsString(), fresh.AsString())
+	}
+}
+
+// TestJSONBSurvivesUnparseableText covers the other half: text that will not
+// parse is kept rather than refused. It came from a log this engine wrote, so
+// rejecting it would turn a formatting change into a database that cannot be
+// opened at all.
+func TestJSONBSurvivesUnparseableText(t *testing.T) {
+	broken := Value{k: KindJSONB, s: `{not json`}
+
+	got, _, err := DecodeValue(AppendValue(nil, broken))
+	if err != nil {
+		t.Fatalf("DecodeValue refused a document it had written: %v", err)
+	}
+	if got.AsString() != `{not json` {
+		t.Errorf("decoded %q, want the text kept as it was", got.AsString())
+	}
 }

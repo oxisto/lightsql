@@ -123,6 +123,24 @@ func DecodeValue(src []byte) (Value, []byte, error) {
 		if uint64(len(src)) < n {
 			return Value{}, nil, errTruncated
 		}
+		if k == KindJSONB {
+			// Re-canonicalised on the way in, not trusted as canonical.
+			//
+			// A jsonb is stored as its canonical text and compared as that
+			// text, so a value written by a version that canonicalised
+			// differently would silently stop matching a literal written today
+			// -- `WHERE doc = '{"a":1}'` returning nothing rather than the row
+			// that is plainly there. Re-canonicalising here upgrades a value
+			// the first time it is read, and the next checkpoint writes it back
+			// in the current form.
+			//
+			// Text that will not parse is kept as it is. It came from a log
+			// this engine wrote, so refusing it would turn a formatting change
+			// into a database that cannot be opened.
+			if v, err := ParseJSONB(string(src[:n])); err == nil {
+				return v, src[n:], nil
+			}
+		}
 		return Value{k: k, s: string(src[:n])}, src[n:], nil
 	default:
 		if len(src) < 8 {
