@@ -3,6 +3,8 @@ package catalog
 import (
 	"testing"
 
+	"github.com/oxisto/lightsql/internal/ast"
+	"github.com/oxisto/lightsql/internal/parser"
 	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
 )
@@ -187,5 +189,54 @@ func TestConcurrentTransactionsSeeConsistentViews(t *testing.T) {
 		if !<-done {
 			t.Error("a transaction saw its own view change between two reads")
 		}
+	}
+}
+
+// TestDefaultTextRenders covers the SQL rendering of a stored DEFAULT, which is
+// what information_schema.columns reports.
+//
+// The catalog keeps a parsed expression rather than the source text, so this is
+// a renderer; the spelling may differ from what was written where the meaning
+// does not. What it must never do is emit something that would not parse, which
+// is why an expression it does not know returns nothing at all.
+func TestDefaultTextRenders(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"integer", "CREATE TABLE t (a INT DEFAULT 42)", "42"},
+		{"negative", "CREATE TABLE t (a INT DEFAULT -1)", "-1"},
+		{"string", "CREATE TABLE t (a TEXT DEFAULT 'none')", "'none'"},
+		// The scanner resolves escapes, so the quote has to be put back the way
+		// SQL writes it: doubled, not backslashed.
+		{"string with a quote", "CREATE TABLE t (a TEXT DEFAULT 'it''s')", "'it''s'"},
+		{"boolean", "CREATE TABLE t (a BOOLEAN DEFAULT true)", "true"},
+		{"null", "CREATE TABLE t (a INT DEFAULT NULL)", "NULL"},
+		{"function", "CREATE TABLE t (a TIMESTAMP DEFAULT now())", "now()"},
+		{"keyword function", "CREATE TABLE t (a TIMESTAMP DEFAULT CURRENT_TIMESTAMP)", "CURRENT_TIMESTAMP"},
+		{"parenthesised", "CREATE TABLE t (a TIMESTAMP DEFAULT (now()))", "(now())"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stmts, err := parser.Parse(tt.sql)
+			if err != nil {
+				t.Fatalf("parsing: %v", err)
+			}
+			ct := stmts[0].(*ast.CreateTableStmt)
+			var def ast.Expr
+			for _, c := range ct.Columns[0].Constraints {
+				if c.Kind == ast.ConstraintDefault {
+					def = c.Expr
+				}
+			}
+			if def == nil {
+				t.Fatal("the fixture has no DEFAULT")
+			}
+			if got := defaultText(def); got != tt.want {
+				t.Errorf("defaultText = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

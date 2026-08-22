@@ -46,6 +46,13 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 	case *plan.Scan:
 		return &scanOp{rows: n.Table.Rows(tx)}, nil
 
+	case *plan.SystemScan:
+		// The rows are computed now, at the start of the scan, rather than per
+		// row. That gives the view the same stability an ordinary scan gets
+		// from its snapshot: a statement reading it twice sees one answer,
+		// even if a concurrent connection creates a table in between.
+		return &scanOp{rows: n.View.Rows(n.Cat)}, nil
+
 	case *plan.Filter:
 		input, err := Build(ctx, n.Input, tx, args)
 		if err != nil {
