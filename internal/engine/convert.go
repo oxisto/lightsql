@@ -59,9 +59,21 @@ func ToDriver(v types.Value) driver.Value {
 		// json.Unmarshal can consume a scan destination directly. Scanning
 		// into a string still works, since database/sql converts bytes to it.
 		return v.AsBytes()
-	default:
-		// Date, time and timestamp kinds all reconstruct to a time.Time.
+	case types.KindNumeric:
+		// As text, which is what lib/pq and pgx do, and for the same reason:
+		// driver.Value has no exact decimal, so anything else would round on
+		// the way out and undo the point of the column. database/sql converts
+		// it for a caller scanning into a float64 or a string, so both still
+		// work -- but the digits are all there for one that wants them.
+		return v.String()
+	case types.KindDate, types.KindTime, types.KindTimestamp, types.KindTimestamptz:
 		return v.AsTime()
+	default:
+		// Named rather than defaulted. A kind that lands here by falling
+		// through reads its payload as microseconds and returns a plausible
+		// timestamp for whatever it actually was, which is how a NUMERIC(5,2)
+		// holding 9.5 once came back as 1970-01-01 00:00:00.000095.
+		return v.String()
 	}
 }
 
@@ -82,6 +94,11 @@ func ScanType(t catalog.Type, nullable bool) reflect.Type {
 		return reflect.TypeFor[int64]()
 	case types.KindFloat:
 		return reflect.TypeFor[float64]()
+	case types.KindNumeric:
+		// A string, matching what ToDriver hands back. Reporting float64 would
+		// invite a generated scan that rounds away the exactness the column
+		// exists for.
+		return reflect.TypeFor[string]()
 	case types.KindText:
 		return reflect.TypeFor[string]()
 	case types.KindBytea, types.KindJSON, types.KindJSONB:

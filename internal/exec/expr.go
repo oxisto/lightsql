@@ -750,9 +750,10 @@ func compileArithmetic(e *plan.Binary, l, r Eval) (Eval, error) {
 			"cannot compile operator %s", e.Op)
 	}
 	op := e.Op
-	// Integer arithmetic stays exact; a float operand makes the whole
-	// expression float, which is what the binder already decided.
-	useInt := e.Kind == types.KindInt
+	// Which arithmetic to do was decided by the binder, from the operand types.
+	// Doing it per row from the values would let one NULL, or one row where a
+	// column happens to hold a whole number, change the answer's type.
+	kind := e.Kind
 
 	return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
 		lv, rv, err := evalPair(ctx, l, r, args, row)
@@ -762,11 +763,66 @@ func compileArithmetic(e *plan.Binary, l, r Eval) (Eval, error) {
 		if lv.IsNull() || rv.IsNull() {
 			return types.Null(), nil
 		}
-		if useInt && lv.Kind() == types.KindInt && rv.Kind() == types.KindInt {
-			return intArith(op, lv.AsInt(), rv.AsInt())
+		switch kind {
+		case types.KindInt:
+			if lv.Kind() == types.KindInt && rv.Kind() == types.KindInt {
+				return intArith(op, lv.AsInt(), rv.AsInt())
+			}
+		case types.KindNumeric:
+			return numericArith(op, lv, rv)
 		}
 		return floatArith(op, lv.AsFloat(), rv.AsFloat())
 	}, nil
+}
+
+// numericArith is exact arithmetic over decimals, which is the whole reason the
+// kind exists.
+//
+// An integer operand joins the decimal side rather than the decimal being
+// flattened to a float, so `price * 3` keeps every digit.
+func numericArith(op ast.BinaryOp, l, r types.Value) (types.Value, error) {
+	a, err := asNumeric(l)
+	if err != nil {
+		return types.Value{}, err
+	}
+	b, err := asNumeric(r)
+	if err != nil {
+		return types.Value{}, err
+	}
+
+	switch op {
+	case ast.OpAdd:
+		return types.AddNumeric(a, b), nil
+	case ast.OpSub:
+		return types.SubNumeric(a, b), nil
+	case ast.OpMul:
+		return types.MulNumeric(a, b), nil
+	case ast.OpDiv:
+		q, err := types.DivNumeric(a, b)
+		if err != nil {
+			return types.Value{}, pgerr.New(pgerr.DivisionByZero, "division by zero")
+		}
+		return q, nil
+	case ast.OpMod:
+		m, err := types.ModNumeric(a, b)
+		if err != nil {
+			return types.Value{}, pgerr.New(pgerr.DivisionByZero, "division by zero")
+		}
+		return m, nil
+	default:
+		// Exponentiation of a decimal by a decimal has no exact answer in
+		// general, so it is the one operator that leaves the exact world.
+		return floatArith(op, l.AsFloat(), r.AsFloat())
+	}
+}
+
+// asNumeric brings an operand onto the exact side. Only an integer needs it;
+// the binder has already ruled out anything that is not a number.
+func asNumeric(v types.Value) (types.Value, error) {
+	if v.Kind() == types.KindNumeric {
+		return v, nil
+	}
+	return types.Cast(v, types.KindNumeric)
 }
 
 func intArith(op ast.BinaryOp, a, b int64) (types.Value, error) {

@@ -410,12 +410,16 @@ func bindLiteral(e *ast.Literal) (plan.Expr, error) {
 	if i, err := strconv.ParseInt(e.Val, 10, 64); err == nil {
 		return &plan.Const{Val: types.Int(i)}, nil
 	}
-	f, err := strconv.ParseFloat(e.Val, 64)
+	// A literal with a point or an exponent is numeric, not float. That is
+	// PostgreSQL's rule, and it is the difference between 0.1 + 0.2 being 0.3
+	// and being 0.30000000000000004. Writing float8 '0.1' or a cast is how one
+	// asks for the inexact kind.
+	d, err := types.ParseDecimal(e.Val)
 	if err != nil {
 		return nil, pgerr.Newf(pgerr.InvalidTextForType,
 			"invalid numeric literal %q", e.Val).At(e.Pos())
 	}
-	return &plan.Const{Val: types.Float(f)}, nil
+	return &plan.Const{Val: types.Numeric(d)}, nil
 }
 
 // bindCast resolves CAST(x AS t) and its x::t spelling.
@@ -566,15 +570,35 @@ func bindBinary(e *ast.BinaryExpr, sc *scope) (plan.Expr, error) {
 		if l, r, err = unify(l, r, e); err != nil {
 			return nil, err
 		}
-		kind := l.Type()
-		if kind == types.KindNull {
-			kind = r.Type()
-		}
+		kind := arithKind(l.Type(), r.Type())
 		if !kind.IsNumeric() && kind != types.KindNull {
 			return nil, pgerr.Newf(pgerr.DatatypeMismatch,
 				"operator %s is not defined for type %s", e.Op, kind).At(e.OpPos)
 		}
 		return &plan.Binary{Op: e.Op, L: l, R: r, Kind: kind}, nil
+	}
+}
+
+// arithKind is the type of an arithmetic result, following PostgreSQL: a float
+// operand makes the whole expression inexact, and otherwise a numeric operand
+// makes it exact-with-a-scale rather than an integer.
+//
+// The order matters and is not symmetric with "widest wins". Float is chosen
+// over numeric not because it holds more but because it holds less: once one
+// operand cannot be represented exactly, claiming the result is exact would be
+// a lie told in the column type.
+func arithKind(l, r types.Kind) types.Kind {
+	switch {
+	case l == types.KindNull:
+		return r
+	case r == types.KindNull:
+		return l
+	case l == types.KindFloat || r == types.KindFloat:
+		return types.KindFloat
+	case l == types.KindNumeric || r == types.KindNumeric:
+		return types.KindNumeric
+	default:
+		return l
 	}
 }
 

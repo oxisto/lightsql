@@ -77,7 +77,7 @@ func (f format) render(w io.Writer, rows *sql.Rows) (int, error) {
 	case formatCSV:
 		return len(out), writeCSV(w, cols, out)
 	case formatJSON:
-		return len(out), writeJSON(w, cols, out)
+		return len(out), writeJSON(w, cols, types, out)
 	default:
 		return len(out), writeTable(w, cols, types, out)
 	}
@@ -220,18 +220,41 @@ func writeCSV(w io.Writer, cols []string, rows [][]any) error {
 // writeJSON keeps the types: a number stays a number and NULL becomes null,
 // so that whatever is on the other end of the pipe does not have to guess which
 // strings were meant to be values.
-func writeJSON(w io.Writer, cols []string, rows [][]any) error {
+func writeJSON(w io.Writer, cols []string, colTypes []*sql.ColumnType, rows [][]any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	out := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
 		obj := make(map[string]any, len(cols))
 		for i, c := range cols {
+			if i < len(colTypes) && isDecimal(colTypes[i]) {
+				obj[c] = decimalJSON(r[i])
+				continue
+			}
 			obj[c] = jsonValue(r[i])
 		}
 		out = append(out, obj)
 	}
 	return enc.Encode(out)
+}
+
+func isDecimal(t *sql.ColumnType) bool {
+	return strings.EqualFold(t.DatabaseTypeName(), "numeric")
+}
+
+// decimalJSON writes a decimal as a JSON number with its digits intact.
+//
+// It arrives as text, because driver.Value has no exact decimal and rounding it
+// into a float64 on the way out would undo the column. Encoding that text as a
+// JSON string would push the same problem onto whatever reads the output, so
+// the digits go out raw -- JSON numbers have no precision limit, whatever a
+// given parser chooses to do with them.
+func decimalJSON(v any) any {
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return jsonValue(v)
+	}
+	return json.RawMessage(s)
 }
 
 // jsonValue maps a scanned value onto a JSON one.

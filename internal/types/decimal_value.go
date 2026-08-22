@@ -145,6 +145,23 @@ func DivNumeric(a, b Value) (Value, error) {
 	return Numeric(q), nil
 }
 
+// ModNumeric returns the remainder of a ÷ b, which for numeric is what is left
+// after truncating the quotient towards zero -- so the sign follows the
+// dividend, as it does for integers.
+func ModNumeric(a, b Value) (Value, error) {
+	if x, y, scale, ok := alignSmall(a, b); ok {
+		if y == 0 {
+			return Value{}, &ErrDivideByZero{}
+		}
+		return Value{k: KindNumeric, scale: uint8(scale), n: uint64(x % y)}, nil
+	}
+	da, db := a.AsDecimal(), b.AsDecimal()
+	if db.IsZero() {
+		return Value{}, &ErrDivideByZero{}
+	}
+	return Numeric(da.Mod(db)), nil
+}
+
 // NegNumeric returns -a.
 func NegNumeric(a Value) Value {
 	if x, scale, ok := a.smallDecimal(); ok && x != minInt64 {

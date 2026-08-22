@@ -104,7 +104,9 @@ func TestFormats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCSV := "id,name,score,ok\n1,Alice,9.5,true\n2,NULL,NULL,false\n"
+	// 9.50 rather than 9.5: the column is NUMERIC(5,2), so the value is stored
+	// to the scale it was declared with, as it would be in PostgreSQL.
+	wantCSV := "id,name,score,ok\n1,Alice,9.50,true\n2,NULL,NULL,false\n"
 	if csv != wantCSV {
 		t.Errorf("csv =\n%q\nwant\n%q", csv, wantCSV)
 	}
@@ -115,7 +117,9 @@ func TestFormats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"id": 1`, `"score": 9.5`, `"ok": true`, `"name": null`} {
+	// The decimal goes out as a JSON number with its digits intact, not as a
+	// string and not rounded through a float.
+	for _, want := range []string{`"id": 1`, `"score": 9.50`, `"ok": true`, `"name": null`} {
 		if !strings.Contains(js, want) {
 			t.Errorf("json does not contain %s:\n%s", want, js)
 		}

@@ -114,6 +114,13 @@ func (d *Decimal) Mul(b *Decimal) *Decimal {
 	}
 }
 
+// Mod returns the remainder of d ÷ b with the quotient truncated towards zero,
+// so the sign follows the dividend as it does for integers. b must not be zero.
+func (d *Decimal) Mod(b *Decimal) *Decimal {
+	x, y, scale := align(d, b)
+	return &Decimal{Unscaled: new(big.Int).Rem(x, y), Scale: scale}
+}
+
 // Neg returns -d.
 func (d *Decimal) Neg() *Decimal {
 	return &Decimal{Unscaled: new(big.Int).Neg(d.Unscaled), Scale: d.Scale}
