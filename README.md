@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/oxisto/lightsql?style=flat-square)](https://goreportcard.com/report/github.com/oxisto/lightsql)
 ![go](https://img.shields.io/badge/go-1.26+-00ADD8?style=flat-square)
 [![license](https://img.shields.io/badge/license-Apache----2.0-blue?style=flat-square)](LICENSE)
-[![SQL features](https://img.shields.io/badge/SQL_features-71_supported-success?style=flat-square)](#compatibility)
+[![SQL features](https://img.shields.io/badge/SQL_features-72_supported-success?style=flat-square)](#compatibility)
 ![dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)
 <!-- END GENERATED BADGES -->
 
@@ -190,6 +190,24 @@ directory — there is no lock file yet.
 This means the working set must fit in memory. That is a deliberate trade for the
 target use cases, not an oversight.
 
+## Parity with PostgreSQL
+
+The claim this project makes is "speaks the PostgreSQL dialect", so there is a suite
+that checks it against PostgreSQL rather than against someone's reading of the
+documentation. It runs the same SQL against both and compares result sets **and**
+SQLSTATEs — see [compat/](compat/).
+
+```sh
+docker run -d --name pg -e POSTGRES_PASSWORD=parity -e POSTGRES_DB=parity     -e PGDATA=/pgdata --tmpfs /pgdata -p 55432:5432 postgres:17-alpine
+
+cd compat && LIGHTSQL_PARITY_DSN='postgres://postgres:parity@localhost:55432/parity?sslmode=disable'     go test -tags parity ./parity/...
+```
+
+It found five real defects the first time it ran, including a decimal that stopped
+being exact when negated, and three error codes that were plausible but not
+PostgreSQL's. It also confirmed the scale PostgreSQL picks for numeric division,
+which had been reproduced from its source and could not be confirmed any other way.
+
 ## Compatibility
 
 The table below is generated from `internal/features`, and a test fails if it drifts
@@ -287,6 +305,7 @@ the two.
 | 🟡 | information_schema | ✅ | 🟡 | tables, columns, table_constraints and key_column_usage, computed from the catalog on read rather than stored. The column lists are a subset of PostgreSQL's -- the ones tools actually read -- and every text column is text rather than a domain such as sql_identifier, since nothing would enforce the domain's constraint. Writing to one is refused rather than ignored. Unqualified names do not reach it, as in PostgreSQL |
 | 🟡 | pg_catalog | ✅ | 🟡 | pg_tables, pg_namespace, pg_class and pg_attribute, computed the same way. An unqualified name finds them, as PostgreSQL's implicit search_path does, which is what lets a migration tool ask FROM pg_tables whether its version table exists. oid columns are positions in a sorted list, stable only for as long as the set of tables is |
 | ✅ | Context cancellation | ✅ | ✅ | checked inside the operator loop, so a running query stops |
+| ✅ | PostgreSQL parity suite | ✅ | ✅ | compat/parity runs the same SQL against lightsql and a real PostgreSQL and compares result sets and SQLSTATEs; a difference that is understood is recorded rather than deleted, and fails if the two ever agree |
 | ✅ | Command-line shell | ✅ | ✅ | cmd/lightsql opens a database directory and runs SQL, with table, CSV and JSON output, .tables and .schema over the catalog views, and transactions as shell commands since the engine has no BEGIN statement |
 | ✅ | SQLSTATE on every error | ✅ | ✅ | errors satisfy interface{ SQLState() string }, as pgx and lib/pq do |
 | 🟡 | File-backed storage | ✅ | 🟡 | write-ahead log, fsync on commit, compacted at close; open with file:./demo.db |

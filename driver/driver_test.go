@@ -763,8 +763,11 @@ func TestOrderByErrors(t *testing.T) {
 		want  string
 	}{
 		{"unknown column", `SELECT a FROM t ORDER BY nope`, "42703"},
-		{"position out of range", `SELECT a FROM t ORDER BY 2`, "42601"},
-		{"position zero", `SELECT a FROM t ORDER BY 0`, "42601"},
+		// 42P10, invalid_column_reference, not 42601: the statement parses,
+		// it just names a column that is not there. This said 42601 until the
+		// parity suite compared it against a real PostgreSQL.
+		{"position out of range", `SELECT a FROM t ORDER BY 2`, "42P10"},
+		{"position zero", `SELECT a FROM t ORDER BY 0`, "42P10"},
 	}
 
 	for _, tt := range tests {

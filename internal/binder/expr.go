@@ -449,7 +449,7 @@ func bindCast(e *ast.CastExpr, sc *scope) (plan.Expr, error) {
 	if c, ok := x.(*plan.Const); ok {
 		v, err := types.Cast(c.Val, t.Kind)
 		if err != nil {
-			return nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.X.Pos())
+			return nil, pgerr.New(types.CastState(err), err.Error()).At(e.X.Pos())
 		}
 		return &plan.Const{Val: v}, nil
 	}
@@ -678,14 +678,14 @@ func unify(l, r plan.Expr, e *ast.BinaryExpr) (left, right plan.Expr, err error)
 	if c, ok := l.(*plan.Const); ok && lt == types.KindText && literalResolves(rt) {
 		v, err := types.Cast(c.Val, rt)
 		if err != nil {
-			return nil, nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.X.Pos())
+			return nil, nil, pgerr.New(types.CastState(err), err.Error()).At(e.X.Pos())
 		}
 		return &plan.Const{Val: v}, r, nil
 	}
 	if c, ok := r.(*plan.Const); ok && rt == types.KindText && literalResolves(lt) {
 		v, err := types.Cast(c.Val, lt)
 		if err != nil {
-			return nil, nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(e.Y.Pos())
+			return nil, nil, pgerr.New(types.CastState(err), err.Error()).At(e.Y.Pos())
 		}
 		return l, &plan.Const{Val: v}, nil
 	}
@@ -723,7 +723,7 @@ func coerce(e plan.Expr, want types.Kind, pos token.Pos) (plan.Expr, error) {
 	if c, ok := e.(*plan.Const); ok {
 		v, err := types.Cast(c.Val, want)
 		if err != nil {
-			return nil, pgerr.New(pgerr.InvalidTextForType, err.Error()).At(pos)
+			return nil, pgerr.New(types.CastState(err), err.Error()).At(pos)
 		}
 		return &plan.Const{Val: v}, nil
 	}

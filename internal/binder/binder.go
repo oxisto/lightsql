@@ -685,6 +685,15 @@ func checkIdentityWrite(t *catalog.Table, ordinal int, pos token.Pos) error {
 		At(pos)
 }
 
+// bindColumnDefault produces the value a column's DEFAULT yields, or NULL when
+// it has none.
+func (b *Binder) bindColumnDefault(col *catalog.Column) (plan.Expr, error) {
+	if col.Default == nil {
+		return &plan.Const{Val: types.Null()}, nil
+	}
+	return b.bindDefault(col.Default, col.Type.Kind)
+}
+
 func indexOfColumn(cols []catalog.Column, name string) int {
 	for i := range cols {
 		if cols[i].Name == name {
@@ -886,8 +895,14 @@ func (b *Binder) bindUpdate(s *ast.UpdateStmt) (plan.Stmt, error) {
 
 		// The right-hand side is bound in the table's scope, so an assignment
 		// may read the row it is updating: SET n = n + 1 sees the old value.
-		val, err := bindExpr(a.Value, sc)
-		if err != nil {
+		var val plan.Expr
+		if _, isDefault := a.Value.(*ast.DefaultExpr); isDefault {
+			// DEFAULT means the column's own default, or NULL where it has
+			// none -- which is what PostgreSQL does rather than refusing.
+			if val, err = b.bindColumnDefault(&t.Columns[i]); err != nil {
+				return nil, at(err, a.Value.Pos())
+			}
+		} else if val, err = bindExpr(a.Value, sc); err != nil {
 			return nil, err
 		}
 		if val, err = coerce(val, t.Columns[i].Type.Kind, a.Value.Pos()); err != nil {
@@ -1385,7 +1400,10 @@ func (b *Binder) bindSortTerm(e ast.Expr, sc *scope, proj *plan.Project) (plan.E
 		n, err := strconv.Atoi(lit.Val)
 		if err == nil {
 			if n < 1 || n > len(proj.Exprs) {
-				return nil, pgerr.Newf(pgerr.SyntaxError,
+				// invalid_column_reference rather than syntax_error: the
+				// statement parses, it just names a column that is not there.
+				// PostgreSQL reports 42P10 and the parity suite says so.
+				return nil, pgerr.Newf(pgerr.InvalidColumnReference,
 					"ORDER BY position %d is not in the select list", n).At(lit.Pos())
 			}
 			return proj.Exprs[n-1], nil

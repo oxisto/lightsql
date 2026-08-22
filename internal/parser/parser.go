@@ -1029,8 +1029,15 @@ func (p *parser) parseUpdate() (*ast.UpdateStmt, error) {
 		if err := p.expect(token.Eq); err != nil {
 			return nil, err
 		}
-		val, err := p.parseExpr(bpNone)
-		if err != nil {
+		// DEFAULT is accepted only here rather than anywhere an expression may
+		// appear, because it means nothing without a column to take its default
+		// from. Letting the expression parser produce one would push that check
+		// into the binder for every expression in the language.
+		var val ast.Expr
+		if p.at(token.Default) {
+			val = &ast.DefaultExpr{DefaultPos: p.cur().Pos}
+			p.next()
+		} else if val, err = p.parseExpr(bpNone); err != nil {
 			return nil, err
 		}
 		stmt.Assignments = append(stmt.Assignments, &ast.Assignment{Column: col, Value: val})

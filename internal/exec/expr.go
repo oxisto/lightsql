@@ -68,7 +68,7 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 			}
 			out, err := types.Cast(v, want)
 			if err != nil {
-				return types.Value{}, pgerr.New(pgerr.InvalidTextForType, err.Error())
+				return types.Value{}, pgerr.New(types.CastState(err), err.Error())
 			}
 			return out, nil
 		}, nil
@@ -101,7 +101,7 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 			}
 			out, err := types.Cast(v, want)
 			if err != nil {
-				return types.Value{}, pgerr.New(pgerr.InvalidTextForType, err.Error())
+				return types.Value{}, pgerr.New(types.CastState(err), err.Error())
 			}
 			return out, nil
 		}, nil
@@ -501,6 +501,12 @@ func compileUnary(e *plan.Unary, tx *storage.Tx) (Eval, error) {
 				return v, nil
 			case types.KindInt:
 				return types.Int(-v.AsInt()), nil
+			case types.KindNumeric:
+				// Exactly, rather than through a float. Negating -1.7 into a
+				// float made it stop being a decimal, which only showed when
+				// something downstream needed it to still be one -- and the
+				// arithmetic path hid it by casting back through text.
+				return types.NegNumeric(v), nil
 			default:
 				return types.Float(-v.AsFloat()), nil
 			}
