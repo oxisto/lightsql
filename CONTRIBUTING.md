@@ -126,6 +126,9 @@ types: hash numeric kinds by class so equal values agree
 The prefix names *where*, which in a strict pipeline is the first thing anyone wants
 to know: a bug is always "the binder rejects X" or "the scanner mislexes Y". Use the
 package's base name without the `internal/` prefix — `scanner`, not `internal/scanner`.
+A command keeps its `cmd/` prefix, as the Go project writes `cmd/go:` — without it a
+commit to `cmd/lightsql` would be indistinguishable from one to the root package,
+which is also called `lightsql`.
 
 Rules:
 
