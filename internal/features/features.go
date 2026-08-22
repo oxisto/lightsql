@@ -484,10 +484,13 @@ var Groups = []Group{
 				Note: "errors satisfy interface{ SQLState() string }, as pgx and lib/pq do"},
 			// Partial rather than yes: what is on disk is correct and a crash
 			// during a commit loses at most that commit, but the log is
-			// compacted only when the database is closed, and nothing stops a
-			// second process opening the same directory.
+			// compacted only when the database is closed.
 			{Name: "File-backed storage", Parse: Yes, Exec: Partial,
-				Note: "write-ahead log, fsync on commit, compacted at close; open with file:./demo.db"},
+				Note: "write-ahead log, fsync on commit, compacted at close; open with " +
+					"file:./demo.db. A second process opening the same directory is refused " +
+					"rather than allowed to corrupt it, and the lock is released by the " +
+					"operating system however the holder exits, so a crash leaves nothing " +
+					"stale"},
 		},
 	},
 	{

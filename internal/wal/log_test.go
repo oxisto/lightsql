@@ -1,11 +1,14 @@
 package wal
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unsafe"
 
+	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/types"
 )
 
@@ -291,5 +294,81 @@ func TestRecordSize(t *testing.T) {
 	const want = 72
 	if got := unsafe.Sizeof(Record{}); got != want {
 		t.Errorf("unsafe.Sizeof(Record{}) = %d, want %d", got, want)
+	}
+}
+
+// TestSecondOpenIsRefused pins the lock. Two processes with one directory open
+// do not merely race: a checkpoint in one renames a new file over the log, and
+// the other goes on writing to an inode that no longer has a name, losing
+// everything it commits from then on with no error on either side.
+//
+// This happened. A server was running while a second program opened the same
+// directory to look at it, and that program's ordinary close -- which
+// checkpoints -- orphaned the server's descriptor. The server carried on
+// committing into a file nobody could see.
+func TestSecondOpenIsRefused(t *testing.T) {
+	dir := t.TempDir()
+
+	first, _ := openAt(t, dir)
+
+	// flock is held per open file description, so a second open from this same
+	// process is refused exactly as another process would be.
+	if _, err := Open(dir, false); err == nil {
+		t.Fatal("a second open of the same directory succeeded")
+	} else {
+		if !strings.Contains(err.Error(), "another process") {
+			t.Errorf("error %q does not say the directory is already open", err)
+		}
+		var coded interface{ SQLState() string }
+		if errors.As(err, &coded) && coded.SQLState() != pgerr.ObjectInUse {
+			t.Errorf("SQLSTATE = %s, want %s", coded.SQLState(), pgerr.ObjectInUse)
+		}
+	}
+
+	// Releasing it makes the directory available again.
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	second, err := Open(dir, false)
+	if err != nil {
+		t.Fatalf("opening after the first was closed: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestLockSurvivesACheckpoint is the regression test for the bug itself. A
+// checkpoint renames a new file over the log, so a lock taken on the log would
+// end up on the unlinked inode and the next process would lock the replacement
+// -- both believing they held the directory. The lock is on a file of its own
+// for exactly this reason.
+func TestLockSurvivesACheckpoint(t *testing.T) {
+	dir := t.TempDir()
+
+	held, _ := openAt(t, dir)
+	if err := held.Write([]Record{DDLRecord("create table t (a int)")}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := held.Checkpoint([]Record{DDLRecord("create table t (a int)")}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	// The log is now a different file than the one opened. The lock is not.
+	if _, err := Open(dir, false); err == nil {
+		t.Fatal("the directory became available to a second opener after a checkpoint")
+	}
+
+	// And the holder can still write, into the file that still has a name.
+	if err := held.Write([]Record{InsertRecord("public.t", 1, []types.Value{types.Int(1)})}); err != nil {
+		t.Fatalf("writing after a checkpoint: %v", err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	_, got := openAt(t, dir)
+	if len(got) != 2 {
+		t.Errorf("replayed %d transactions, want the checkpoint and the write after it", len(got))
 	}
 }

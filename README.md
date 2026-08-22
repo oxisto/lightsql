@@ -165,6 +165,7 @@ db, err := sql.Open("lightsql", "file:./demo.db?fsync=off") // faster, loses the
 
 ```
 demo.db/
+  LOCK             flock'd, so only one process opens the directory
   wal              every committed change, oldest first
 ```
 
@@ -183,9 +184,17 @@ at the restart after that.
 Closing the database rewrites the log as the state rather than the history that produced
 it, so a table updated a million times does not replay a million versions at startup.
 
-Two limits worth knowing before pointing something at a directory: the log is compacted
-only when the database is closed, and nothing stops a second process opening the same
-directory — there is no lock file yet.
+**One process at a time.** A second one opening the directory is refused, with SQLSTATE
+`55006`, rather than allowed to corrupt it. That is not caution: a checkpoint replaces the
+log by renaming a new file over it, so a second process closing — even cleanly — would
+leave the first writing to an inode with no name, losing every commit it made afterwards
+with no error on either side. The lock is an `flock` held by an open descriptor, so the
+operating system releases it however the process exits and a crash leaves nothing stale to
+clean up. To look at a database that something else has open, copy the directory.
+
+One limit worth knowing: the log is compacted only when the database is closed, so a
+process that is killed rather than shut down leaves a log that keeps growing across runs.
+Nothing is lost — recovery is unaffected — it just takes longer to open.
 
 This means the working set must fit in memory. That is a deliberate trade for the
 target use cases, not an oversight.
@@ -308,7 +317,7 @@ the two.
 | ✅ | PostgreSQL parity suite | ✅ | ✅ | compat/parity runs the same SQL against lightsql and a real PostgreSQL and compares result sets and SQLSTATEs over two hundred cases; a difference that is understood is recorded rather than deleted, and fails if the two ever agree |
 | ✅ | Command-line shell | ✅ | ✅ | cmd/lightsql opens a database directory and runs SQL, with table, CSV and JSON output, .tables and .schema over the catalog views, and transactions as shell commands since the engine has no BEGIN statement |
 | ✅ | SQLSTATE on every error | ✅ | ✅ | errors satisfy interface{ SQLState() string }, as pgx and lib/pq do |
-| 🟡 | File-backed storage | ✅ | 🟡 | write-ahead log, fsync on commit, compacted at close; open with file:./demo.db |
+| 🟡 | File-backed storage | ✅ | 🟡 | write-ahead log, fsync on commit, compacted at close; open with file:./demo.db. A second process opening the same directory is refused rather than allowed to corrupt it, and the lock is released by the operating system however the holder exits, so a crash leaves nothing stale |
 | | **Lexical** | | | |
 | ✅ | Comments | ✅ | ✅ | -- to end of line, and nestable /* */ |
 | ✅ | Quoted identifiers | ✅ | ✅ | case preserving, doubled quote escapes |
