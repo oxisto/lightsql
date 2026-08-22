@@ -42,6 +42,10 @@ const (
 	ReadOnlySQLTransaction  = "25006"
 	FeatureNotSupported     = "0A000"
 	InternalError           = "XX000"
+	// DataCorrupted reports a stored record that cannot be read back. A crash
+	// may truncate the write-ahead log mid-write, so this is an expected
+	// outcome of recovery rather than a sign of a bug.
+	DataCorrupted = "XX001"
 )
 
 // Error is a lightsql error. The zero value is not useful; construct with New,
