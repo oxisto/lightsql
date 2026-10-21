@@ -276,8 +276,11 @@ var Groups = []Group{
 			{Name: "Subqueries", Parse: Yes, Exec: Partial,
 				Note: "scalar, IN, EXISTS and derived tables, which must have an alias. " +
 					"A scalar subquery is NULL over no rows and an error over more than one. " +
-					"Only uncorrelated subqueries are supported: one that references the " +
-					"outer query, and LATERAL, are both rejected rather than mis-resolved",
+					"A correlated subquery works in all three expression forms, at any " +
+					"depth, and is re-run for each outer row; an inner name shadows an outer " +
+					"one, so a subquery means the same thing whether or not the query around " +
+					"it shares a column. LATERAL is not supported, so a derived table in FROM " +
+					"is bound in a scope of its own and cannot see the query containing it",
 				Setup: probeJoin,
 				SQL:   "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)"},
 			{Name: "UNION / INTERSECT / EXCEPT", Parse: Yes, Exec: Yes,

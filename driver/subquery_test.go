@@ -237,10 +237,13 @@ func TestSubqueryErrors(t *testing.T) {
 			want:  "subquery must return only one column",
 		},
 		{
-			// Correlated subqueries are not supported yet. The reference must
-			// fail rather than resolve against the subplan's own row.
-			name:  "correlated reference is rejected",
-			query: `SELECT name FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.id = emp.dept)`,
+			// A derived table in FROM is bound in a scope of its own, so a
+			// reference to the query around it is the missing column it looks
+			// like. Correlating one needs LATERAL, which lightsql does not
+			// have -- and resolving it silently against the outer query would
+			// be a different query from the one that was written.
+			name:  "a derived table cannot see the query around it",
+			query: `SELECT name FROM emp, (SELECT id FROM dept WHERE dept.id = emp.dept) d`,
 			want:  "does not exist",
 		},
 		{
@@ -328,5 +331,111 @@ func TestSubqueryNotAllowed(t *testing.T) {
 				t.Errorf("%s: got %v, want it to mention a subquery", s, err)
 			}
 		})
+	}
+}
+
+// TestCorrelatedSubqueries covers the shape an ORM emits constantly and that
+// this engine used to refuse: a subquery reading a column of the query around
+// it.
+//
+// What makes it different from an uncorrelated one is not the syntax but the
+// evaluation: the answer changes per outer row, so the subquery cannot be run
+// once and reused.
+func TestCorrelatedSubqueries(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db, subqueryFixture...)
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{
+			name:  "exists",
+			query: `SELECT name FROM emp e WHERE EXISTS (SELECT 1 FROM dept d WHERE d.id = e.dept) ORDER BY name`,
+			want:  []string{"ada", "cy"},
+		},
+		{
+			// bob has no department, so nothing matches for him.
+			name:  "not exists",
+			query: `SELECT name FROM emp e WHERE NOT EXISTS (SELECT 1 FROM dept d WHERE d.id = e.dept) ORDER BY name`,
+			want:  []string{"bob"},
+		},
+		{
+			// The value differs per row, which is the whole point.
+			name:  "scalar in the select list",
+			query: `SELECT name, (SELECT label FROM dept d WHERE d.id = e.dept) FROM emp e ORDER BY name`,
+			want:  []string{"ada|eng", "bob|NULL", "cy|ops"},
+		},
+		{
+			name:  "correlated in",
+			query: `SELECT label FROM dept d WHERE d.id IN (SELECT e.dept FROM emp e WHERE e.name <> 'cy') ORDER BY label`,
+			want:  []string{"eng"},
+		},
+		{
+			// An outer NULL makes the comparison unknown, so nothing matches
+			// and EXISTS is false rather than unknown.
+			name:  "outer null",
+			query: `SELECT count(*) FROM emp e WHERE EXISTS (SELECT 1 FROM dept d WHERE d.id = e.dept)`,
+			want:  []string{"2"},
+		},
+		{
+			name:  "correlated aggregate",
+			query: `SELECT label, (SELECT count(*) FROM emp e WHERE e.dept = d.id) FROM dept d ORDER BY label`,
+			want:  []string{"eng|1", "hr|0", "ops|1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rowsOf(t, db, tt.query); !slices.Equal(got, tt.want) {
+				t.Errorf("%s\n got: %v\nwant: %v", tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCorrelationResolvesInward pins that an inner name shadows an outer one.
+// Looking outward only when the inner query lacks the name is what keeps a
+// subquery meaning the same thing whether or not the query around it happens to
+// share a column.
+func TestCorrelationResolvesInward(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE o (id INT, v INT)`,
+		`CREATE TABLE i (id INT, v INT)`,
+		`INSERT INTO o VALUES (1, 100), (2, 200)`,
+		`INSERT INTO i VALUES (1, 100), (2, 999)`,
+	)
+
+	// Unqualified v is i.v, so this matches whenever i has a 999 -- for every
+	// outer row, since nothing correlates it.
+	if got := rowsOf(t, db, `SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE v = 999) ORDER BY id`); !slices.Equal(got, []string{"1", "2"}) {
+		t.Errorf("the inner v did not win: %v", got)
+	}
+	// Qualifying reaches the outer one, which correlates it.
+	if got := rowsOf(t, db, `SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.v = o.v) ORDER BY o.id`); !slices.Equal(got, []string{"1"}) {
+		t.Errorf("the qualified outer v did not correlate: %v", got)
+	}
+}
+
+// TestCorrelationTwoLevelsOut covers a subquery reaching past its own parent.
+// The middle query has to carry the value down rather than resolving it, which
+// is why every scope on the way is marked correlated and not just the innermost.
+func TestCorrelationTwoLevelsOut(t *testing.T) {
+	db := open(t)
+	mustExecAll(t, db,
+		`CREATE TABLE a (id INT)`,
+		`CREATE TABLE b (id INT, a_id INT)`,
+		`CREATE TABLE c (id INT, b_id INT)`,
+		`INSERT INTO a VALUES (1), (2)`,
+		`INSERT INTO b VALUES (10, 1), (11, 2)`,
+		`INSERT INTO c VALUES (100, 10)`,
+	)
+
+	got := rowsOf(t, db, `SELECT a.id FROM a WHERE EXISTS (
+		SELECT 1 FROM b WHERE EXISTS (
+			SELECT 1 FROM c WHERE c.b_id = b.id AND b.a_id = a.id)) ORDER BY a.id`)
+	if !slices.Equal(got, []string{"1"}) {
+		t.Errorf("got %v, want [1]", got)
 	}
 }

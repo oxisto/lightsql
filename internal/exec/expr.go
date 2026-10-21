@@ -19,7 +19,6 @@ import (
 	"github.com/oxisto/lightsql/internal/builtin"
 	"github.com/oxisto/lightsql/internal/pgerr"
 	"github.com/oxisto/lightsql/internal/plan"
-	"github.com/oxisto/lightsql/internal/storage"
 	"github.com/oxisto/lightsql/internal/types"
 )
 
@@ -39,11 +38,29 @@ type Row []types.Value
 type Eval func(ctx context.Context, args []types.Value, row Row) (types.Value, error)
 
 // Compile turns a bound expression into a closure.
-func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
+func compile(e plan.Expr, ev env) (Eval, error) {
 	switch e := e.(type) {
 	case *plan.Const:
 		v := e.Val
 		return func(context.Context, []types.Value, Row) (types.Value, error) { return v, nil }, nil
+
+	case *plan.OuterRef:
+		// Which cell is decided here, once, rather than searched per row. The
+		// cell is filled by the correlated subquery that owns it, just before
+		// it runs.
+		cell := ev.cell(e.Level)
+		if cell == nil {
+			return nil, pgerr.Newf(pgerr.InternalError,
+				"no enclosing query for the reference to %q", e.Name)
+		}
+		ordinal := e.Ordinal
+		return func(context.Context, []types.Value, Row) (types.Value, error) {
+			row := *cell
+			if ordinal >= len(row) {
+				return types.Null(), nil
+			}
+			return row[ordinal], nil
+		}, nil
 
 	case *plan.Column:
 		i := e.Ordinal
@@ -74,7 +91,7 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 		}, nil
 
 	case *plan.IsNull:
-		x, err := Compile(e.X, tx)
+		x, err := compile(e.X, ev)
 		if err != nil {
 			return nil, err
 		}
@@ -89,7 +106,7 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 		}, nil
 
 	case *plan.Cast:
-		x, err := Compile(e.X, tx)
+		x, err := compile(e.X, ev)
 		if err != nil {
 			return nil, err
 		}
@@ -107,13 +124,13 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 		}, nil
 
 	case *plan.Case:
-		return compileCase(e, tx)
+		return compileCase(e, ev)
 
 	case *plan.FuncCall:
-		return compileFuncCall(e, tx)
+		return compileFuncCall(e, ev)
 
 	case *plan.Coalesce:
-		return compileCoalesce(e, tx)
+		return compileCoalesce(e, ev)
 
 	case *plan.Now:
 		// Resolved once, here, rather than per row: the transaction's start is
@@ -124,29 +141,29 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 		// DEFAULT. There is no transaction to ask, so the wall clock is the
 		// honest answer.
 		at := time.Now().UTC()
-		if tx != nil {
-			at = tx.Started()
+		if ev.tx != nil {
+			at = ev.tx.Started()
 		}
 		v := types.TimeValue(at, e.Kind)
 		return func(context.Context, []types.Value, Row) (types.Value, error) { return v, nil }, nil
 
 	case *plan.ScalarSubquery:
-		return compileScalarSubquery(e, tx)
+		return compileScalarSubquery(e, ev)
 
 	case *plan.ExistsSubquery:
-		return compileExists(e, tx)
+		return compileExists(e, ev)
 
 	case *plan.InSubquery:
-		return compileInSubquery(e, tx)
+		return compileInSubquery(e, ev)
 
 	case *plan.InList:
-		return compileInList(e, tx)
+		return compileInList(e, ev)
 
 	case *plan.Unary:
-		return compileUnary(e, tx)
+		return compileUnary(e, ev)
 
 	case *plan.Binary:
-		return compileBinary(e, tx)
+		return compileBinary(e, ev)
 
 	default:
 		return nil, pgerr.Newf(pgerr.InternalError, "cannot compile expression %T", e)
@@ -160,16 +177,16 @@ func Compile(e plan.Expr, tx *storage.Tx) (Eval, error) {
 // rule a WHERE clause follows and the reason `CASE WHEN NULL THEN 1 ELSE 2 END`
 // is 2 rather than 1. A CASE that matches nothing with no ELSE is NULL, which
 // is why the zero Value is never returned from here.
-func compileCase(e *plan.Case, tx *storage.Tx) (Eval, error) {
+func compileCase(e *plan.Case, ev env) (Eval, error) {
 	type arm struct{ cond, value Eval }
 
 	arms := make([]arm, len(e.Whens))
 	for i, w := range e.Whens {
-		cond, err := Compile(w.Cond, tx)
+		cond, err := compile(w.Cond, ev)
 		if err != nil {
 			return nil, err
 		}
-		value, err := Compile(w.Value, tx)
+		value, err := compile(w.Value, ev)
 		if err != nil {
 			return nil, err
 		}
@@ -179,7 +196,7 @@ func compileCase(e *plan.Case, tx *storage.Tx) (Eval, error) {
 	var els Eval
 	if e.Else != nil {
 		var err error
-		if els, err = Compile(e.Else, tx); err != nil {
+		if els, err = compile(e.Else, ev); err != nil {
 			return nil, err
 		}
 	}
@@ -210,7 +227,7 @@ func compileCase(e *plan.Case, tx *storage.Tx) (Eval, error) {
 // implementation. That is what stops a new function from quietly forgetting
 // SQL's rule that NULL propagates -- and it means an implementation may read
 // its arguments without guarding every one.
-func compileFuncCall(e *plan.FuncCall, tx *storage.Tx) (Eval, error) {
+func compileFuncCall(e *plan.FuncCall, ev env) (Eval, error) {
 	fn, ok := builtin.LookupScalar(e.Func)
 	if !ok {
 		// The binder accepted the name, so a miss is a bug in the plan rather
@@ -221,7 +238,7 @@ func compileFuncCall(e *plan.FuncCall, tx *storage.Tx) (Eval, error) {
 	args := make([]Eval, len(e.Args))
 	for i, a := range e.Args {
 		var err error
-		if args[i], err = Compile(a, tx); err != nil {
+		if args[i], err = compile(a, ev); err != nil {
 			return nil, err
 		}
 	}
@@ -249,11 +266,11 @@ func compileFuncCall(e *plan.FuncCall, tx *storage.Tx) (Eval, error) {
 // for the shape coalesce is usually written in -- a cheap column with an
 // expensive fallback -- and it is what the SQL standard specifies, coalesce
 // being defined as a CASE.
-func compileCoalesce(e *plan.Coalesce, tx *storage.Tx) (Eval, error) {
+func compileCoalesce(e *plan.Coalesce, ev env) (Eval, error) {
 	args := make([]Eval, len(e.Args))
 	for i, a := range e.Args {
 		var err error
-		if args[i], err = Compile(a, tx); err != nil {
+		if args[i], err = compile(a, ev); err != nil {
 			return nil, err
 		}
 	}
@@ -293,8 +310,8 @@ func compileCoalesce(e *plan.Coalesce, tx *storage.Tx) (Eval, error) {
 // Copying out row[0] is required, not incidental: an operator's row is only
 // valid until the next Next call. types.Value is a value type, so the append
 // copies it.
-func drainColumn(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value, limit int) (vals []types.Value, err error) {
-	op, err := Build(ctx, n, tx, args)
+func drainColumn(ctx context.Context, n plan.Node, ev env, args []types.Value, limit int) (vals []types.Value, err error) {
+	op, err := build(ctx, n, ev, args)
 	if err != nil {
 		return nil, err
 	}
@@ -315,8 +332,18 @@ func drainColumn(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.
 	return vals, nil
 }
 
-func compileScalarSubquery(e *plan.ScalarSubquery, tx *storage.Tx) (Eval, error) {
+func compileScalarSubquery(e *plan.ScalarSubquery, ev env) (Eval, error) {
 	sub := e.Input
+
+	if e.Correlated {
+		cell := new(Row)
+		inner := ev.push(cell)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			*cell = row
+			return scalarOf(ctx, sub, inner, args)
+		}, nil
+	}
+
 	var (
 		cached types.Value
 		done   bool
@@ -325,29 +352,57 @@ func compileScalarSubquery(e *plan.ScalarSubquery, tx *storage.Tx) (Eval, error)
 		if done {
 			return cached, nil
 		}
-		// Two rows is all it takes to know there are too many.
-		vals, err := drainColumn(ctx, sub, tx, args, 2)
+		v, err := scalarOf(ctx, sub, ev, args)
 		if err != nil {
 			return types.Value{}, err
 		}
-		switch len(vals) {
-		case 0:
-			// No rows is NULL rather than an error: asking for a value that
-			// turns out not to exist is a well-formed question.
-			cached = types.Null()
-		case 1:
-			cached = vals[0]
-		default:
-			return types.Value{}, pgerr.New(pgerr.CardinalityViolation,
-				"more than one row returned by a subquery used as an expression")
-		}
-		done = true
+		cached, done = v, true
 		return cached, nil
 	}, nil
 }
 
-func compileExists(e *plan.ExistsSubquery, tx *storage.Tx) (Eval, error) {
+// scalarOf runs a subquery used where a single value is expected.
+//
+// No rows is NULL rather than an error: asking for a value that turns out not
+// to exist is a well-formed question. More than one row is not, because there
+// is no answer to give.
+func scalarOf(ctx context.Context, sub plan.Node, ev env, args []types.Value) (types.Value, error) {
+	// Two rows is all it takes to know there are too many.
+	vals, err := drainColumn(ctx, sub, ev, args, 2)
+	if err != nil {
+		return types.Value{}, err
+	}
+	switch len(vals) {
+	case 0:
+		return types.Null(), nil
+	case 1:
+		return vals[0], nil
+	default:
+		return types.Value{}, pgerr.New(pgerr.CardinalityViolation,
+			"more than one row returned by a subquery used as an expression")
+	}
+}
+
+func compileExists(e *plan.ExistsSubquery, ev env) (Eval, error) {
 	sub, negate := e.Input, e.Negate
+
+	if e.Correlated {
+		// A correlated subquery has a different answer for every outer row, so
+		// there is nothing to remember: the row is written into the cell the
+		// inner expressions were compiled against, and the whole thing is run
+		// again.
+		cell := new(Row)
+		inner := ev.push(cell)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			*cell = row
+			ok, err := anyRow(ctx, sub, inner, args)
+			if err != nil {
+				return types.Value{}, err
+			}
+			return types.Bool(ok != negate), nil
+		}, nil
+	}
+
 	var (
 		found bool
 		done  bool
@@ -357,7 +412,7 @@ func compileExists(e *plan.ExistsSubquery, tx *storage.Tx) (Eval, error) {
 			// Only the first row is asked for. EXISTS has its answer as soon as
 			// one arrives, and the operator tree is torn down without producing
 			// the rest.
-			ok, err := anyRow(ctx, sub, tx, args)
+			ok, err := anyRow(ctx, sub, ev, args)
 			if err != nil {
 				return types.Value{}, err
 			}
@@ -372,8 +427,8 @@ func compileExists(e *plan.ExistsSubquery, tx *storage.Tx) (Eval, error) {
 // anyRow reports whether a subplan produces at least one row. It is
 // separate from drainColumn because EXISTS does not care about the select list
 // at all, so a subquery of any width is legal here.
-func anyRow(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value) (found bool, err error) {
-	op, err := Build(ctx, n, tx, args)
+func anyRow(ctx context.Context, n plan.Node, ev env, args []types.Value) (found bool, err error) {
+	op, err := build(ctx, n, ev, args)
 	if err != nil {
 		return false, err
 	}
@@ -388,19 +443,37 @@ func anyRow(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value
 	return found, nil
 }
 
-func compileInSubquery(e *plan.InSubquery, tx *storage.Tx) (Eval, error) {
-	x, err := Compile(e.X, tx)
+func compileInSubquery(e *plan.InSubquery, ev env) (Eval, error) {
+	x, err := compile(e.X, ev)
 	if err != nil {
 		return nil, err
 	}
 	sub, negate := e.Input, e.Negate
+
+	if e.Correlated {
+		cell := new(Row)
+		inner := ev.push(cell)
+		return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
+			*cell = row
+			xv, err := x(ctx, args, row)
+			if err != nil {
+				return types.Value{}, err
+			}
+			vals, err := drainColumn(ctx, sub, inner, args, 0)
+			if err != nil {
+				return types.Value{}, err
+			}
+			return inResult(xv, vals, negate), nil
+		}, nil
+	}
+
 	var (
 		vals []types.Value
 		done bool
 	)
 	return func(ctx context.Context, args []types.Value, row Row) (types.Value, error) {
 		if !done {
-			if vals, err = drainColumn(ctx, sub, tx, args, 0); err != nil {
+			if vals, err = drainColumn(ctx, sub, ev, args, 0); err != nil {
 				return types.Value{}, err
 			}
 			done = true
@@ -413,14 +486,14 @@ func compileInSubquery(e *plan.InSubquery, tx *storage.Tx) (Eval, error) {
 	}, nil
 }
 
-func compileInList(e *plan.InList, tx *storage.Tx) (Eval, error) {
-	x, err := Compile(e.X, tx)
+func compileInList(e *plan.InList, ev env) (Eval, error) {
+	x, err := compile(e.X, ev)
 	if err != nil {
 		return nil, err
 	}
 	list := make([]Eval, len(e.List))
 	for i, item := range e.List {
-		if list[i], err = Compile(item, tx); err != nil {
+		if list[i], err = compile(item, ev); err != nil {
 			return nil, err
 		}
 	}
@@ -469,8 +542,8 @@ func inResult(x types.Value, vals []types.Value, negate bool) types.Value {
 	return types.Bool(negate)
 }
 
-func compileUnary(e *plan.Unary, tx *storage.Tx) (Eval, error) {
-	x, err := Compile(e.X, tx)
+func compileUnary(e *plan.Unary, ev env) (Eval, error) {
+	x, err := compile(e.X, ev)
 	if err != nil {
 		return nil, err
 	}
@@ -530,12 +603,12 @@ var comparisons = map[ast.BinaryOp]func(a, b types.Value) types.Bool3{
 	},
 }
 
-func compileBinary(e *plan.Binary, tx *storage.Tx) (Eval, error) {
-	l, err := Compile(e.L, tx)
+func compileBinary(e *plan.Binary, ev env) (Eval, error) {
+	l, err := compile(e.L, ev)
 	if err != nil {
 		return nil, err
 	}
-	r, err := Compile(e.R, tx)
+	r, err := compile(e.R, ev)
 	if err != nil {
 		return nil, err
 	}

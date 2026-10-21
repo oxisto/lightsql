@@ -41,10 +41,10 @@ type Operator interface {
 // The context is taken here, and not only in Next, because building is not
 // purely structural: LIMIT and OFFSET are evaluated now, and a subquery in
 // expression position builds an operator tree of its own.
-func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value) (Operator, error) {
+func build(ctx context.Context, n plan.Node, ev env, args []types.Value) (Operator, error) {
 	switch n := n.(type) {
 	case *plan.Scan:
-		return &scanOp{rows: n.Table.Rows(tx)}, nil
+		return &scanOp{rows: n.Table.Rows(ev.tx)}, nil
 
 	case *plan.SystemScan:
 		// The rows are computed now, at the start of the scan, rather than per
@@ -54,22 +54,22 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		return &scanOp{rows: n.View.Rows(n.Cat)}, nil
 
 	case *plan.Filter:
-		input, err := Build(ctx, n.Input, tx, args)
+		input, err := build(ctx, n.Input, ev, args)
 		if err != nil {
 			return nil, err
 		}
-		pred, err := Compile(n.Pred, tx)
+		pred, err := compile(n.Pred, ev)
 		if err != nil {
 			return nil, err
 		}
 		return &filterOp{input: input, pred: pred, args: args}, nil
 
 	case *plan.Join:
-		left, err := Build(ctx, n.Left, tx, args)
+		left, err := build(ctx, n.Left, ev, args)
 		if err != nil {
 			return nil, err
 		}
-		right, err := Build(ctx, n.Right, tx, args)
+		right, err := build(ctx, n.Right, ev, args)
 		if err != nil {
 			return nil, err
 		}
@@ -84,14 +84,14 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 			keepRight: n.Type == ast.RightJoin || n.Type == ast.FullJoin,
 		}
 		if n.Pred != nil {
-			if op.pred, err = Compile(n.Pred, tx); err != nil {
+			if op.pred, err = compile(n.Pred, ev); err != nil {
 				return nil, err
 			}
 		}
 		return op, nil
 
 	case *plan.Aggregate:
-		input, err := Build(ctx, n.Input, tx, args)
+		input, err := build(ctx, n.Input, ev, args)
 		if err != nil {
 			return nil, err
 		}
@@ -113,7 +113,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 			op.funcs = append(op.funcs, agg)
 		}
 		for _, k := range n.Keys {
-			eval, err := Compile(k, tx)
+			eval, err := compile(k, ev)
 			if err != nil {
 				return nil, err
 			}
@@ -124,7 +124,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 				op.argEvals = append(op.argEvals, nil)
 				continue
 			}
-			eval, err := Compile(c.Arg, tx)
+			eval, err := compile(c.Arg, ev)
 			if err != nil {
 				return nil, err
 			}
@@ -133,11 +133,11 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		return op, nil
 
 	case *plan.SetOp:
-		left, err := Build(ctx, n.Left, tx, args)
+		left, err := build(ctx, n.Left, ev, args)
 		if err != nil {
 			return nil, err
 		}
-		right, err := Build(ctx, n.Right, tx, args)
+		right, err := build(ctx, n.Right, ev, args)
 		if err != nil {
 			_ = left.Close()
 			return nil, err
@@ -145,7 +145,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		return newSetOp(left, right, n), nil
 
 	case *plan.Distinct:
-		input, err := Build(ctx, n.Input, tx, args)
+		input, err := build(ctx, n.Input, ev, args)
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +154,7 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 			seen: builtin.NewKeySet(),
 		}
 		for _, e := range n.On {
-			eval, err := Compile(e, tx)
+			eval, err := compile(e, ev)
 			if err != nil {
 				return nil, err
 			}
@@ -166,26 +166,26 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		return &singleRowOp{}, nil
 
 	case *plan.Project:
-		input, err := Build(ctx, n.Input, tx, args)
+		input, err := build(ctx, n.Input, ev, args)
 		if err != nil {
 			return nil, err
 		}
 		evals := make([]Eval, len(n.Exprs))
 		for i, e := range n.Exprs {
-			if evals[i], err = Compile(e, tx); err != nil {
+			if evals[i], err = compile(e, ev); err != nil {
 				return nil, err
 			}
 		}
 		return &projectOp{input: input, evals: evals, args: args, out: make(Row, len(evals))}, nil
 
 	case *plan.Sort:
-		input, err := Build(ctx, n.Input, tx, args)
+		input, err := build(ctx, n.Input, ev, args)
 		if err != nil {
 			return nil, err
 		}
 		keys := make([]sortKey, len(n.Keys))
 		for i, k := range n.Keys {
-			eval, err := Compile(k.Expr, tx)
+			eval, err := compile(k.Expr, ev)
 			if err != nil {
 				return nil, err
 			}
@@ -194,15 +194,15 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 		return &sortOp{input: input, keys: keys, args: args}, nil
 
 	case *plan.Limit:
-		input, err := Build(ctx, n.Input, tx, args)
+		input, err := build(ctx, n.Input, ev, args)
 		if err != nil {
 			return nil, err
 		}
-		count, err := rowCount(ctx, n.Count, tx, args, math.MaxInt64)
+		count, err := rowCount(ctx, n.Count, ev, args, math.MaxInt64)
 		if err != nil {
 			return nil, err
 		}
-		offset, err := rowCount(ctx, n.Offset, tx, args, 0)
+		offset, err := rowCount(ctx, n.Offset, ev, args, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -215,11 +215,11 @@ func Build(ctx context.Context, n plan.Node, tx *storage.Tx, args []types.Value)
 
 // rowCount evaluates a LIMIT or OFFSET operand, which cannot reference a column
 // and so is constant for the whole statement.
-func rowCount(ctx context.Context, e plan.Expr, tx *storage.Tx, args []types.Value, def int64) (int64, error) {
+func rowCount(ctx context.Context, e plan.Expr, ev env, args []types.Value, def int64) (int64, error) {
 	if e == nil {
 		return def, nil
 	}
-	eval, err := Compile(e, tx)
+	eval, err := compile(e, ev)
 	if err != nil {
 		return 0, err
 	}
@@ -524,13 +524,13 @@ type compiledCheck struct {
 	pred Eval
 }
 
-func compileChecks(checks []plan.Check, tx *storage.Tx) ([]compiledCheck, error) {
+func compileChecks(checks []plan.Check, ev env) ([]compiledCheck, error) {
 	if len(checks) == 0 {
 		return nil, nil
 	}
 	out := make([]compiledCheck, len(checks))
 	for i, c := range checks {
-		pred, err := Compile(c.Pred, tx)
+		pred, err := compile(c.Pred, ev)
 		if err != nil {
 			return nil, err
 		}
@@ -565,14 +565,14 @@ type returningEval struct {
 	evals []Eval
 }
 
-func compileReturning(r *plan.Returning, tx *storage.Tx) (*returningEval, error) {
+func compileReturning(r *plan.Returning, ev env) (*returningEval, error) {
 	if r == nil {
 		return nil, nil
 	}
 	evals := make([]Eval, len(r.Exprs))
 	for i, e := range r.Exprs {
 		var err error
-		if evals[i], err = Compile(e, tx); err != nil {
+		if evals[i], err = compile(e, ev); err != nil {
 			return nil, err
 		}
 	}
@@ -595,28 +595,29 @@ func (r *returningEval) row(ctx context.Context, args []types.Value, in Row) (Ro
 
 // ExecUpdate applies an UPDATE.
 func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []types.Value) (Result, error) {
-	pred, err := compilePredicate(up.Where, tx)
+	ev := env{tx: tx}
+	pred, err := compilePredicate(up.Where, ev)
 	if err != nil {
 		return Result{}, err
 	}
-	ret, err := compileReturning(up.Returning, tx)
+	ret, err := compileReturning(up.Returning, ev)
 	if err != nil {
 		return Result{}, err
 	}
-	checks, err := compileChecks(up.Checks, tx)
+	checks, err := compileChecks(up.Checks, ev)
 	if err != nil {
 		return Result{}, err
 	}
 	assign := make([]Eval, len(up.Assignments))
 	for i, a := range up.Assignments {
-		if assign[i], err = Compile(a.Value, tx); err != nil {
+		if assign[i], err = compile(a.Value, ev); err != nil {
 			return Result{}, err
 		}
 	}
 
 	var res Result
 	wrote := touched{}
-	for _, v := range up.Table.Scan(tx) {
+	for _, v := range up.Table.Scan(ev.tx) {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
@@ -649,10 +650,10 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 		}
 		// A key the children point at is changing, so they have to be dealt
 		// with before the parent row moves out from under them.
-		if err := applyRefActions(tx, up.Table, cur, next, onUpdate, wrote, cascaded{}); err != nil {
+		if err := applyRefActions(ev, up.Table, cur, next, onUpdate, wrote, cascaded{}); err != nil {
 			return Result{}, err
 		}
-		if err := up.Table.Update(tx, v, next); err != nil {
+		if err := up.Table.Update(ev.tx, v, next); err != nil {
 			return Result{}, err
 		}
 
@@ -669,13 +670,13 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 
 	// Uniqueness is checked once the statement has finished writing, so a row
 	// keeping its own value does not conflict with itself.
-	if err := up.Table.CheckConstraints(tx); err != nil {
+	if err := up.Table.CheckConstraints(ev.tx); err != nil {
 		return Result{}, err
 	}
-	if err := up.Table.CheckForeignKeys(tx); err != nil {
+	if err := up.Table.CheckForeignKeys(ev.tx); err != nil {
 		return Result{}, err
 	}
-	if err := wrote.check(tx, up.Table); err != nil {
+	if err := wrote.check(ev, up.Table); err != nil {
 		return Result{}, err
 	}
 	return res, nil
@@ -683,18 +684,19 @@ func ExecUpdate(ctx context.Context, tx *storage.Tx, up *plan.Update, args []typ
 
 // ExecDelete applies a DELETE.
 func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []types.Value) (Result, error) {
-	pred, err := compilePredicate(del.Where, tx)
+	ev := env{tx: tx}
+	pred, err := compilePredicate(del.Where, ev)
 	if err != nil {
 		return Result{}, err
 	}
-	ret, err := compileReturning(del.Returning, tx)
+	ret, err := compileReturning(del.Returning, ev)
 	if err != nil {
 		return Result{}, err
 	}
 
 	var res Result
 	wrote := touched{}
-	for _, v := range del.Table.Scan(tx) {
+	for _, v := range del.Table.Scan(ev.tx) {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
@@ -714,10 +716,10 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 			}
 			res.Rows = append(res.Rows, out)
 		}
-		if err := applyRefActions(tx, del.Table, cur, nil, onDelete, wrote, cascaded{}); err != nil {
+		if err := applyRefActions(ev, del.Table, cur, nil, onDelete, wrote, cascaded{}); err != nil {
 			return Result{}, err
 		}
-		if err := del.Table.Delete(tx, v); err != nil {
+		if err := del.Table.Delete(ev.tx, v); err != nil {
 			return Result{}, err
 		}
 		res.Affected++
@@ -725,7 +727,7 @@ func ExecDelete(ctx context.Context, tx *storage.Tx, del *plan.Delete, args []ty
 
 	// A DELETE had no statement-end check at all, so a cascade could leave a
 	// child in a state nothing revalidated.
-	if err := wrote.check(tx, del.Table); err != nil {
+	if err := wrote.check(ev, del.Table); err != nil {
 		return Result{}, err
 	}
 	return res, nil
@@ -742,15 +744,15 @@ func (t touched) add(tbl *catalog.Table) { t[tbl] = struct{}{} }
 
 // check revalidates every table a cascade wrote to, skipping the statement's
 // own target, which the caller checks separately.
-func (t touched) check(tx *storage.Tx, except *catalog.Table) error {
+func (t touched) check(ev env, except *catalog.Table) error {
 	for tbl := range t {
 		if tbl == except {
 			continue
 		}
-		if err := tbl.CheckConstraints(tx); err != nil {
+		if err := tbl.CheckConstraints(ev.tx); err != nil {
 			return err
 		}
-		if err := tbl.CheckForeignKeys(tx); err != nil {
+		if err := tbl.CheckForeignKeys(ev.tx); err != nil {
 			return err
 		}
 	}
@@ -777,17 +779,17 @@ const (
 // referencing each other -- terminates instead of recurring forever.
 type cascaded map[*storage.Version]bool
 
-func applyRefActions(tx *storage.Tx, parent *catalog.Table, old, next []types.Value,
-	ev refEvent, wrote touched, seen cascaded) error {
+func applyRefActions(ev env, parent *catalog.Table, old, next []types.Value,
+	event refEvent, wrote touched, seen cascaded) error {
 
 	if !parent.IsReferenced() {
 		return nil
 	}
 
-	for _, group := range parent.ChildrenOf(tx, old) {
+	for _, group := range parent.ChildrenOf(ev.tx, old) {
 		fk := group.Ref.FK
 		action := fk.OnDelete
-		if ev == onUpdate {
+		if event == onUpdate {
 			action = fk.OnUpdate
 			// Only a change to the referenced columns matters.
 			if next != nil && matchesParentKey(old, next, fk.ParentCols) {
@@ -800,7 +802,7 @@ func applyRefActions(tx *storage.Tx, parent *catalog.Table, old, next []types.Va
 				continue
 			}
 			seen[child] = true
-			if err := applyRefAction(tx, group.Ref.Child, fk, child, next, action, wrote, seen); err != nil {
+			if err := applyRefAction(ev, group.Ref.Child, fk, child, next, action, wrote, seen); err != nil {
 				return err
 			}
 			// A cascade writes to the child, so the child's own constraints
@@ -822,7 +824,7 @@ func matchesParentKey(old, next []types.Value, cols []int) bool {
 	return true
 }
 
-func applyRefAction(tx *storage.Tx, childTable *catalog.Table, fk *catalog.ForeignKey,
+func applyRefAction(ev env, childTable *catalog.Table, fk *catalog.ForeignKey,
 	child *storage.Version, next []types.Value, action catalog.RefAction,
 	wrote touched, seen cascaded) error {
 
@@ -835,10 +837,10 @@ func applyRefAction(tx *storage.Tx, childTable *catalog.Table, fk *catalog.Forei
 			// pointing at a row that no longer existed -- referential integrity
 			// broken by the machinery that enforces it, and silently, since
 			// nothing revisits them.
-			if err := applyRefActions(tx, childTable, cur, nil, onDelete, wrote, seen); err != nil {
+			if err := applyRefActions(ev, childTable, cur, nil, onDelete, wrote, seen); err != nil {
 				return err
 			}
-			return childTable.Delete(tx, child)
+			return childTable.Delete(ev.tx, child)
 		}
 		// The parent's key moved, so the child follows it.
 		updated := make([]types.Value, len(cur))
@@ -846,12 +848,12 @@ func applyRefAction(tx *storage.Tx, childTable *catalog.Table, fk *catalog.Forei
 		for i, ord := range fk.Columns {
 			updated[ord] = next[fk.ParentCols[i]]
 		}
-		if err := childTable.Update(tx, child, updated); err != nil {
+		if err := childTable.Update(ev.tx, child, updated); err != nil {
 			return err
 		}
 		// The child's own key may have been what moved, so anything referencing
 		// the child follows in turn.
-		return applyRefActions(tx, childTable, cur, updated, onUpdate, wrote, seen)
+		return applyRefActions(ev, childTable, cur, updated, onUpdate, wrote, seen)
 
 	case catalog.SetNull, catalog.SetDefault:
 		cur := childTable.Values(child)
@@ -864,7 +866,7 @@ func applyRefAction(tx *storage.Tx, childTable *catalog.Table, fk *catalog.Forei
 			}
 			updated[ord] = v
 		}
-		return childTable.Update(tx, child, updated)
+		return childTable.Update(ev.tx, child, updated)
 
 	default: // NoAction, Restrict
 		return pgerr.Newf(pgerr.ForeignKeyViolation,
@@ -892,11 +894,11 @@ func refReplacement(t *catalog.Table, ordinal int, action catalog.RefAction) (ty
 // compilePredicate turns an optional WHERE into a row test. A missing clause
 // matches every row, and a clause evaluating to unknown matches none — the same
 // rule a Filter operator applies.
-func compilePredicate(e plan.Expr, tx *storage.Tx) (func(ctx context.Context, args []types.Value, row Row) (bool, error), error) {
+func compilePredicate(e plan.Expr, ev env) (func(ctx context.Context, args []types.Value, row Row) (bool, error), error) {
 	if e == nil {
 		return func(context.Context, []types.Value, Row) (bool, error) { return true, nil }, nil
 	}
-	eval, err := Compile(e, tx)
+	eval, err := compile(e, ev)
 	if err != nil {
 		return nil, err
 	}
@@ -911,23 +913,24 @@ func compilePredicate(e plan.Expr, tx *storage.Tx) (func(ctx context.Context, ar
 
 // ExecInsert runs an INSERT.
 func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []types.Value) (Result, error) {
+	ev := env{tx: tx}
 	width := len(ins.Table.Columns)
-	ret, err := compileReturning(ins.Returning, tx)
+	ret, err := compileReturning(ins.Returning, ev)
 	if err != nil {
 		return Result{}, err
 	}
-	checks, err := compileChecks(ins.Checks, tx)
+	checks, err := compileChecks(ins.Checks, ev)
 	if err != nil {
 		return Result{}, err
 	}
 	defaults := make(map[int]Eval, len(ins.Defaults))
 	for ord, e := range ins.Defaults {
-		if defaults[ord], err = Compile(e, tx); err != nil {
+		if defaults[ord], err = compile(e, ev); err != nil {
 			return Result{}, err
 		}
 	}
 
-	conflict, err := compileConflict(ins, tx)
+	conflict, err := compileConflict(ins, ev)
 	if err != nil {
 		return Result{}, err
 	}
@@ -969,15 +972,15 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 		// statement over the whole table, by which point it is too late to know
 		// which row collided or to do anything but fail.
 		if conflict != nil {
-			if existing := conflict.find(tx, ins.Table, row); existing != nil {
-				return conflict.resolve(ctx, tx, ins.Table, existing, row, args, checks, ret, &res)
+			if existing := conflict.find(ev, ins.Table, row); existing != nil {
+				return conflict.resolve(ctx, ev, ins.Table, existing, row, args, checks, ret, &res)
 			}
 		}
 
 		if err := runChecks(ctx, checks, args, row, ins.Table.Name); err != nil {
 			return err
 		}
-		if err := ins.Table.Insert(tx, row); err != nil {
+		if err := ins.Table.Insert(ev.tx, row); err != nil {
 			return err
 		}
 		res.Affected++
@@ -995,7 +998,7 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 	}
 
 	if ins.Source != nil {
-		if err := insertFrom(ctx, ins.Source, tx, args, store); err != nil {
+		if err := insertFrom(ctx, ins.Source, ev, args, store); err != nil {
 			return res, err
 		}
 	}
@@ -1006,7 +1009,7 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 			return res, err
 		}
 		for i, e := range exprs {
-			eval, err := Compile(e, tx)
+			eval, err := compile(e, ev)
 			if err != nil {
 				return res, err
 			}
@@ -1021,10 +1024,10 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 
 	// Checked once the statement has written every row, so a multi-row INSERT
 	// is validated against its own rows as well as the existing ones.
-	if err := ins.Table.CheckConstraints(tx); err != nil {
+	if err := ins.Table.CheckConstraints(ev.tx); err != nil {
 		return res, err
 	}
-	if err := ins.Table.CheckForeignKeys(tx); err != nil {
+	if err := ins.Table.CheckForeignKeys(ev.tx); err != nil {
 		return res, err
 	}
 	return res, nil
@@ -1037,8 +1040,8 @@ func ExecInsert(ctx context.Context, tx *storage.Tx, ins *plan.Insert, args []ty
 // source reads the table being written, because a scan takes its rows when the
 // operator is built: the statement sees the table as it was, and cannot chase
 // the rows it is itself appending.
-func insertFrom(ctx context.Context, src plan.Node, tx *storage.Tx, args []types.Value, store func(Row) error) (err error) {
-	op, err := Build(ctx, src, tx, args)
+func insertFrom(ctx context.Context, src plan.Node, ev env, args []types.Value, store func(Row) error) (err error) {
+	op, err := build(ctx, src, ev, args)
 	if err != nil {
 		return err
 	}
